@@ -1,0 +1,194 @@
+id	name	cost	type	subtype	atk	def	keywords	effect	rarity	unique
+1	Young Thief	1	unit	rogue	4	2	tenacity		common	false
+2	Fast Rat	1	unit	rat	4	1	dash		common	false
+3	Red Rose Warrior	1	unit	plant	0	7			common	false
+4	Mud Golem	1	unit	golem	2	4	tenacity		common	false
+5	Giant Ant	1	unit	bug	4	3			common	false
+6	Mad Warrior	1	unit	berserker	5	2			common	false
+7	Sorcerer Apprentice	1	unit	mage	3	4			common	false
+8	Little Wurm	1	unit	wurm	4	3			common	false
+9	Ephemeral Angel	1	unit	angel	3	2	fly		common	false
+10	Desert Nomad	1	unit	merchant	2	5			common	false
+11	Hasty Fiend	1	unit	demon	3	2	dash		common	false
+12	Flying Ghost	1	unit	spirit	2	3	fly		common	false
+13	Wild Beast	1	unit	beast	4	1	overrun		common	false
+14	Brave Soldier	1	unit	soldier	4	3			common	false
+15	Undead Servant	1	unit	zombie	4	3			common	false
+16	Quick Rat	1	unit	rat	4	0	dash	Enter - Opponent discards 1 card from hand.	common	false
+17	Desert Rat	1	unit	rat	3	2		Enter/Attack - Opponent loses 3 life.	common	false
+18	Plague Rat	1	unit	rat	2	3		Enter/Death - Put a weak counter on each enemy.	common	false
+19	Digging Rat	1	unit	rat	3	1		Enter/Attack - Dig 3.	common	false
+20	Garden Keeper	1	unit	plant	0	5		Harvest - Gain 5 life.	common	false
+21	Yellow Rose Seed	1	unit	plant	0	4		Harvest - Discard a card then gain 1 coin.	common	false
+22	Blue Rose Seed	1	unit	plant	0	4		Harvest - Discard a card then draw 1 card.	common	false
+23	Stone Golem	1	unit	golem	3	3		Closure - You may have this unit become a defender.	common	false
+24	Rock Golem	1	unit	golem	3	4		Defend - Put 2 power counters on this unit.	common	false
+25	Slaying Mantis	1	unit	bug	5	3	fly	Attack - You lose 3 life.	common	false
+26	Dark Caterpillar	1	unit	bug	3	3		Enter - Put 3 weak counters on an enemy.	common	false
+27	Angry Pacifist	1	unit	berserker	6	3	dash	Closure - You lose 3 life.	common	false
+28	Furious Avenger	1	unit	berserker	7	5	overrun	Closure - Discard a card.	common	false
+29	Fire Apprentice	1	unit	mage	2	2		Enter/Ability - Deal 2 damage.	common	false
+30	Ice Apprentice	1	unit	mage	2	3		Enter/Ability - Draw 1 card then discard 1 card.	common	false
+31	Dark Apprentice	1	unit	mage	3	3		Enter/Ability - Opponent loses 3 life.	common	false
+32	Nomadic Salesman	1	unit	merchant	2	3		Enter/Ability - Discard 2 cards then draw 1 card and gain 1 coin.	common	false
+33	Travelling Vendor	1	unit	merchant	2	3		Enter/Ability - Pay 1 coin to draw 2 cards then discard 1 card.	common	false
+34	Ruthless Negotiator	1	unit	merchant	4	3	tenacity	Enter/Attack - Put a weak counter on an ally of your choice to gain 1 coin.	common	false
+35	Dead Demon of Discord	1	unit	demon	3	1	dash	Death - Draw 1 card and you lose 3 life.	common	false
+36	Dead Demon of Dreams	1	unit	demon	3	1	dash	Death - Gain 1 coin and you lose 3 life.	common	false
+37	Dead Demon of Doubt	1	unit	demon	3	1	dash	Death - Opponent discards 1 card then you lose 3 life.	common	false
+38	Dead Demon of Darkness	1	unit	demon	3	1	dash	Death - Deal 3 damage and you lose 3 life.	common	false
+39	Dead Demon of Deceit	1	unit	demon	3	1	dash	Death - Add 2 demons from your graveyard to your hand then you lose 3 life.	common	false
+40	Life Guardian	1	unit	spirit	3	1	fly	Enter/Attack/Death - Gain 3 life.	common	false
+41	Savage Boar	1	unit	beast	4	2		Enter - Gain 4 life.	common	false
+42	Angry Beast	1	unit	beast	5	4	dash;overrun	Attack - Discard a card.	common	false
+43	Prodigious Recruit	1	unit	soldier	3	3		Attack - Put 2 power counters on this unit.	common	false
+44	Lucky Recruit	1	unit	soldier	2	4		Defend - Put 2 power counters on another ally.	common	false
+45	Undead Horde	1	unit	zombie	6	0	overrun	Passive - Cannot defend.	common	false
+46	Dead Walkers	1	unit	zombie	6	2		Passive - Cannot defend.	common	false
+47	Special Tactics Unit	2	unit	rogue	7	4	tenacity;dash	Attack - Draw 2 cards then discard 2 cards.	common	false
+48	Close-Combat Expert	2	unit	rogue	4	4	tenacity	Attack - Put 4 power counters on this unit.	common	false
+49	Giant Rat	2	unit	rat	6	6		Attack - Opponent discards 1 card then loses 3 life.	common	false
+50	Cursed Flower	2	unit	plant	0	7		Harvest - Gain 1 coin and you lose 1 life.	common	false
+51	Flower Pollinator	2	unit	plant	0	6		Harvest - Make a 0/2 plant token then gain 2 life.	common	false
+52	Persistent Golem	2	unit	golem	7	7	tenacity	Death - Add this card to hand.	common	false
+53	Dark Chrysalis	2	unit	bug	0	10		Rush - Sacrifice Dark Caterpillar to deploy this unit. If you do draw 2 cards.	common	false
+54	Giant Spider	2	unit	bug	8	8		Attack/Defend - Make a 2/2 bug token.	common	false
+55	Experimental Failure	2	unit	berserker	12	8	dash;overrun	Enter - Discard 2 cards then you lose 2 life.	common	false
+56	Curious Entomologist	2	unit	mage	4	8		Harvest - Make two 2/2 bug tokens and you lose 2 life.	common	false
+57	Arcane Archeologist	2	unit	mage	5	8		Enter - Choose support from your graveyard and add it to your hand.	common	false
+58	Skilled Pyromancer	2	unit	mage	3	9		Enter/Ability - Deal 3 damage.	common	false
+59	Lonely Trader	2	unit	merchant	5	8		Enter/Ability - Discard 1 card to gain 2 coins.	common	false
+60	Life Dealer	2	unit	merchant	3	6		Enter/Ability - Gain 1 coin then you lose 3 life.	common	false
+61	Beast Tamer	2	unit	merchant	4	7		Enter/Ability - Make a 3/3 beast token.	common	false
+62	Dealer Demon of Disease	2	unit	demon	6	6	fly	Harvest - Sacrifice a unit then draw 1 card.	common	false
+63	Dealer Demon of Death	2	unit	demon	6	6	fly	Harvest - Sacrifice a unit then your opponent chooses and discards 1 card.	common	false
+64	Blessing Spirit	2	unit	spirit	4	4	fly	Enter - Draw 1 card and gain 4 life.	common	false
+65	Savage Beast	2	unit	beast	8	4		Enter - Deal 4 damage to an enemy.	common	false
+66	Lurking Hunter	2	unit	beast	9	6		Attack - Deal 3 damage to each enemy.	common	false
+67	Aspiring Sergeant	2	unit	soldier	8	4		Enter - Put 4 power counters on another ally.	common	false
+68	Honorable Sergeant	2	unit	soldier	7	7	tenacity	Attack - Put 2 power counters on each other ally.	common	false
+69	Heavy-Arms Officer	2	unit	soldier	10	5	dash	Attack - Each player loses 5 life.	common	false
+70	Rotten Corpse	2	unit	zombie	13	0	overrun	Passive - Cannot defend. Enter - Each player loses 3 life.	common	false
+71	Quick Thief	3	unit	rogue	10	7	dash	Attack - Draw 3 cards then discard 2 cards.	common	false
+72	White Rose Guardian	3	unit	plant	0	12		Harvest - Draw 1 card gain 1 coin and gain 1 life.	common	false
+73	Black Rose Guardian	3	unit	plant	0	12		Harvest - Your opponent chooses and discards a card then they lose 3 life.	common	false
+74	Silver Golem	3	unit	golem	9	9		Death - Gain 3 coins.	common	false
+75	Dark Imago	3	unit	bug	13	8	fly	Rush - Sacrifice Dark Chrysalis to deploy this unit. If you do draw 3 cards.	common	false
+76	Bloodrush Berserker	3	unit	berserker	13	7	dash;overrun	Attack - You lose 4 life.	common	false
+77	Archmage of Storms	3	unit	mage	7	11		Enter/Ability - Deal 5 damage then draw 1 card.	common	false
+78	Gilded Caravan Master	3	unit	merchant	6	10		Enter/Ability - Gain 3 coins then draw 1 card.	common	false
+79	Abyssal Tormentor	3	unit	demon	10	8	fly	Enter - Sacrifice a unit then deal 5 damage.	common	false
+80	Ancestral Wraith	3	unit	spirit	7	8	fly	Enter/Death - Draw 2 cards and gain 4 life.	common	false
+81	Rampaging Hydra	3	unit	beast	12	7	overrun	Attack - Deal 3 damage to an enemy.	common	false
+82	Veteran Commander	3	unit	soldier	9	9	tenacity	Enter - Put 3 power counters on each other ally.	common	false
+83	Risen Abomination	3	unit	zombie	14	5	overrun	Passive - Cannot defend. Enter - Put 3 weak counters on each enemy.	common	false
+84	Greedy Thief	4	unit	rogue	11	9	tenacity	Attack - Gain 2 coins.	common	false
+85	Sneaky Thief	4	unit	rogue	11	9	tenacity	Attack - Draw 2 cards.	common	false
+86	Eternal Blossom Tree	4	unit	plant	0	15		Harvest - Draw 2 cards gain 2 coins and gain 3 life.	common	false
+87	Adamantine Golem	4	unit	golem	12	12	tenacity	Enter - Become a defender. Defend - Put 3 power counters on this unit.	common	false
+88	Devouring Swarm Queen	4	unit	bug	10	10	fly	Enter - Make two 3/3 bug tokens.	common	false
+89	Frenzied Warlord	4	unit	berserker	16	10	dash;overrun	Enter - Discard 3 cards.	common	false
+90	Grand Sorcerer	4	unit	mage	8	12		Enter/Ability - Deal 6 damage then draw 1 card.	common	false
+91	Archfiend of Ruin	4	unit	demon	12	10	fly;dash	Enter - Sacrifice 2 units then draw 3 cards.	common	false
+92	Primordial Bloom	5	unit	plant	0	18		Harvest - Draw 2 cards gain 3 coins and gain 5 life.	common	true
+93	Colossal Golem	5	unit	golem	14	14	tenacity	Death - Add this card to hand then gain 5 coins.	common	true
+94	Titan Beetle	5	unit	bug	15	12	fly;overrun	Attack - Make a 4/4 bug token.	common	true
+95	Doomhowl Ravager	5	unit	berserker	18	12	dash;overrun	Attack - You lose 5 life. Enter - Discard 2 cards.	common	true
+96	Arcane Overlord	5	unit	mage	10	14		Enter/Ability - Deal 8 damage then draw 2 cards.	common	true
+97	Alpha Predator	5	unit	beast	16	12	overrun	Enter - Deal 6 damage to an enemy then deal 3 damage to each other enemy.	common	true
+98	Tree of Abundance	6	unit	plant	0	16		Harvest - Gain 3 coins.	common	true
+99	Mythril Golem	6	unit	golem	12	12	overrun	Death - Add this card to hand then gain 6 life.	common	true
+100	Abyssal Moth Empress	6	unit	bug	14	12	fly;overrun	Attack - Opponent chooses and discards 2 cards.	common	true
+101	Crazed Annihilator	6	unit	berserker	17	11	dash;overrun	Attack - Sacrifice an ally.	common	true
+102	Grand Arcanist	6	unit	mage	7	14		Enter/Ability - Deal 7 damage.	common	true
+103	Ancient Wurm	6	unit	wurm	14	14	overrun	Attack - Deal 4 damage to each other unit.	common	true
+104	Seraphim of Grace	6	unit	angel	12	14	fly	Enter - Gain 14 life.	common	true
+105	Opulent Grandmaster	6	unit	merchant	5	12		Enter/Ability - Discard a card then draw 2 cards and gain 2 coins.	common	true
+106	Sovereign of the Abyss	6	unit	demon	13	13	fly;dash;overrun;tenacity	Enter - Sacrifice a unit then you lose 6 life.	common	true
+107	Primal Stampede Lord	6	unit	beast	15	12	overrun	Attack - Each other ally gains overrun this turn.	common	true
+108	Arrow	0	support		0	0		Deal 2 damage.	common	false
+109	Scrying Shovel	0	support		0	0		Dig 5.	common	false
+110	Ember Wave	0	support		0	0		Deal 1 damage to each enemy.	common	false
+111	Grow	0	support		0	0		Put 3 power counters on an ally.	common	false
+112	Obsession	0	support		0	0		Draw 1 card and you lose 4 life.	common	false
+113	Luck	0	support		0	0		Gain 1 coin.	common	false
+114	Arcane Insight	1	support		0	0		Draw 2 cards then discard 1 card.	common	false
+115	Grave Beckoning	1	support		0	0		Add a unit from your graveyard to hand.	common	false
+116	Fire Bolt	1	support		0	0		Deal 4 damage.	common	false
+117	Spark of Knowledge	1	support		0	0		Deal 1 damage then draw 1 card.	common	false
+118	Battle Blessing	1	support		0	0		Put a power counter on an ally then draw 1 card.	common	false
+119	Scorching Tempest	1	support		0	0		Deal 3 damage to each unit.	common	false
+120	Deep Meditation	2	support		0	0		Draw 2 cards.	common	false
+121	Golden Harvest	2	support		0	0		Gain 4 coins at end of turn.	common	false
+122	War Drums	2	support		0	0		Put 4 power counters on each ally.	common	false
+123	Annihilate	2	support		0	0		Destroy an enemy.	common	false
+124	Searing Judgment	2	support		0	0		Deal 4 damage then draw 1 card.	common	false
+125	Necromantic Rite	2	support		0	0		Deploy a unit with cost 4 or less from your graveyard.	common	false
+126	Cruel Edict	3	support		0	0		Your opponent sacrifices 2 units.	common	false
+127	Mind Shatter	3	support		0	0		Your opponent discards 2 cards.	common	false
+128	Wings of Valor	3	support		0	0		Put 3 power counters on each ally and they gain fly until end of turn.	common	false
+129	Plague of Frailty	3	support		0	0		Put 5 weak counters on each enemy.	common	false
+130	Forbidden Scroll	3	support		0	0		Draw 4 cards then discard 2 cards.	common	false
+131	Terminate	4	support		0	0		Destroy an enemy then draw 1 card.	common	false
+132	Twin Inferno	4	support		0	0		Deal 8 damage to up to 2 enemies.	common	false
+133	Warcry of the Ancients	4	support		0	0		Put 7 power counters on each ally and they gain overrun until end of turn.	common	false
+134	Wheel of Fate	4	support		0	0		Discard your hand then draw 7 cards.	common	false
+135	Mass Resurrection	5	support		0	0		Deploy up to 2 units with cost 4 or less from your graveyard.	common	true
+136	Rich People's Luck	5	support		0	0		Gain 7 coins.	common	false
+137	Cataclysmic Purge	5	support		0	0		Destroy up to 3 enemies.	common	true
+138	Sovereign's Decree	6	support		0	0		Draw 2 cards and gain 6 life then your opponent discards 2 cards and loses 6 life.	common	true
+139	Hellfire Apocalypse	6	support		0	0		Deal 6 damage to each enemy then draw 1 card for each enemy destroyed this way.	common	true
+140	Dimensional Rift	6	support		0	0		Deploy a unit from your hand then deploy a unit from your graveyard.	common	true
+140Shadow Breaker2unitrogue86dash, tenacityEnter - Target enemy stops defending. Attack - Draw 1 card and lose 1 life.rarefalse
+141Hand Thief2unitrogue96Enter - Look at your opponent's hand and discard a card from there, then that player loses life equal to that card's cost.rarefalse
+142Rat Lord2unitrat93dashEnter - Add a rat from your graveyard to hand. Passive - Other ally rats gain +5/+5 while this unit is on the field.rarefalse
+143Rat Commander2unitrat77dashAttack - Make two 1/1 rat tokens, then put a power counter on each other ally rat for each rat in your graveyard. Closure - If you attacked with 3 or more rats this turn, draw 1 card.rarefalse
+144Thorned Bloom2unitplant08Harvest - Draw 2 cards, then discard 1 card and lose 2 life.rarefalse
+145Coin Blossom2unitplant010Harvest - Put 2 weak counters on each ally, then gain 2 coins.rarefalse
+146Life Root2unitplant010Enter/Death/Harvest - Put 4 power counters on each other ally, then gain 4 life.rarefalse
+147Plague Vine2unitplant08Harvest - Put 2 weak counters on each enemy, then destroy each enemy with 6 or more weak counters on it.rarefalse
+148Golden Golem2unitgolem79tenacityAttack - Put a gold counter on this unit, then gain 1 coin for each gold counter on it.rarefalse
+149War Golem2unitgolem88dashEnter - Put 4 power counters on each other ally and you gain 4 life. Death - Put 4 weak counters on each enemy and your opponent loses 4 life.rarefalse
+150Hive Mother2unitbug44flyPassive - Ally bugs have fly. Enter/Ability - Make two 2/2 bug tokens, then put 2 power counters on each ally bug.rarefalse
+151Scavenger Beetle2unitbug77flyEnter - Draw 2 cards, then discard 2 cards. If you discarded 2 units this way, make two 2/2 bug tokens.rarefalse
+152Arcane Fury2unitmage27Ability - Another ally gains +7 atk, fly, dash and overrun until the end of turn.rarefalse
+153Spell Channeler2unitmage55Enter - For each card in your hand, put 1 power counter on this unit, then deal that much damage to an enemy.rarefalse
+154Blood Broker2unitmerchant48tradeAbility - Pay 2 life and discard 2 cards to draw 3 cards and gain 1 coin.rarefalse
+155Lucky Merchant2unitmerchant28tradeAbility - If you have no coins, gain 2 coins, then if you have no cards in hand, draw 1 card then gain 1 coin.rarefalse
+156Void Tyrant2unitdemon99dash, fly, overrunPassive - You cannot play units from hand. Enter - Sacrifice all other ally units.rarefalse
+157Coercion Fiend2unitdemon53dashAttack/Death - Your opponent must choose to sacrifice a unit or discard 2 cards or lose 8 life.rarefalse
+158Silent Reaper3unitrogue88dashPassive - Can ignore defenders. Attack - Your opponent discards 1 card and you draw 1 card.rarefalse
+159Drain Blossom3unitplant012Harvest - Gain 2 coins and draw 1 card, then you lose 3 life.rarefalse
+160Reborn Guardian3unitgolem1010Enter - Draw 1 card and gain 5 life. Death - Make a 5/5 golem token and gain 1 coin.rarefalse
+161Grave Digger3unitbug66fly, dashAttack - Dig 3, then for each unit in your graveyard, put 1 power counter on this unit and gain 1 life.rarefalse
+162Soul Weaver3unitmage79Enter - Choose up to 1 unit and up to 1 support from your graveyard and add them to hand. Ability - Discard 1 card to make a 10/10 golem token.rarefalse
+163Wealth Master3unitmerchant58tradeAbility - Discard any number of cards to gain twice that many coins. Closure - Draw cards until you have 3 cards in hand.rarefalse
+164Chaos Breeder3unitdemon118dashAttack - Make a 3/1 demon token with dash. Closure - Discard 1 card and lose 3 life.rarefalse
+165Alpha Beast3unitbeast99overrunPassive - Other ally beasts have overrun and gain +3/+3 while this unit is on the field. Attack - Make a 3/3 beast token.rarefalse
+166Reckless Fury3unitberserker155dash, overrunEnter - Discard your hand and dig 5, then you lose 5 life.rarefalse
+167War Mage3unitmage810Ability - Deploy a unit from your hand, then put 4 power counters on it.rarefalse
+168Necro Mage4unitmage1012Ability - Deploy a unit from your graveyard, then put 5 power counters on it.rarefalse
+169Abyssal Lord4unitdemon1111fly, overrunPassive - Other ally units gain +6/+6 while this unit is on the field. Closure - Sacrifice another ally or lose 11 life.rarefalse
+170Celestial Warden4unitangel1212fly, overrun, dash, tenacityPassive - Other ally units gain fly, overrun, dash and tenacity while this unit is on the field.rarefalse
+171Savage Overlord5unitbeast1214dash, overrunEnter - Make a 6/6 beast token. Attack - Put 6 power counters on each other ally.rarefalse
+172Dread Reaper5unitdemon1313fly, overrunEnter - Destroy an enemy. Harvest - Your opponent sacrifices a unit.rarefalse
+173Seraph of Vengeance6unitangel1515fly, dashEnter - Deal 7 damage to each enemy. Attack - Make a 7/7 Angel token with fly, then gain 7 life.rarefalse
+174Mind Shackle2support00Gain control over an enemy with atk 4 or less.rarefalse
+175Power Surge2support00Put 5 power counter on an ally, then destroy an enemy with less atk than that ally.rarefalse
+176Arcane Burst2support00Draw 2 cards, then discard 1 card, then if the discarded card was a unit, deal damage equal to its atk.rarefalse
+177Celestial Army2support00For each ally, make a 7/7 angel token with fly.rarefalse
+178War Cry2support00Allies deal double combat damage this turn.rarefalse
+179Graveyard Feast3support00Add up to 3 cards from your graveyard to hand.rarefalse
+180Domination3support00Gain control over an enemy.rarefalse
+181Soul Recall1support00Deploy a unit from your graveyard.rarefalse
+182Cataclysm3support00Destroy all units.rarefalse
+183Cerebral Storm4support00Draw 3 cards, then deal damage to each enemy equal to the number of cards in your hand.rarefalse
+184Mass Revival4support00Deploy all units with atk 4 or less from your graveyard.rarefalse
+185Shadow Summon4support00Deploy a unit from your hand.rarefalse
+186Triple Punishment4support00Your opponent discards 2 cards, sacrifices 2 units and loses 4 life.rarefalse
+187Bug Swarm4support00For each card in your hand, make a 2/2 bug token, then for each card in your hand, put 2 power counters on each ally bug.rarefalse
+188Annihilation5support00Destroy all enemies.rarefalse
+189Grand Bargain5support00Draw 3 cards and gain 6 life, then make a 12/12 beast token.rarefalse
+190Mass Subjugation5support00Gain control over each enemy with atk 4 or less, then put 4 power counters on each of them.rarefalse
+191Rise from Ashes6support00Deploy each unit from your graveyard.rarefalse
+192Nature's Army6support00Make six 6/6 beast tokens with overrun.rarefalse
