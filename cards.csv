@@ -139,56 +139,56 @@ id	name	cost	type	subtype	atk	def	keywords	effect	rarity	unique
 138	Sovereign's Decree	6	support		0	0		Draw 2 cards and gain 6 life then your opponent discards 2 cards and loses 6 life.	common	true
 139	Hellfire Apocalypse	6	support		0	0		Deal 6 damage to each enemy then draw 1 card for each enemy destroyed this way.	common	true
 140	Dimensional Rift	6	support		0	0		Deploy a unit from your hand then deploy a unit from your graveyard.	common	true
-140Shadow Breaker2unitrogue86dash, tenacityEnter - Target enemy stops defending. Attack - Draw 1 card and lose 1 life.rarefalse
-141Hand Thief2unitrogue96Enter - Look at your opponent's hand and discard a card from there, then that player loses life equal to that card's cost.rarefalse
-142Rat Lord2unitrat93dashEnter - Add a rat from your graveyard to hand. Passive - Other ally rats gain +5/+5 while this unit is on the field.rarefalse
-143Rat Commander2unitrat77dashAttack - Make two 1/1 rat tokens, then put a power counter on each other ally rat for each rat in your graveyard. Closure - If you attacked with 3 or more rats this turn, draw 1 card.rarefalse
-144Thorned Bloom2unitplant08Harvest - Draw 2 cards, then discard 1 card and lose 2 life.rarefalse
-145Coin Blossom2unitplant010Harvest - Put 2 weak counters on each ally, then gain 2 coins.rarefalse
-146Life Root2unitplant010Enter/Death/Harvest - Put 4 power counters on each other ally, then gain 4 life.rarefalse
-147Plague Vine2unitplant08Harvest - Put 2 weak counters on each enemy, then destroy each enemy with 6 or more weak counters on it.rarefalse
-148Golden Golem2unitgolem79tenacityAttack - Put a gold counter on this unit, then gain 1 coin for each gold counter on it.rarefalse
-149War Golem2unitgolem88dashEnter - Put 4 power counters on each other ally and you gain 4 life. Death - Put 4 weak counters on each enemy and your opponent loses 4 life.rarefalse
-150Hive Mother2unitbug44flyPassive - Ally bugs have fly. Enter/Ability - Make two 2/2 bug tokens, then put 2 power counters on each ally bug.rarefalse
-151Scavenger Beetle2unitbug77flyEnter - Draw 2 cards, then discard 2 cards. If you discarded 2 units this way, make two 2/2 bug tokens.rarefalse
-152Arcane Fury2unitmage27Ability - Another ally gains +7 atk, fly, dash and overrun until the end of turn.rarefalse
-153Spell Channeler2unitmage55Enter - For each card in your hand, put 1 power counter on this unit, then deal that much damage to an enemy.rarefalse
-154Blood Broker2unitmerchant48tradeAbility - Pay 2 life and discard 2 cards to draw 3 cards and gain 1 coin.rarefalse
-155Lucky Merchant2unitmerchant28tradeAbility - If you have no coins, gain 2 coins, then if you have no cards in hand, draw 1 card then gain 1 coin.rarefalse
-156Void Tyrant2unitdemon99dash, fly, overrunPassive - You cannot play units from hand. Enter - Sacrifice all other ally units.rarefalse
-157Coercion Fiend2unitdemon53dashAttack/Death - Your opponent must choose to sacrifice a unit or discard 2 cards or lose 8 life.rarefalse
-158Silent Reaper3unitrogue88dashPassive - Can ignore defenders. Attack - Your opponent discards 1 card and you draw 1 card.rarefalse
-159Drain Blossom3unitplant012Harvest - Gain 2 coins and draw 1 card, then you lose 3 life.rarefalse
-160Reborn Guardian3unitgolem1010Enter - Draw 1 card and gain 5 life. Death - Make a 5/5 golem token and gain 1 coin.rarefalse
-161Grave Digger3unitbug66fly, dashAttack - Dig 3, then for each unit in your graveyard, put 1 power counter on this unit and gain 1 life.rarefalse
-162Soul Weaver3unitmage79Enter - Choose up to 1 unit and up to 1 support from your graveyard and add them to hand. Ability - Discard 1 card to make a 10/10 golem token.rarefalse
-163Wealth Master3unitmerchant58tradeAbility - Discard any number of cards to gain twice that many coins. Closure - Draw cards until you have 3 cards in hand.rarefalse
-164Chaos Breeder3unitdemon118dashAttack - Make a 3/1 demon token with dash. Closure - Discard 1 card and lose 3 life.rarefalse
-165Alpha Beast3unitbeast99overrunPassive - Other ally beasts have overrun and gain +3/+3 while this unit is on the field. Attack - Make a 3/3 beast token.rarefalse
-166Reckless Fury3unitberserker155dash, overrunEnter - Discard your hand and dig 5, then you lose 5 life.rarefalse
-167War Mage3unitmage810Ability - Deploy a unit from your hand, then put 4 power counters on it.rarefalse
-168Necro Mage4unitmage1012Ability - Deploy a unit from your graveyard, then put 5 power counters on it.rarefalse
-169Abyssal Lord4unitdemon1111fly, overrunPassive - Other ally units gain +6/+6 while this unit is on the field. Closure - Sacrifice another ally or lose 11 life.rarefalse
-170Celestial Warden4unitangel1212fly, overrun, dash, tenacityPassive - Other ally units gain fly, overrun, dash and tenacity while this unit is on the field.rarefalse
-171Savage Overlord5unitbeast1214dash, overrunEnter - Make a 6/6 beast token. Attack - Put 6 power counters on each other ally.rarefalse
-172Dread Reaper5unitdemon1313fly, overrunEnter - Destroy an enemy. Harvest - Your opponent sacrifices a unit.rarefalse
-173Seraph of Vengeance6unitangel1515fly, dashEnter - Deal 7 damage to each enemy. Attack - Make a 7/7 Angel token with fly, then gain 7 life.rarefalse
-174Mind Shackle2support00Gain control over an enemy with atk 4 or less.rarefalse
-175Power Surge2support00Put 5 power counter on an ally, then destroy an enemy with less atk than that ally.rarefalse
-176Arcane Burst2support00Draw 2 cards, then discard 1 card, then if the discarded card was a unit, deal damage equal to its atk.rarefalse
-177Celestial Army2support00For each ally, make a 7/7 angel token with fly.rarefalse
-178War Cry2support00Allies deal double combat damage this turn.rarefalse
-179Graveyard Feast3support00Add up to 3 cards from your graveyard to hand.rarefalse
-180Domination3support00Gain control over an enemy.rarefalse
-181Soul Recall1support00Deploy a unit from your graveyard.rarefalse
-182Cataclysm3support00Destroy all units.rarefalse
-183Cerebral Storm4support00Draw 3 cards, then deal damage to each enemy equal to the number of cards in your hand.rarefalse
-184Mass Revival4support00Deploy all units with atk 4 or less from your graveyard.rarefalse
-185Shadow Summon4support00Deploy a unit from your hand.rarefalse
-186Triple Punishment4support00Your opponent discards 2 cards, sacrifices 2 units and loses 4 life.rarefalse
-187Bug Swarm4support00For each card in your hand, make a 2/2 bug token, then for each card in your hand, put 2 power counters on each ally bug.rarefalse
-188Annihilation5support00Destroy all enemies.rarefalse
-189Grand Bargain5support00Draw 3 cards and gain 6 life, then make a 12/12 beast token.rarefalse
-190Mass Subjugation5support00Gain control over each enemy with atk 4 or less, then put 4 power counters on each of them.rarefalse
-191Rise from Ashes6support00Deploy each unit from your graveyard.rarefalse
-192Nature's Army6support00Make six 6/6 beast tokens with overrun.rarefalse
+141	Shadow Blade	2	unit	rogue	8	6	dash;tenacity	Enter - Target enemy stops defending. Attack - Draw 1 card and lose 1 life.	rare	false
+142	Mind Thief	2	unit	rogue	9	6		Enter - Look at your opponent's hand and discard a card from there, then that player loses life equal to that card's cost.	rare	false
+143	Rat Lord	2	unit	rat	9	3	dash	Enter - Add a rat from your graveyard to hand. Passive - Other ally rats gain +5/+5 while this unit is on the field.	rare	false
+144	Rat Commander	2	unit	rat	7	7	dash	Attack - Make two 1/1 rat tokens, then put a power counter on each other ally rat for each rat in your graveyard. Closure - If you attacked with 3 or more rats this turn, draw 1 card.	rare	false
+145	Bloom Harvester	2	unit	plant	0	8		Harvest - Draw 2 cards, then discard 1 card and lose 2 life.	rare	false
+146	Wilt Bringer	2	unit	plant	0	10		Harvest - Put 2 weak counters on each ally, then gain 2 coins.	rare	false
+147	Verdant Guardian	2	unit	plant	0	10		Enter/Death/Harvest - Put 4 power counters on each other ally, then gain 4 life.	rare	false
+148	Rot Bloom	2	unit	plant	0	8		Harvest - Put 2 weak counters on each enemy, then destroy each enemy with 6 or more weak counters on it.	rare	false
+149	Golden Golem	2	unit	golem	7	9	tenacity	Attack - Put a gold counter on this unit, then gain 1 coin for each gold counter on it.	rare	false
+150	War Golem	2	unit	golem	8	8	dash	Enter - Put 4 power counters on each other ally and you gain 4 life. Death - Put 4 weak counters on each enemy and your opponent loses 4 life.	rare	false
+151	Hivemind Matriarch	2	unit	bug	4	4	fly	Passive - Ally bugs have fly. Enter/Ability - Make two 2/2 bug tokens, then put 2 power counters on each ally bug.	rare	false
+152	Grave Moth	2	unit	bug	7	7	fly	Enter - Draw 2 cards, then discard 2 cards.	rare	false
+153	Battle Enchantress	2	unit	mage	2	7		Ability - Another ally gains +7 atk, fly, dash and overrun until the end of turn.	rare	false
+154	Arcane Striker	2	unit	mage	5	5		Enter - For each card in your hand, put 1 power counter on this unit, then deal that much damage to an enemy.	rare	false
+155	Shrewd Broker	2	unit	merchant	4	8	trade	Ability - Pay 2 life and discard 2 cards to draw 3 cards and gain 1 coin.	rare	false
+156	Resourceful Peddler	2	unit	merchant	2	8	trade	Ability - If you have no coins, gain 2 coins, then if you have no cards in hand, draw 1 card.	rare	false
+157	Abyssal Tyrant	2	unit	demon	9	9	dash;fly;overrun	Passive - You cannot play units from hand. Enter - Sacrifice all other ally units.	rare	false
+158	Spite Fiend	2	unit	demon	5	3	dash	Attack/Death - Your opponent must choose to sacrifice a unit or discard 2 cards or lose 8 life.	rare	false
+159	Master Infiltrator	3	unit	rogue	8	8	dash	Passive - Can ignore defenders. Attack - Your opponent discards 1 card and you draw 1 card.	rare	false
+160	Elder Blossom	3	unit	plant	0	12		Harvest - Gain 2 coins and draw 1 card, then you lose 3 life.	rare	false
+161	Titanic Golem	3	unit	golem	10	10		Enter - Draw 1 card and gain 5 life. Death - Make a 5/5 golem token and gain 1 coin.	rare	false
+162	Grave Beetle	3	unit	bug	6	6	fly;dash	Attack - Dig 3, then for each unit in your graveyard, put 1 power counter on this unit and gain 1 life.	rare	false
+163	Chrono Mage	3	unit	mage	7	9		Enter - Choose up to 1 unit and up to 1 support from your graveyard and add them to hand. Ability - Discard 1 card to make a 10/10 golem token.	rare	false
+164	Fortune Merchant	3	unit	merchant	5	8	trade	Ability - Discard any number of cards to gain twice that many coins. Closure - Draw cards until you have 3 cards in hand.	rare	false
+165	Infernal Broodlord	3	unit	demon	11	8	dash	Attack - Make a 3/1 demon token with dash. Closure - Discard 1 card and lose 3 life.	rare	false
+166	Pack Alpha	3	unit	beast	9	9	overrun	Passive - Other ally beasts have overrun and gain +3/+3 while this unit is on the field. Attack - Make a 3/3 beast token.	rare	false
+167	Berserker Champion	3	unit	berserker	15	5	dash;overrun	Enter - Discard your hand and dig 5, then you lose 5 life.	rare	false
+168	Arcane Deployer	3	unit	mage	8	10		Ability - Deploy a unit from your hand, then put 4 power counters on it.	rare	false
+169	Supreme Conjurer	4	unit	mage	10	12		Ability - Deploy a unit from your graveyard, then put 5 power counters on it.	rare	false
+170	Infernal Overlord	4	unit	demon	11	11	fly;overrun	Passive - Other ally units gain +6/+6 while this unit is on the field. Closure - Sacrifice another ally or lose 11 life.	rare	false
+171	Celestial Paragon	4	unit	angel	12	12	fly;overrun;dash;tenacity	Passive - Other ally units gain fly, overrun, dash and tenacity while this unit is on the field.	rare	false
+172	Apex Predator	5	unit	beast	12	14	dash;overrun	Enter - Make a 6/6 beast token. Attack - Put 6 power counters on each other ally.	rare	false
+173	Pit Lord	5	unit	demon	13	13	fly;overrun	Enter - Destroy an enemy. Harvest - Your opponent sacrifices a unit.	rare	false
+174	Archangel of Wrath	6	unit	angel	15	15	fly;dash	Enter - Deal 7 damage to each enemy. Attack - Make a 7/7 Angel token with fly, then gain 7 life.	rare	false
+175	Mind Shackle	2	support		0	0		Gain control over an enemy with atk 4 or less.	rare	false
+176	Power Surge	2	support		0	0		Put 5 power counter on an ally, then destroy an enemy with less atk than that ally.	rare	false
+177	Arcane Burst	2	support		0	0		Draw 2 cards, then discard 1 card, then if the discarded card was a unit, deal damage equal to its atk.	rare	false
+178	Celestial Army	2	support		0	0		For each ally, make a 7/7 angel token with fly.	rare	false
+179	War Cry	2	support		0	0		Allies deal double combat damage this turn.	rare	false
+180	Graveyard Feast	3	support		0	0		Add up to 3 cards from your graveyard to hand.	rare	false
+181	Domination	3	support		0	0		Gain control over an enemy.	rare	false
+182	Soul Recall	3	support		0	0		Deploy a unit from your graveyard.	rare	false
+183	Cataclysm	3	support		0	0		Destroy all units.	rare	false
+184	Cerebral Storm	4	support		0	0		Draw 3 cards, then deal damage to each enemy equal to the number of cards in your hand.	rare	false
+185	Mass Revival	4	support		0	0		Deploy all units with atk 4 or less from your graveyard.	rare	false
+186	Shadow Summon	4	support		0	0		Deploy a unit from your hand.	rare	false
+187	Triple Punishment	4	support		0	0		Your opponent discards 2 cards, sacrifices 2 units and loses 4 life.	rare	false
+188	Bug Swarm	4	support		0	0		For each card in your hand, make a 2/2 bug token, then for each card in your hand, put 2 power counters on each ally bug.	rare	false
+189	Annihilation	5	support		0	0		Destroy all enemies.	rare	false
+190	Grand Bargain	5	support		0	0		Draw 3 cards and gain 6 life, then make a 12/12 beast token.	rare	false
+191	Mass Subjugation	5	support		0	0		Gain control over each enemy with atk 4 or less, then put 4 power counters on each of them.	rare	false
+192	Rise from Ashes	6	support		0	0		Deploy each unit from your graveyard.	rare	false
+193	Nature's Army	6	support		0	0		Make six 6/6 beast tokens with overrun.	rare	false

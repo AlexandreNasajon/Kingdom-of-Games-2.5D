@@ -2,7 +2,7 @@
   "mcpServers": {
     "jcodemunch": {
       "type": "stdio",
-      "command": "uvx",
+      "command": "C:\\Users\\User\\AppData\\Local\\Programs\\Python\\Python311\\Scripts\\uvx.exe",
       "args": [
         "jcodemunch-mcp"
       ],

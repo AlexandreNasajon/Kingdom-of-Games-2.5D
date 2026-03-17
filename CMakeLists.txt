@@ -46,7 +46,7 @@ target_include_directories(rlimgui_lib PUBLIC ${rlimgui_SOURCE_DIR})
 target_link_libraries(rlimgui_lib PUBLIC raylib imgui_lib)
 
 # ── Main executable ───────────────────────────────────────────────────────────
-add_executable(KOG25DEditor src/main.cpp)
+add_executable(KOG25DEditor src/main.cpp src/input.h)
 
 if(MSVC)
     target_compile_options(KOG25DEditor PRIVATE /wd4576)
@@ -62,7 +62,7 @@ if(WIN32)
     target_link_libraries(KOG25DEditor PRIVATE winmm)
 endif()
 
-# ── Post-build: copy assets & create maps dir ────────────────────────────────
+# ── Post-build: copy assets, create maps dir, and create KoG25D.exe alias ────
 add_custom_command(TARGET KOG25DEditor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_SOURCE_DIR}/assets
@@ -73,4 +73,10 @@ add_custom_command(TARGET KOG25DEditor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         $<TARGET_FILE_DIR:KOG25DEditor>/maps
     COMMENT "Creating maps dir..."
+)
+add_custom_command(TARGET KOG25DEditor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:KOG25DEditor>
+        $<TARGET_FILE_DIR:KOG25DEditor>/KoG25D.exe
+    COMMENT "Creating KoG25D.exe..."
 )
