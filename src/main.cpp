@@ -311,9 +311,12 @@ void main(){
     float ripple = nm.r * 0.5 + nm.g * 0.5;
     float micro = mix(0.92, 1.08, ripple);
     vec3 base = albedo.rgb * micro;
-    // Cel-shaded lighting (2 bands)
+    // Smooth sun/shadow gradient — warm sandy shadow, never black
     float L = max(dot(n, -sunDir), 0.0);
-    float band = (L > 0.5) ? 1.0 : 0.55; // Bright vs Shadow sand
+    float sunLit    = mix(0.60, 1.0, smoothstep(0.10, 0.75, L));
+    vec3 sunCol     = vec3(1.0, 0.820, 0.643);    // #FFD1A4 warm golden-orange
+    vec3 shadowCol  = vec3(0.58, 0.40, 0.22);     // warm sandy shadow tint
+    vec3 lighting   = mix(shadowCol, sunCol, sunLit);
     // Rim highlight on crests (view-dependent)
     vec3 V = normalize(cameraPos - fragWorldPos);
     float rim = pow(clamp(1.0 - max(dot(n, V), 0.0), 0.0, 1.0), 3.0);
@@ -322,14 +325,88 @@ void main(){
     // Pixel-grit overlay (two-tone), low frequency to avoid moiré
     float gritMask = grit.r;
     vec3 gritCol = mix(vec3(0.92, 0.80, 0.60), vec3(0.70, 0.55, 0.40), step(0.5, gritMask));
-    vec3 color = base * band;
+    vec3 color = base * lighting;
     color = mix(color, color * rimCol, rim * 0.35);
     color = mix(color, gritCol, 0.08);
-    // Vertex color contribution (AO valley darkening baked in C++)
-    color *= colDiffuse.rgb * fragColor.rgb / vec3(255.0, 255.0, 255.0);
+    // colDiffuse tint only — vertex-color AO removed (was darkening shadows to black)
+    color *= colDiffuse.rgb;
     finalColor = vec4(color, 1.0);
 }
 )";
+// ── City shaders ─────────────────────────────────────────────────────────────
+static const char *VS_GOLD = R"(
+#version 330
+layout(location=0) in vec3 vertexPosition;
+layout(location=2) in vec3 vertexNormal;
+layout(location=3) in vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+out vec3 fragPos;
+out vec3 fragNormal;
+void main(){
+    fragPos    = vec3(matModel * vec4(vertexPosition,1.0));
+    fragNormal = normalize(vec3(matModel * vec4(vertexNormal,0.0)));
+    gl_Position = mvp * vec4(vertexPosition,1.0);
+}
+)";
+
+static const char *FS_GOLD = R"(
+#version 330
+in vec3 fragPos;
+in vec3 fragNormal;
+uniform vec4 colDiffuse;
+uniform float time;
+uniform vec3 cameraPos;
+uniform vec3 sunDir;
+out vec4 finalColor;
+void main(){
+    vec3 n = normalize(fragNormal);
+    vec3 v = normalize(cameraPos - fragPos);
+    vec3 l = normalize(-sunDir);
+    vec3 h = normalize(l + v);
+    vec3 goldBase = vec3(0.87, 0.65, 0.15);
+    vec3 goldHot  = vec3(1.00, 0.93, 0.56);
+    float NdotL  = max(dot(n, l), 0.0);
+    float spec   = pow(max(dot(n, h), 0.0), 90.0);
+    float F0     = 0.92;
+    float fresnel = F0 + (1.0-F0)*pow(1.0-max(dot(n,v),0.0),5.0);
+    float shimmer = 1.0 + 0.04*sin(time*1.9 + fragPos.x*0.4 + fragPos.z*0.3);
+    vec3 col = goldBase*(0.25 + 0.75*NdotL)
+             + goldHot*spec*shimmer*0.85
+             + goldHot*(fresnel-F0)*0.28;
+    col = clamp(col * colDiffuse.rgb/255.0, 0.0, 1.0);
+    finalColor = vec4(col, 1.0);
+}
+)";
+
+static const char *FS_WATER = R"(
+#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform float time;
+out vec4 finalColor;
+void main(){
+    vec2 uv = fragTexCoord;
+    float wave1 = sin(uv.x*7.2 + time*1.3)*0.013;
+    float wave2 = cos(uv.y*5.8 + time*0.95)*0.013;
+    vec2 warp = clamp(uv + vec2(wave1,wave2), 0.0, 1.0);
+    vec3 deep    = vec3(0.04, 0.14, 0.27);
+    vec3 shallow = vec3(0.18, 0.52, 0.65);
+    vec3 glint   = vec3(0.80, 0.95, 1.00);
+    float depth = length(uv - 0.5)*2.0;
+    vec3 col = mix(deep, shallow, smoothstep(0.0, 1.0, depth));
+    float caus = pow(0.5 + 0.5*sin(warp.x*11.0+time*2.4)*cos(warp.y*9.0+time*1.8), 4.0);
+    col += glint*caus*0.30;
+    float spark = pow(0.5+0.5*sin(uv.x*44.0+time*8.0)*cos(uv.y*37.0+time*7.2), 18.0);
+    col += vec3(1.0)*spark*0.18;
+    float rimA = 1.0 - smoothstep(0.3, 0.5, depth);
+    float alpha = mix(0.92, 0.75, depth)*rimA + 0.12;
+    finalColor = vec4(col, alpha);
+}
+)";
+
 // ── Post-processing state ────────────────────────────────────────────────────
 static RenderTexture2D g_sceneFBO, g_brightFBO, g_blurA, g_blurB, g_godrayFBO,
     g_pixelFBO;
@@ -347,13 +424,70 @@ static bool g_highFidelityMode = true;
 static Shader g_shTriplanar;
 static int g_locSandScale;
 static int g_locTripSunDir, g_locTripCameraPos;
+// ── Frustum culling ───────────────────────────────────────────────────────────
+static float g_frustum[6][4]; // [plane][a,b,c,d]  (normals pointing inward)
+
+// Called once per frame inside BeginMode3D, after camera matrices are loaded.
+static void UpdateFrustumPlanes() {
+  Matrix mv   = rlGetMatrixModelview();
+  Matrix proj = rlGetMatrixProjection();
+  // clip = proj * mv  (transforms world → clip space)
+  Matrix c = MatrixMultiply(proj, mv);
+  // Gribb-Hartmann plane extraction (column-major Raylib Matrix)
+  // Row i of c: {c.m[i], c.m[i+4], c.m[i+8], c.m[i+12]}
+  // Left   = row3 + row0
+  g_frustum[0][0]=c.m3+c.m0; g_frustum[0][1]=c.m7+c.m4;
+  g_frustum[0][2]=c.m11+c.m8; g_frustum[0][3]=c.m15+c.m12;
+  // Right  = row3 - row0
+  g_frustum[1][0]=c.m3-c.m0; g_frustum[1][1]=c.m7-c.m4;
+  g_frustum[1][2]=c.m11-c.m8; g_frustum[1][3]=c.m15-c.m12;
+  // Bottom = row3 + row1
+  g_frustum[2][0]=c.m3+c.m1; g_frustum[2][1]=c.m7+c.m5;
+  g_frustum[2][2]=c.m11+c.m9; g_frustum[2][3]=c.m15+c.m13;
+  // Top    = row3 - row1
+  g_frustum[3][0]=c.m3-c.m1; g_frustum[3][1]=c.m7-c.m5;
+  g_frustum[3][2]=c.m11-c.m9; g_frustum[3][3]=c.m15-c.m13;
+  // Near   = row3 + row2
+  g_frustum[4][0]=c.m3+c.m2; g_frustum[4][1]=c.m7+c.m6;
+  g_frustum[4][2]=c.m11+c.m10; g_frustum[4][3]=c.m15+c.m14;
+  // Far    = row3 - row2
+  g_frustum[5][0]=c.m3-c.m2; g_frustum[5][1]=c.m7-c.m6;
+  g_frustum[5][2]=c.m11-c.m10; g_frustum[5][3]=c.m15-c.m14;
+  // Normalize each plane so d is a signed distance in world units
+  for (int i = 0; i < 6; i++) {
+    float len = sqrtf(g_frustum[i][0]*g_frustum[i][0]
+                    + g_frustum[i][1]*g_frustum[i][1]
+                    + g_frustum[i][2]*g_frustum[i][2]);
+    if (len > 1e-6f) {
+      g_frustum[i][0] /= len; g_frustum[i][1] /= len;
+      g_frustum[i][2] /= len; g_frustum[i][3] /= len;
+    }
+  }
+}
+
+// Returns false if sphere is entirely outside the view frustum.
+static inline bool SphereInFrustum(float cx, float cy, float cz, float r) {
+  for (int i = 0; i < 6; i++) {
+    float d = g_frustum[i][0]*cx + g_frustum[i][1]*cy
+            + g_frustum[i][2]*cz + g_frustum[i][3];
+    if (d < -r) return false;
+  }
+  return true;
+}
+
+// City shaders & primitive models
+static Shader g_shGold, g_shWater;
+static int    g_locGoldTime, g_locGoldCamPos, g_locGoldSunDir;
+static int    g_locWaterTime;
+static Model  g_goldModel, g_waterModel;
+static bool   g_cityModelsReady = false;
 
 // ── Constants
 // ─────────────────────────────────────────────────────────────────
 static constexpr int SCREEN_W = 960;
 static constexpr int SCREEN_H = 640;
-static constexpr int MAP_W = 40;
-static constexpr int MAP_H = 30;
+static constexpr int MAP_W = 200;
+static constexpr int MAP_H = 150;
 static constexpr int INT_W = 10;
 static constexpr int INT_H = 8;
 static constexpr float TILE_W = 1.0f; // 1 world unit = 1 tile
@@ -369,6 +503,27 @@ static constexpr float EXPOSURE = 1.45f; // overexposed desert sun
 // Sun direction for shadow projection (from top-right)
 static constexpr float SUN_DX = -0.5f;
 static constexpr float SUN_DZ = 0.35f;
+// ── Five Cities of Eretz ─────────────────────────────────────────────────────
+static constexpr float CITY_ZAHAV_X  = 100.0f, CITY_ZAHAV_Z  =  12.0f;
+static constexpr float CITY_MAAYAN_X =  22.0f, CITY_MAAYAN_Z =  75.0f;
+static constexpr float CITY_AVAK_X   = 100.0f, CITY_AVAK_Z   = 133.0f;
+static constexpr float CITY_GAN_X    = 177.0f, CITY_GAN_Z    =  75.0f;
+static constexpr float CITY_SELA_X   =  35.0f, CITY_SELA_Z   =  30.0f;
+static constexpr float CITY_RADIUS   =  14.0f;
+static const float CITY_POS[5][2] = {
+  {CITY_ZAHAV_X,  CITY_ZAHAV_Z },
+  {CITY_MAAYAN_X, CITY_MAAYAN_Z},
+  {CITY_AVAK_X,   CITY_AVAK_Z  },
+  {CITY_GAN_X,    CITY_GAN_Z   },
+  {CITY_SELA_X,   CITY_SELA_Z  },
+};
+static const char *CITY_NAMES[] = {
+  "Zahav - The Golden Citadel",
+  "Ma'ayan - The Oasis",
+  "Avak - The Dust Town",
+  "Gan - The Blooming Town",
+  "Sela - The Canyon Town"
+};
 
 enum Dir { DIR_DOWN = 0, DIR_UP, DIR_LEFT, DIR_RIGHT, DIR_COUNT };
 static constexpr int FRAMES_PER_DIR = 3;
@@ -412,6 +567,22 @@ static void InitPostProcessing() {
   g_locSandScale = GetShaderLocation(g_shTriplanar, "sandScale");
   g_locTripSunDir = GetShaderLocation(g_shTriplanar, "sunDir");
   g_locTripCameraPos = GetShaderLocation(g_shTriplanar, "cameraPos");
+  // ── City shaders ──────────────────────────────────────────────────────────
+  g_shGold = LoadShaderFromMemory(VS_GOLD, FS_GOLD);
+  g_locGoldTime   = GetShaderLocation(g_shGold, "time");
+  g_locGoldCamPos = GetShaderLocation(g_shGold, "cameraPos");
+  g_locGoldSunDir = GetShaderLocation(g_shGold, "sunDir");
+  g_shWater = LoadShaderFromMemory(nullptr, FS_WATER);
+  g_locWaterTime = GetShaderLocation(g_shWater, "time");
+  // Gold unit-cube model (used by DrawGoldBuilding)
+  Mesh goldMesh = GenMeshCube(1.0f, 1.0f, 1.0f);
+  g_goldModel   = LoadModelFromMesh(goldMesh);
+  g_goldModel.materials[0].shader = g_shGold;
+  // Water plane model (used by DrawWaterPlane)
+  Mesh waterMesh = GenMeshPlane(1.0f, 1.0f, 1, 1);
+  g_waterModel   = LoadModelFromMesh(waterMesh);
+  g_waterModel.materials[0].shader = g_shWater;
+  g_cityModelsReady = true;
 }
 static void CleanupPostProcessing() {
   UnloadRenderTexture(g_sceneFBO);
@@ -482,6 +653,7 @@ struct ChibiColors {
   Color outline;                // Edge tint (used for eyelashes etc.)
 };
 
+enum NpcRole { NPC_ROLE_NORMAL=0, NPC_ROLE_SHOP, NPC_ROLE_TOURNAMENT };
 struct NPC {
   int gx, gy;
   float worldX, worldZ;
@@ -492,6 +664,8 @@ struct NPC {
   float facingAngle;    // current Y-rotation in degrees (0=south, 90=west, etc.)
   float targetAngle;    // desired Y-rotation
   ChibiColors colors;   // vinyl figure colors
+  NpcRole role;         // NPC_ROLE_SHOP opens shop, NPC_ROLE_TOURNAMENT starts tournament
+  int cityIndex;        // city (0-4) for tournament masters
 };
 struct Particle {
   float x, y, vx, vy, life, maxLife, size;
@@ -530,10 +704,17 @@ static Camera3D g_cam;
 static Camera3D matchCam;
 static Player g_player;
 static ChibiColors g_playerColors; // 3D chibi palette (initialized in InitOverworld)
+
+// Fast player-distance squared (ground plane only, no sqrt) — placed after g_player
+static inline float DistSqToPlayer(float wx, float wz) {
+  float dx = wx - g_player.posX, dz = wz - g_player.posZ;
+  return dx*dx + dz*dz;
+}
 static Texture2D g_sandTex, g_stormTex, g_torchGlow, g_signTextures[4];
 static std::vector<Tent> g_tents;
 static std::vector<Rock> g_rocks;
-static NPC g_npcs[4];
+static NPC g_npcs[40];
+static int g_numNpcs = 0;
 static float g_time = 0.0f;
 static Scene g_scene = SCENE_OVERWORLD;
 static int g_savedGridX = 0, g_savedGridY = 0;
@@ -1192,9 +1373,10 @@ static bool CardHasKeyword(const CardDef &cd, const char *kw) {
 
 // ── Match State ─────────────────────────────────────────────────────────────
 static constexpr int MAX_HAND = 10;
-static constexpr int MAX_FIELD = 8;
-static constexpr int MAX_DECK = 40;
+static constexpr int MAX_FIELD = 5;
+static constexpr int MAX_DECK = 60;
 static constexpr int MAX_GRAVE = 60;
+static constexpr int MAX_OBLIVION = 30;
 
 struct FieldUnit {
   int cardId;             // references ALL_CARDS by id
@@ -1220,6 +1402,8 @@ struct MatchPlayer {
   int fieldSize;
   int grave[MAX_GRAVE];
   int graveSize;
+  int oblivion[MAX_OBLIVION]; // banished cards
+  int oblivionSize;
   bool isAI;
 };
 
@@ -1261,6 +1445,692 @@ struct GameMatch {
 };
 
 static GameMatch g_match;
+
+// ── Match Visual Effects ────────────────────────────────────────────────────
+static constexpr int MAX_FLOAT_TEXT = 16;
+struct FloatText {
+  char text[32];
+  float x, y;
+  float life;
+  Color color;
+  bool active;
+};
+static FloatText g_floatTexts[MAX_FLOAT_TEXT];
+static int g_matchHoverHand = -1;
+static int g_matchHoverField = -1;
+static int g_matchHoverEnemyField = -1;
+
+// Fixed 3D Perspective Camera at 60° downward tilt (spec: physical table feel)
+// Position (0, 20, 11.5): atan2(20, 11.5) ≈ 60.1° depression angle
+static Camera3D g_matchCam = {
+    {0.0f, 20.0f, 11.5f},  // position: 60° downward tilt above table
+    {0.0f, 0.0f, 0.0f},    // target: center of table
+    {0.0f, 1.0f, 0.0f},    // up
+    60.0f,                   // 60° perspective FOV (spec)
+    CAMERA_PERSPECTIVE};
+
+// ── Card texture constants (declared early for arena draw helpers) ────────────
+static constexpr int CARD_TEX_W = 96;
+static constexpr int CARD_TEX_H = 128;
+static Texture2D g_cardTextures[200]; // one per card ID (up to 193 + extra)
+static int g_numCardTextures = 0;
+
+// ── Arena VFX State ──────────────────────────────────────────────────────────
+struct ArenaBurst {
+  float x, y;    // screen-space position
+  float vx, vy;  // velocity
+  float life;    // 1.0 → 0.0
+  float size;
+  Color col;
+  bool active;
+};
+static constexpr int ARENA_BURST_MAX = 80;
+static ArenaBurst    g_arenaBursts[ARENA_BURST_MAX];
+
+// Combat targeting arrow (screen-space, drawn during ACTIVATE selection)
+static bool    g_arrowActive = false;
+static Vector2 g_arrowSrc   = {};
+static Vector2 g_arrowDst   = {};
+
+// AI "Thinking..." indicator
+static float g_aiThinkTimer  = 0.0f;
+
+// Oblivion portal pulse phase
+static float g_oblivionPulse = 0.0f;
+
+// ── Spawn arena burst particles ──────────────────────────────────────────────
+static void SpawnArenaBurst(float x, float y, int count, Color col) {
+  for (int i = 0; i < count; i++) {
+    for (int k = 0; k < ARENA_BURST_MAX; k++) {
+      if (!g_arenaBursts[k].active) {
+        float angle = (float)(rand() % 628) * 0.01f;
+        float speed = 40.0f + (float)(rand() % 90);
+        g_arenaBursts[k] = {x, y,
+                             cosf(angle) * speed,
+                             sinf(angle) * speed - 20.0f,
+                             1.0f, (float)(3 + rand() % 5), col, true};
+        break;
+      }
+    }
+  }
+}
+
+// ── Update arena VFX (called from UpdateMatch each frame) ──────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Forward declarations for anim helpers (defined later)
+static Vector3 GetFieldSlotPos(int playerIdx, int slotIdx, int totalUnits);
+static Rectangle GetHandCardRect(int idx, int handSize);
+
+// ── CardView — must be defined before DrawCardAnims ──────────────────────────
+struct CardView {
+  int  cardId    = 0;
+  int  atk       = 0;
+  int  def       = 0;
+  int  cost      = 0;
+  int  rarity    = 0;   // 0=common  1=rare  2=unique
+  bool isPlayable = false;
+  float hoverRotX = 0.f, hoverRotY = 0.f;
+  float hoverVelX = 0.f, hoverVelY = 0.f;
+  float scale    = 1.f;
+  float scaleVel = 0.f;
+
+  void Init(int id, bool doEnter = false) {
+    if (id <= 0 || id >= NUM_ALL_CARDS) return;
+    const CardDef &cd = ALL_CARDS[id];
+    cardId = cd.id; atk = cd.atk; def = cd.def; cost = cd.cost;
+    rarity = cd.isUnique ? 2 : cd.rarity;
+    if (doEnter) { scale = 0.8f; scaleVel = 0.f; } else scale = 1.0f;
+  }
+  void Update(float dt, bool hovered, Vector2 mouseRel) {
+    float tgtX = hovered ? Clamp( mouseRel.y * 0.018f, -0.25f, 0.25f) : 0.f;
+    float tgtY = hovered ? Clamp(-mouseRel.x * 0.018f, -0.25f, 0.25f) : 0.f;
+    const float k = 18.f, damp = 8.f;
+    hoverVelX += (tgtX - hoverRotX) * k * dt - hoverVelX * damp * dt;
+    hoverVelY += (tgtY - hoverRotY) * k * dt - hoverVelY * damp * dt;
+    hoverRotX += hoverVelX * dt; hoverRotY += hoverVelY * dt;
+    const float ks = 20.f, ds = 7.f;
+    scaleVel += (1.0f - scale) * ks * dt - scaleVel * ds * dt;
+    scale     = Clamp(scale + scaleVel * dt, 0.0f, 1.15f);
+  }
+  void UpdateStats(int newAtk, int newDef) { atk = newAtk; def = newDef; }
+};
+
+static void DrawCardView(Rectangle rect, const CardView &view, int artTexId); // fwd
+
+// §CARD-ANIM   Bezier Tweening Engine (non-blocking card animations)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Easing functions ──────────────────────────────────────────────────────────
+static float EaseInOutCubic(float t) {
+  t = Clamp(t, 0.f, 1.f);
+  return t < 0.5f ? 4*t*t*t : 1.f - powf(-2*t+2, 3)*0.5f;
+}
+static float EaseOutBack(float t) {          // overshoot for "slam"
+  t = Clamp(t, 0.f, 1.f);
+  const float c1 = 1.70158f, c3 = c1 + 1.f;
+  return 1.f + c3*powf(t-1.f,3) + c1*powf(t-1.f,2);
+}
+static float EaseInCubic(float t)  { t=Clamp(t,0.f,1.f); return t*t*t; }
+static float EaseOutCubic(float t) { t=Clamp(t,0.f,1.f); float s=1-t; return 1-s*s*s; }
+
+// ── Bezier helpers ────────────────────────────────────────────────────────────
+static Vector2 BezQ(Vector2 p0, Vector2 p1, Vector2 p2, float t) {
+  float m = 1-t;
+  return {m*m*p0.x + 2*m*t*p1.x + t*t*p2.x,
+          m*m*p0.y + 2*m*t*p1.y + t*t*p2.y};
+}
+
+// ── Screen-shake ──────────────────────────────────────────────────────────────
+static float g_shakeTimer = 0.f, g_shakeMag = 0.f;
+static Vector2 ShakeOff() {
+  if (g_shakeTimer <= 0.f) return {0,0};
+  float t = g_shakeTimer;
+  return {sinf(t * 89.3f) * g_shakeMag * t,
+          cosf(t * 67.1f) * g_shakeMag * t};
+}
+
+// ── Animation pool ────────────────────────────────────────────────────────────
+enum CardAnimType { CA_NONE=0, CA_DRAW, CA_PLAY, CA_DESTROY, CA_ERASE, CA_ATTACK };
+struct CardAnim {
+  bool          active;
+  CardAnimType  type;
+  int           cardId;
+  float         elapsed, duration, startDelay;
+  // Quadratic Bezier
+  Vector2       p0, p1, p2;
+  // Rebound (attack)
+  Vector2       rb0, rb1, rb2;
+  bool          rebounding;
+  float         rbElapsed, rbDuration;
+  // Visuals
+  float         scale, alpha, rot;
+  Color         glowColor;
+  float         glowAlpha;
+  bool          grayscale, showBack;
+  float         dissolve;  // 0=solid 1=gone
+  // Soul particle (destroy)
+  bool          soulActive;
+  Vector2       soulPos, soulDst;
+  float         soulElapsed;
+  // Entry flash flag (prevents re-triggering landing effects)
+  bool          landedFx;
+  // Draw-and-Reveal: player draw flips at t=0.5; AI draw stays face-down
+  bool          isReveal;
+};
+static constexpr int CA_POOL = 16;
+static CardAnim g_cardAnims[CA_POOL];
+
+// Enter-trigger display state
+static float   g_enterFxTimer  = 0.f;
+static Vector2 g_enterFxPos;
+static Color   g_enterFxColor  = {255, 200, 60, 255};
+static int     g_enterFxCardId = -1;
+
+// Hand spring-spread offsets (X) driven by hover index
+static float g_hspringOff[MAX_HAND] = {};
+static float g_hspringVel[MAX_HAND] = {};
+
+// ── Allocate ──────────────────────────────────────────────────────────────────
+static CardAnim* AllocCA() {
+  for (int i = 0; i < CA_POOL; i++) {
+    if (!g_cardAnims[i].active) {
+      g_cardAnims[i] = {};
+      g_cardAnims[i].active = true;
+      g_cardAnims[i].scale  = 1.f;
+      g_cardAnims[i].alpha  = 1.f;
+      return &g_cardAnims[i];
+    }
+  }
+  return nullptr; // pool full
+}
+
+// ── AnimationQueue — centralized command sequencer ────────────────────────────
+enum AnimCmdType { ACMD_NONE=0, ACMD_DRAW, ACMD_PLAY, ACMD_DESTROY, ACMD_ATTACK };
+struct AnimCmd {
+  AnimCmdType type;
+  int         cardId;
+  bool        parallelGroup; // fire alongside previous command without waiting
+  bool        isPlayer;      // true=player (Draw-and-Reveal), false=AI (face-down)
+  Vector2     from, ctrl, to;
+  float       duration;
+};
+static constexpr int ANIM_Q_CAP = 32;
+static AnimCmd g_animCmdQueue[ANIM_Q_CAP];
+static int  g_animQHead     = 0;
+static int  g_animQTail     = 0;
+static bool g_animUILocked  = false;
+static bool g_prevAnimLocked = false;   // for pending-draw flush edge detection
+
+// Pending draw buffer: human player cards waiting for CA_DRAW to finish
+static int  g_pendingDrawCards[32];
+static int  g_pendingDrawCount = 0;
+
+static bool AnyCA_Active() {
+  for (int i = 0; i < CA_POOL; i++)
+    if (g_cardAnims[i].active) return true;
+  return false;
+}
+
+static void EnqueueAnim(AnimCmd cmd) {
+  int next = (g_animQTail + 1) % ANIM_Q_CAP;
+  if (next == g_animQHead) return; // queue full — drop
+  g_animCmdQueue[g_animQTail] = cmd;
+  g_animQTail = next;
+}
+
+static void FireAnimCmd(const AnimCmd &cmd) {
+  CardAnim *a = AllocCA();
+  if (!a) return;
+  a->cardId    = cmd.cardId;
+  a->duration  = cmd.duration > 0.f ? cmd.duration : 0.5f;
+  a->p0 = cmd.from; a->p1 = cmd.ctrl; a->p2 = cmd.to;
+  a->alpha = 1.f;
+  switch (cmd.type) {
+  case ACMD_DRAW:
+    a->type     = CA_DRAW;
+    a->showBack = true;
+    a->isReveal = cmd.isPlayer;
+    a->scale    = 0.75f;
+    break;
+  case ACMD_PLAY:
+    a->type     = CA_PLAY;
+    a->showBack = false;
+    a->scale    = 1.f;
+    a->duration = cmd.duration > 0.f ? cmd.duration : 0.4f;
+    break;
+  case ACMD_DESTROY:
+    a->type    = CA_DESTROY;
+    a->soulDst = {cmd.to.x, cmd.to.y};
+    a->duration = cmd.duration > 0.f ? cmd.duration : 0.7f;
+    break;
+  case ACMD_ATTACK:
+    a->type      = CA_ATTACK;
+    a->rb0 = cmd.to; a->rb1 = cmd.ctrl; a->rb2 = cmd.from;
+    a->rbDuration = 0.2f;
+    a->duration   = cmd.duration > 0.f ? cmd.duration : 0.25f;
+    break;
+  default: a->active = false; break;
+  }
+}
+
+// Called each frame from UpdateMatch/UpdateOverworld
+static void UpdateAnimQueue() {
+  if (g_animQHead == g_animQTail) {
+    // Queue is empty — unlock UI if no active anims
+    g_animUILocked = AnyCA_Active();
+    return;
+  }
+  // Only advance queue when all current animations are done
+  if (!AnyCA_Active()) {
+    // Fire head command
+    FireAnimCmd(g_animCmdQueue[g_animQHead]);
+    g_animQHead = (g_animQHead + 1) % ANIM_Q_CAP;
+    // Fire any consecutive commands in the same parallelGroup
+    while (g_animQHead != g_animQTail &&
+           g_animCmdQueue[g_animQHead].parallelGroup) {
+      FireAnimCmd(g_animCmdQueue[g_animQHead]);
+      g_animQHead = (g_animQHead + 1) % ANIM_Q_CAP;
+    }
+  }
+  g_animUILocked = true; // queue not empty or anims active
+}
+
+// Flush the animation queue (e.g. on scene change)
+static void ClearAnimQueue() {
+  g_animQHead = g_animQTail = 0;
+  for (int i = 0; i < CA_POOL; i++) g_cardAnims[i].active = false;
+  g_animUILocked = false;
+}
+
+// ── Update ────────────────────────────────────────────────────────────────────
+static void UpdateCardAnims(float dt) {
+  g_shakeTimer = fmaxf(0.f, g_shakeTimer - dt);
+  g_enterFxTimer = fmaxf(0.f, g_enterFxTimer - dt);
+
+  for (int i = 0; i < CA_POOL; i++) {
+    CardAnim &a = g_cardAnims[i];
+    if (!a.active) continue;
+    if (a.startDelay > 0.f) { a.startDelay -= dt; continue; }
+    a.elapsed += dt;
+    float t = Clamp(a.elapsed / a.duration, 0.f, 1.f);
+
+    switch (a.type) {
+    case CA_DRAW:
+      if (a.isReveal) {
+        // Player draw: face-down travel → flip at t=0.5 → reveal + settle 1.1x → back to 1.0x
+        a.showBack = (t < 0.5f);
+        if (t < 0.5f) {
+          a.scale = 0.75f + t * 0.35f;  // grow during travel
+        } else {
+          float tp = (t - 0.5f) / 0.5f;          // 0..1 after flip
+          float settle = (tp < 0.4f)
+            ? (1.0f + 0.1f * sinf(tp * 3.14159f / 0.4f))  // 1.0→1.1→1.0
+            : 1.0f;
+          a.scale = settle;
+        }
+      } else {
+        // AI draw: stays face-down the whole arc
+        a.showBack = true;
+        a.scale    = 0.75f + t * 0.25f;
+      }
+      a.alpha = 1.f;
+      if (t >= 1.f) a.active = false;
+      break;
+
+    case CA_PLAY: {
+      float peak = sinf(t * 3.14159f);
+      a.scale     = 1.f + 0.22f * peak;
+      a.glowAlpha = peak * 0.9f;
+      a.alpha     = 1.f;
+      if (!a.landedFx && t >= 0.88f) {
+        a.landedFx = true;
+        g_shakeTimer = 0.18f; g_shakeMag = 6.f;
+        SpawnArenaBurst(a.p2.x, a.p2.y, 18, {220, 200, 80, 200});
+      }
+      if (t >= 1.f) a.active = false;
+      break;
+    }
+    case CA_DESTROY:
+      if (t < 0.25f) {                    // shake phase
+        a.rot  = sinf(t * 160.f) * 9.f;
+        a.scale = 1.f;  a.alpha = 1.f;  a.grayscale = false;
+      } else {                            // dissolve phase
+        float d = (t - 0.25f) / 0.75f;
+        a.rot       = 0.f;
+        a.grayscale = true;
+        a.dissolve  = d;
+        a.alpha     = 1.f - d;
+        a.scale     = 1.f - d * 0.3f;
+        if (!a.soulActive && d > 0.28f) {
+          a.soulActive  = true;
+          a.soulPos     = a.p0;
+          a.soulElapsed = 0.f;
+        }
+      }
+      if (a.soulActive) {
+        a.soulElapsed += dt;
+        float st = Clamp(a.soulElapsed / 0.55f, 0.f, 1.f);
+        a.soulPos = {a.p0.x + (a.soulDst.x - a.p0.x) * EaseInCubic(st),
+                     a.p0.y + (a.soulDst.y - a.p0.y) * EaseInCubic(st)};
+      }
+      if (t >= 1.f) a.active = false;
+      break;
+
+    case CA_ERASE:
+      a.scale = 1.f - EaseInCubic(t);
+      a.rot   = t * 720.f;
+      a.alpha = 1.f - t;
+      if (t >= 1.f) a.active = false;
+      break;
+
+    case CA_ATTACK:
+      if (!a.rebounding) {
+        a.scale = 1.f + EaseOutCubic(t) * 0.18f;
+        if (t >= 1.f) { a.rebounding = true; a.rbElapsed = 0.f; }
+      } else {
+        a.rbElapsed += dt;
+        float rt = Clamp(a.rbElapsed / a.rbDuration, 0.f, 1.f);
+        a.scale = 1.18f - EaseOutCubic(rt) * 0.18f;
+        if (rt >= 1.f) a.active = false;
+      }
+      break;
+
+    default: a.active = false; break;
+    }
+  }
+
+  // Hand spring simulation
+  GameMatch &m = g_match;
+  MatchPlayer &human = m.players[0];
+  int hov = (m.phase == PHASE_DEVELOP || m.phase == PHASE_ACTIVATE)
+              ? g_matchHoverHand : -1;
+  for (int i = 0; i < human.handSize && i < MAX_HAND; i++) {
+    float tgt = 0.f;
+    if (hov >= 0) {
+      int d = i - hov;
+      if      (d == -2) tgt = -9.f;
+      else if (d == -1) tgt = -19.f;
+      else if (d ==  1) tgt = +19.f;
+      else if (d ==  2) tgt = +9.f;
+    }
+    float f = 14.f * (tgt - g_hspringOff[i]) - 7.f * g_hspringVel[i];
+    g_hspringVel[i] += f * dt;
+    g_hspringOff[i] += g_hspringVel[i] * dt;
+  }
+}
+
+// ── Draw ──────────────────────────────────────────────────────────────────────
+static void DrawCardAnims() {
+  Vector2 shake = ShakeOff();
+  float cw = 75.f, ch = 105.f;
+
+  for (int i = 0; i < CA_POOL; i++) {
+    CardAnim &a = g_cardAnims[i];
+    if (!a.active || a.startDelay > 0.f) continue;
+    float t = Clamp(a.elapsed / a.duration, 0.f, 1.f);
+
+    // Compute screen position
+    Vector2 pos;
+    switch (a.type) {
+    case CA_DRAW:    pos = BezQ(a.p0, a.p1, a.p2, EaseInOutCubic(t)); break;
+    case CA_PLAY:    pos = BezQ(a.p0, a.p1, a.p2, EaseOutBack(Clamp(t,0,1))); break;
+    case CA_DESTROY:
+    case CA_ERASE:   pos = a.p0; break;
+    case CA_ATTACK:
+      if (!a.rebounding)
+        pos = BezQ(a.p0, a.p1, a.p2, EaseOutCubic(t));
+      else {
+        float rt = Clamp(a.rbElapsed / a.rbDuration, 0.f, 1.f);
+        pos = BezQ(a.rb0, a.rb1, a.rb2, EaseOutCubic(rt));
+      }
+      break;
+    default: continue;
+    }
+    pos.x += shake.x;
+    pos.y += shake.y;
+
+    float w = cw * a.scale, h = ch * a.scale;
+    Rectangle dr = {pos.x - w*0.5f, pos.y - h*0.5f, w, h};
+    Vector2 origin = {w*0.5f, h*0.5f};
+
+    // Full card frame — use DrawCardView for consistent layout
+    if (!a.showBack && a.cardId > 0 && a.cardId < (int)NUM_ALL_CARDS) {
+      CardView av; av.Init(a.cardId);
+      av.scale = a.scale;
+      DrawCardView(dr, av, a.cardId);
+      // Dissolve / grayscale veil
+      if (a.dissolve > 0.01f || a.grayscale) {
+        unsigned char veilA = (unsigned char)Clamp(
+            (a.dissolve * 200.f) + (a.grayscale ? 80.f : 0.f), 0.f, 220.f);
+        DrawRectangleRounded(dr, 0.10f, 4, {0, 0, 0, veilA});
+      }
+    } else if (a.showBack) {
+      DrawRectangleRounded(dr, 0.12f, 4, {48, 36, 68, (unsigned char)(a.alpha * 215)});
+      DrawRectangleRoundedLinesEx(dr, 0.12f, 4, 2.f, {160, 130, 210, 180});
+      DrawText("?", (int)(pos.x - 6), (int)(pos.y - 9), 20,
+               {180, 150, 255, (unsigned char)(a.alpha * 255)});
+    } else {
+      DrawRectangleRounded(dr, 0.12f, 4, {40, 28, 12, 250});
+      DrawRectangleRoundedLinesEx(dr, 0.12f, 4, 2.0f, {182, 150, 52, 230});
+    }
+
+    // Glow overlay (PLAY cost color) — drawn after card frame
+    if (a.glowAlpha > 0.01f) {
+      Color gc = a.glowColor; gc.a = (unsigned char)(a.glowAlpha * 110);
+      DrawRectangleRounded(dr, 0.12f, 4, gc);
+    }
+
+    // Fade veil for alpha < 1 (draw / play animations)
+    if (a.alpha < 0.99f) {
+      DrawRectangleRounded(dr, 0.12f, 4, {0, 0, 0, (unsigned char)((1.f - a.alpha) * 210)});
+    }
+
+    // Soul particle (DESTROY)
+    if (a.soulActive) {
+      float sa = Clamp(1.f - a.soulElapsed / 0.55f, 0.f, 1.f);
+      DrawCircle((int)a.soulPos.x, (int)a.soulPos.y,
+                 (int)(7*sa + 2), {200, 180, 255, (unsigned char)(sa*190)});
+      DrawCircle((int)a.soulPos.x, (int)a.soulPos.y,
+                 (int)(3*sa + 1), {255, 245, 255, (unsigned char)(sa*255)});
+    }
+  }
+
+  // Enter-trigger gold pulse border
+  if (g_enterFxTimer > 0.f && g_enterFxCardId >= 0) {
+    float alpha = fminf(g_enterFxTimer * 5.f, 1.f);
+    float pulse = sinf(g_time * 14.f) * 0.5f + 0.5f;
+    float ew = cw * (1.08f + pulse * 0.04f), eh = ch * (1.08f + pulse * 0.04f);
+    Rectangle er = {g_enterFxPos.x - ew*0.5f, g_enterFxPos.y - eh*0.5f, ew, eh};
+    DrawRectangleRoundedLinesEx(er, 0.12f, 4, 3.5f + pulse * 1.5f,
+      {(unsigned char)(255*alpha), (unsigned char)((180 + (int)(pulse*75))*alpha),
+       (unsigned char)(30*alpha),  (unsigned char)(230*alpha)});
+    int tw = MeasureText("ENTER!", 11);
+    DrawText("ENTER!", (int)(g_enterFxPos.x - tw/2), (int)(g_enterFxPos.y - eh*0.5f - 18),
+             11, {255, 220, 80, (unsigned char)(200*alpha)});
+  }
+}
+
+// ── Returns time (sec) until all queued+active animations finish ──────────────
+static float AnimQueueEnd() {
+  float maxEnd = 0.f;
+  for (int i = 0; i < CA_POOL; i++) {
+    if (!g_cardAnims[i].active) continue;
+    float remaining = g_cardAnims[i].startDelay
+                    + g_cardAnims[i].duration
+                    - g_cardAnims[i].elapsed;
+    if (remaining > maxEnd) maxEnd = remaining;
+  }
+  return fmaxf(0.f, maxEnd);
+}
+
+// ── Trigger helpers ───────────────────────────────────────────────────────────
+static void AnimDraw(int cardId, int nextHandIdx, int handSize, float delay) {
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type      = CA_DRAW;
+  a->cardId    = cardId;
+  a->duration  = 0.50f;
+  a->startDelay = AnimQueueEnd() + delay; // chain after current anim
+  a->showBack  = true;
+  a->isReveal  = true; // player draw always reveals
+  // Start: player deck 3D projected
+  Vector3 dk3 = {10.5f, 0.5f, 5.5f};
+  a->p0 = GetWorldToScreen(dk3, g_matchCam);
+  Rectangle hr = GetHandCardRect(nextHandIdx, handSize + 1);
+  a->p2 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
+  a->p1 = {(a->p0.x + a->p2.x)*0.5f, fminf(a->p0.y, a->p2.y) - 195.f};
+}
+
+static void AnimPlay(int cardId, int handIdx, int handSize,
+                     int fieldIdx, int newFieldSize, int playerIdx,
+                     Color glowCol) {
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type      = CA_PLAY;
+  a->cardId    = cardId;
+  a->duration  = 0.50f;
+  a->startDelay = AnimQueueEnd(); // chain after current anim
+  a->glowColor = glowCol;
+  Rectangle hr = GetHandCardRect(handIdx, handSize);
+  a->p0 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
+  Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
+  a->p2 = GetWorldToScreen(fp, g_matchCam);
+  a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y - 90.f};
+}
+
+static void AnimDestroy(int cardId, int playerIdx, int fieldIdx, int fieldSize) {
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type       = CA_DESTROY;
+  a->cardId     = cardId;
+  a->duration   = 0.50f;
+  a->startDelay = AnimQueueEnd();
+  Vector3 fp  = GetFieldSlotPos(playerIdx, fieldIdx, fieldSize);
+  a->p0       = GetWorldToScreen(fp, g_matchCam);
+  // Soul target = graveyard
+  Vector3 gv  = {-10.5f, 0.5f, (playerIdx == 0) ? 5.5f : -6.5f};
+  a->soulDst  = GetWorldToScreen(gv, g_matchCam);
+}
+
+static void AnimErase(int cardId, int playerIdx, int fieldIdx, int fieldSize) {
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type       = CA_ERASE;
+  a->cardId     = cardId;
+  a->duration   = 0.50f;
+  a->startDelay = AnimQueueEnd();
+  Vector3 fp  = GetFieldSlotPos(playerIdx, fieldIdx, fieldSize);
+  a->p0       = GetWorldToScreen(fp, g_matchCam);
+}
+
+static void AnimAttack(int atkPl, int atkIdx, int atkTotal,
+                       int defPl, int defIdx, int defTotal) {
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type       = CA_ATTACK;
+  a->cardId     = g_match.players[atkPl].field[atkIdx].cardId;
+  a->duration   = 0.25f;
+  a->rbDuration = 0.25f;
+  a->startDelay = AnimQueueEnd();
+  Vector3 ap = GetFieldSlotPos(atkPl, atkIdx, atkTotal);
+  a->p0 = GetWorldToScreen(ap, g_matchCam);
+  Vector2 tgt;
+  if (defIdx >= 0) {
+    Vector3 dp = GetFieldSlotPos(defPl, defIdx, defTotal);
+    tgt = GetWorldToScreen(dp, g_matchCam);
+  } else {
+    tgt = {SCREEN_W * 0.5f, (float)(defPl == 1 ? 62 : SCREEN_H - 175)};
+  }
+  // Lunge slightly past target
+  Vector2 dir = {tgt.x - a->p0.x, tgt.y - a->p0.y};
+  float len = sqrtf(dir.x*dir.x + dir.y*dir.y);
+  if (len > 0.01f) { dir.x /= len; dir.y /= len; }
+  a->p2 = {tgt.x + dir.x*22, tgt.y + dir.y*22};
+  a->p1 = {(a->p0.x + a->p2.x)*0.5f, (a->p0.y + a->p2.y)*0.5f - 18.f};
+  // Rebound back
+  a->rb0 = a->p2;  a->rb2 = a->p0;
+  a->rb1 = {(a->rb0.x + a->rb2.x)*0.5f, (a->rb0.y + a->rb2.y)*0.5f - 30.f};
+}
+
+static void UpdateArenaVFX(float dt) {
+  for (int i = 0; i < ARENA_BURST_MAX; i++) {
+    ArenaBurst &b = g_arenaBursts[i];
+    if (!b.active) continue;
+    b.x  += b.vx * dt;
+    b.y  += b.vy * dt;
+    b.vy += 120.0f * dt;  // gravity pull
+    b.life -= dt * 1.6f;
+    if (b.life <= 0) b.active = false;
+  }
+  if (g_aiThinkTimer > 0) g_aiThinkTimer -= dt;
+  g_oblivionPulse += dt * 2.5f;
+}
+
+static void SpawnFloatText(float x, float y, const char *txt, Color col) {
+  for (int i = 0; i < MAX_FLOAT_TEXT; i++) {
+    if (!g_floatTexts[i].active) {
+      snprintf(g_floatTexts[i].text, 32, "%s", txt);
+      g_floatTexts[i].x = x;
+      g_floatTexts[i].y = y;
+      g_floatTexts[i].life = 1.5f;
+      g_floatTexts[i].color = col;
+      g_floatTexts[i].active = true;
+      return;
+    }
+  }
+}
+
+static void UpdateFloatTexts(float dt) {
+  for (int i = 0; i < MAX_FLOAT_TEXT; i++) {
+    if (g_floatTexts[i].active) {
+      g_floatTexts[i].y -= 40.0f * dt;
+      g_floatTexts[i].life -= dt;
+      if (g_floatTexts[i].life <= 0)
+        g_floatTexts[i].active = false;
+    }
+  }
+}
+
+static void DrawFloatTexts() {
+  for (int i = 0; i < MAX_FLOAT_TEXT; i++) {
+    if (g_floatTexts[i].active) {
+      unsigned char alpha =
+          (unsigned char)(255 * fminf(g_floatTexts[i].life, 1.0f));
+      Color c = g_floatTexts[i].color;
+      c.a = alpha;
+      DrawText(g_floatTexts[i].text, (int)g_floatTexts[i].x,
+               (int)g_floatTexts[i].y, 22, c);
+    }
+  }
+}
+
+// Get 3D world position for a field card slot
+static Vector3 GetFieldSlotPos(int playerIdx, int slotIdx, int totalUnits) {
+  float z = (playerIdx == 0) ? 3.5f : -2.5f;  // player near camera = screen-bottom
+  float spacing = 3.2f;
+  float startX = -(totalUnits - 1) * spacing / 2.0f;
+  return {startX + slotIdx * spacing, 0.08f, z};
+}
+
+// Get screen rectangle for a hand card (2D overlay)
+static Rectangle GetHandCardRect(int idx, int handSize) {
+  float cardW = 88, cardH = 126;
+  float gap = 6;
+  float totalW = handSize * (cardW + gap) - gap;
+  float startX = (SCREEN_W - totalW) / 2.0f;
+  // Fan arc: center card is highest, edge cards dip down parabolically
+  float center = (handSize - 1) * 0.5f;
+  float dist   = fabsf((float)idx - center);
+  float fanDip = dist * dist * 3.8f;   // up to ~19px dip at edge of 7-card hand
+  float y = SCREEN_H - cardH - 10 + fanDip;
+  if (idx == g_matchHoverHand)
+    y -= 40;                            // hover: lift card well above the zone
+  return {startX + idx * (cardW + gap), y, cardW, cardH};
+}
+
+// Get screen rectangle for a field unit (projected from 3D)
+static Rectangle GetFieldScreenRect(int playerIdx, int slotIdx, int totalUnits,
+                                     float w, float h) {
+  Vector3 pos = GetFieldSlotPos(playerIdx, slotIdx, totalUnits);
+  Vector2 sp = GetWorldToScreen(pos, g_matchCam);
+  return {sp.x - w / 2, sp.y - h / 2, w, h};
+}
 
 // ── Player Collection & Shop ────────────────────────────────────────────────
 static constexpr int MAX_COLLECTION = 600;
@@ -1559,6 +2429,7 @@ struct TournamentManager {
   }
 };
 static TournamentManager g_tournament;
+static bool g_tournamentMode = false; // true = match is a tournament round
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DAY/NIGHT CYCLE — 4 states with shop price modifiers
@@ -1877,6 +2748,7 @@ static const CardDef &GetCard(int id) {
 static void StartMatch(int npcIdx) {
   srand((unsigned)time(nullptr));
   memset(&g_match, 0, sizeof(g_match));
+  memset(g_floatTexts, 0, sizeof(g_floatTexts));
   g_match.active = true;
   g_match.challengedNPC = npcIdx;
   g_match.turn = 0;
@@ -1898,6 +2770,7 @@ static void StartMatch(int npcIdx) {
     mp.handSize = 0;
     mp.fieldSize = 0;
     mp.graveSize = 0;
+    mp.oblivionSize = 0;
     mp.isAI = (p == 1);
 
     if (p == 0) {
@@ -1922,8 +2795,19 @@ static void StartMatch(int npcIdx) {
 static bool MatchDrawCard(MatchPlayer &mp) {
   if (mp.deckSize <= 0)
     return false;
+  if (&mp == &g_match.players[0]) {
+    // Human player: fire animation FIRST, add card to hand only after anim ends
+    if (mp.handSize >= MAX_HAND)
+      return false; // hand full
+    int cardId = mp.deck[--mp.deckSize];
+    AnimDraw(cardId, mp.handSize, mp.handSize, 0.f);
+    if (g_pendingDrawCount < 32)
+      g_pendingDrawCards[g_pendingDrawCount++] = cardId;
+    return true;
+  }
+  // AI player: no animation, add immediately
   if (mp.handSize >= MAX_HAND)
-    return false; // hand full, card lost
+    return false;
   mp.hand[mp.handSize++] = mp.deck[--mp.deckSize];
   return true;
 }
@@ -1954,6 +2838,12 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
     return false;
 
   mp.coins -= cd.cost;
+  // Animate: card travels from hand to field
+  {
+    Color gc = {220, 180, 40, 255};  // yellow = coin cost
+    AnimPlay(cardId, handIdx, mp.handSize, mp.fieldSize, mp.fieldSize + 1,
+             playerIdx, gc);
+  }
   FieldUnit &fu = mp.field[mp.fieldSize++];
   fu.cardId = cardId;
   fu.curAtk = cd.atk;
@@ -2776,11 +3666,22 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
              attacker.bonusAtk;
   if (aAtk < 0)
     aAtk = 0;
+  // Attack lunge animation
+  AnimAttack(atkPlayer, atkIdx, ap.fieldSize, defPlayer, defIdx,
+             defIdx >= 0 ? dp.fieldSize : 0);
 
   if (defIdx < 0) {
     // Direct attack on player
     dp.life -= aAtk;
     attacker.activated = true;
+    // Floating damage text
+    {
+      char dmgBuf[16];
+      snprintf(dmgBuf, 16, "-%d", aAtk);
+      float fx = (defPlayer == 1) ? SCREEN_W / 2.0f : SCREEN_W / 2.0f;
+      float fy = (defPlayer == 1) ? 50.0f : SCREEN_H - 190.0f;
+      SpawnFloatText(fx, fy, dmgBuf, {255, 60, 60, 255});
+    }
     // Attack trigger effects
     if (strstr(acd.effect, "Attack") && strstr(acd.effect, "Gain") &&
         strstr(acd.effect, "coin")) {
@@ -2821,24 +3722,43 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
   // Compare ATK vs DEF
   if (aAtk > dDef) {
     defender.alive = false;
-    if (atkOverrun)
+    AnimDestroy(defender.cardId, defPlayer, defIdx, dp.fieldSize);
+    SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f - 30,
+                   "DESTROYED", {255, 80, 80, 255});
+    if (atkOverrun) {
       dp.life -= (aAtk - dDef);
+      char ob[16];
+      snprintf(ob, 16, "-%d OVR", aAtk - dDef);
+      SpawnFloatText(SCREEN_W / 2.0f, (defPlayer == 1) ? 50.0f : SCREEN_H - 190.0f,
+                     ob, {255, 120, 60, 255});
+    }
   } else if (aAtk == dDef) {
-    defender.alive = false;
-    if (!atkTenacity)
+    // Tie: both destroyed unless Tenacity
+    SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f - 30,
+                   "TRADE", {255, 200, 80, 255});
+    if (!defTenacity) {
+      defender.alive = false;
+      AnimDestroy(defender.cardId, defPlayer, defIdx, dp.fieldSize);
+    } else
+      SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f + 10,
+                     "TENACITY!", {200, 255, 200, 255});
+    if (!atkTenacity) {
       attacker.alive = false;
+      AnimDestroy(attacker.cardId, atkPlayer, atkIdx, ap.fieldSize);
+    } else
+      SpawnFloatText(SCREEN_W / 2.0f - 60, SCREEN_H / 2.0f + 10,
+                     "TENACITY!", {200, 255, 200, 255});
   } else {
-    // Defender survives, reduce DEF temporarily
-    defender.curDef -= aAtk;
-  }
-
-  // Defender retaliates
-  if (dAtk > aDef) {
+    // ATK < DEF: attacker destroyed, defender DEF reduced until end of turn
     attacker.alive = false;
-  } else if (dAtk == aDef) {
-    if (!defTenacity)
-      attacker.alive = false;
-    // defender already handled above
+    AnimDestroy(attacker.cardId, atkPlayer, atkIdx, ap.fieldSize);
+    SpawnFloatText(SCREEN_W / 2.0f - 60, SCREEN_H / 2.0f + 10,
+                   "REPELLED!", {255, 80, 80, 255});
+    defender.bonusDef -= aAtk;  // temporary — reset at turn end
+    char db[16];
+    snprintf(db, 16, "-%d DEF", aAtk);
+    SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f - 20,
+                   db, {255, 180, 80, 255});
   }
 
   // Attack trigger effects
@@ -2994,6 +3914,63 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
   CleanupField(dp);
 }
 
+// ─── Trigger Harvest effects (fires at Collect phase start) ──────────────────
+static void TriggerHarvest(MatchPlayer &mp, GameMatch &m) {
+  for (int i = 0; i < mp.fieldSize; i++) {
+    const CardDef &cd = GetCard(mp.field[i].cardId);
+    if (!strstr(cd.effect, "Harvest")) continue;
+    if (strstr(cd.effect, "Draw")) MatchDrawCard(mp);
+    if (strstr(cd.effect, "Gain") && strstr(cd.effect, "coin")) {
+      const char *p = strstr(cd.effect, "Gain");
+      if (p) mp.coins += atoi(p + 5);
+    }
+    if (strstr(cd.effect, "Gain") && strstr(cd.effect, "life")) {
+      const char *p = strstr(cd.effect, "Gain");
+      if (p) mp.life += atoi(p + 5);
+    }
+    if (strstr(cd.effect, "power counter")) {
+      const char *p = strstr(cd.effect, "Put");
+      if (p) mp.field[i].powerCounters += atoi(p + 4);
+    }
+  }
+  (void)m;
+}
+
+// ─── Trigger Closure effects (fires at End phase) ────────────────────────────
+static void TriggerClosure(MatchPlayer &mp, GameMatch &m) {
+  for (int i = 0; i < mp.fieldSize; i++) {
+    const CardDef &cd = GetCard(mp.field[i].cardId);
+    if (!strstr(cd.effect, "Closure")) continue;
+    if (strstr(cd.effect, "Gain") && strstr(cd.effect, "life")) {
+      const char *p = strstr(cd.effect, "Gain");
+      if (p) mp.life += atoi(p + 5);
+    }
+    if (strstr(cd.effect, "Gain") && strstr(cd.effect, "coin")) {
+      const char *p = strstr(cd.effect, "Gain");
+      if (p) mp.coins += atoi(p + 5);
+    }
+    if (strstr(cd.effect, "Draw")) MatchDrawCard(mp);
+    if (strstr(cd.effect, "power counter")) {
+      const char *p = strstr(cd.effect, "Put");
+      if (p) mp.field[i].powerCounters += atoi(p + 4);
+    }
+    if (strstr(cd.effect, "Heal") && strstr(cd.effect, "life")) {
+      const char *p = strstr(cd.effect, "Heal");
+      if (p) mp.life += atoi(p + 5);
+    }
+  }
+  (void)m;
+}
+
+// ─── Reset temporary combat modifiers at end of every turn ───────────────────
+static void ResetTempModifiers(GameMatch &m) {
+  for (int p = 0; p < 2; p++)
+    for (int i = 0; i < m.players[p].fieldSize; i++) {
+      m.players[p].field[i].bonusDef = 0;  // DEF reductions expire
+      m.players[p].field[i].bonusAtk = 0;
+    }
+}
+
 // ── AI Logic ────────────────────────────────────────────────────────────────
 static void AITakeTurn(GameMatch &m) {
   MatchPlayer &ai = m.players[1];
@@ -3007,6 +3984,8 @@ static void AITakeTurn(GameMatch &m) {
     return;
   }
   ai.coins += 2;
+  TriggerHarvest(ai, m);  // Harvest effects for AI
+  // AI draw animation (use AI deck position — top of screen)
 
   // Development phase: play most expensive affordable cards
   bool played = true;
@@ -3062,34 +4041,33 @@ static void AITakeTurn(GameMatch &m) {
       }
 
     if (hasDefenders && !hasFly) {
-      // Must attack a defender
+      // Must attack a defender (fly defenders can be attacked by all)
       int weakestDef = -1, weakestVal = 99999;
       for (int d = 0; d < human.fieldSize; d++) {
-        if (!human.field[d].isDefender)
-          continue;
+        if (!human.field[d].isDefender) continue;
+        // Non-fly can attack fly defenders (rule: fly cannot be attacked unless defending)
         int val = human.field[d].curDef + human.field[d].powerCounters -
                   human.field[d].weakCounters;
-        if (val < weakestVal) {
-          weakestVal = val;
-          weakestDef = d;
-        }
+        if (val < weakestVal) { weakestVal = val; weakestDef = d; }
       }
       if (weakestDef >= 0)
         ResolveCombat(m, 1, a, 0, weakestDef);
     } else {
-      // Attack weakest unit or player
-      if (human.fieldSize > 0 && !hasFly) {
-        int weakest = 0;
-        for (int d = 1; d < human.fieldSize; d++)
-          if (human.field[d].curDef + human.field[d].powerCounters -
-                  human.field[d].weakCounters <
-              human.field[weakest].curDef + human.field[weakest].powerCounters -
-                  human.field[weakest].weakCounters)
-            weakest = d;
-        ResolveCombat(m, 1, a, 0, weakest);
-      } else {
-        ResolveCombat(m, 1, a, 0, -1);
+      // Attack weakest attackable unit or player
+      int weakest = -1;
+      int weakestVal2 = 99999;
+      for (int d = 0; d < human.fieldSize; d++) {
+        bool targetFly = CardHasKeyword(GetCard(human.field[d].cardId), "fly");
+        // Non-fly cannot attack non-defending fly units
+        if (targetFly && !hasFly && !human.field[d].isDefender) continue;
+        int val = human.field[d].curDef + human.field[d].powerCounters -
+                  human.field[d].weakCounters + human.field[d].bonusDef;
+        if (val < weakestVal2) { weakestVal2 = val; weakest = d; }
       }
+      if (weakest >= 0)
+        ResolveCombat(m, 1, a, 0, weakest);
+      else
+        ResolveCombat(m, 1, a, 0, -1);  // no valid unit target, attack player
     }
     CleanupField(ai);
     CleanupField(human);
@@ -3124,6 +4102,10 @@ static void AITakeTurn(GameMatch &m) {
     }
   }
 
+  // Closure effects fire at end of AI turn
+  TriggerClosure(ai, m);
+  // Temporary DEF reductions expire
+  ResetTempModifiers(m);
   // End turn: prepare for player
   for (int i = 0; i < ai.fieldSize; i++) {
     ai.field[i].canActivate = true;
@@ -3146,7 +4128,22 @@ static void AITakeTurn(GameMatch &m) {
 }
 
 // ── Update Match (human turn logic) ─────────────────────────────────────────
+
 static void UpdateMatch(float dt) {
+  UpdateFloatTexts(dt);
+  UpdateArenaVFX(dt);
+  UpdateCardAnims(dt);
+  UpdateAnimQueue();
+  // Flush pending draw cards the moment animations finish
+  if (g_prevAnimLocked && !g_animUILocked) {
+    MatchPlayer &hp = g_match.players[0];
+    for (int i = 0; i < g_pendingDrawCount; i++) {
+      if (hp.handSize < MAX_HAND)
+        hp.hand[hp.handSize++] = g_pendingDrawCards[i];
+    }
+    g_pendingDrawCount = 0;
+  }
+  g_prevAnimLocked = g_animUILocked;
   GameMatch &m = g_match;
   if (!m.active && m.phase == PHASE_GAME_OVER) {
     if (m.messageTimer > 0)
@@ -3155,25 +4152,31 @@ static void UpdateMatch(float dt) {
       if (m.playerWon) {
         int reward = (int)(10 * g_inventory.GetWinCoinMult() + 0.5f);
         g_playerCoins += reward;
-        // Advance tournament if in tournament mode
-        int winDeck[MAX_DECK], loseDeck[MAX_DECK];
-        int winCount = m.players[0].deckSize, loseCount = m.players[1].deckSize;
-        for (int i = 0; i < winCount; i++)
-          winDeck[i] = m.players[0].deck[i];
-        for (int i = 0; i < loseCount; i++)
-          loseDeck[i] = m.players[1].deck[i];
-        g_tournament.AdvanceRound(true, winDeck, winCount, loseDeck, loseCount);
+        if (g_tournamentMode) {
+          int winDeck[MAX_DECK], loseDeck[MAX_DECK];
+          int winCount = m.players[0].deckSize, loseCount = m.players[1].deckSize;
+          for (int i = 0; i < winCount; i++)
+            winDeck[i] = m.players[0].deck[i];
+          for (int i = 0; i < loseCount; i++)
+            loseDeck[i] = m.players[1].deck[i];
+          bool cityDone = g_tournament.AdvanceRound(true, winDeck, winCount, loseDeck, loseCount);
+          (void)cityDone;
+        }
       } else {
-        // Lost — tournament doesn't advance but prices still shift
-        int winDeck[MAX_DECK], loseDeck[MAX_DECK];
-        int winCount = m.players[1].deckSize, loseCount = m.players[0].deckSize;
-        for (int i = 0; i < winCount; i++)
-          winDeck[i] = m.players[1].deck[i];
-        for (int i = 0; i < loseCount; i++)
-          loseDeck[i] = m.players[0].deck[i];
-        g_tournament.AdvanceRound(false, winDeck, winCount, loseDeck,
-                                  loseCount);
+        if (g_tournamentMode) {
+          // Lost tournament round — prices shift, round resets to 0
+          int winDeck[MAX_DECK], loseDeck[MAX_DECK];
+          int winCount = m.players[1].deckSize, loseCount = m.players[0].deckSize;
+          for (int i = 0; i < winCount; i++)
+            winDeck[i] = m.players[1].deck[i];
+          for (int i = 0; i < loseCount; i++)
+            loseDeck[i] = m.players[0].deck[i];
+          g_tournament.roundsWon = 0; // reset round on loss
+          g_market.OnTournamentEnd(winDeck, winCount, loseDeck, loseCount);
+        }
       }
+      g_tournamentMode = false;
+      ClearAnimQueue();
       g_scene = SCENE_OVERWORLD;
     }
     return;
@@ -3185,7 +4188,8 @@ static void UpdateMatch(float dt) {
   MatchPlayer &ai = m.players[1];
 
   if (m.turn == 0) { // Human turn
-    if (m.phase == PHASE_COLLECT) {
+    MatchPhase phaseSnap = m.phase; // snapshot — prevents same-frame cascade
+    if (phaseSnap == PHASE_COLLECT) {
       if (!MatchDrawCard(human)) {
         m.phase = PHASE_GAME_OVER;
         m.playerWon = false;
@@ -3193,19 +4197,19 @@ static void UpdateMatch(float dt) {
         return;
       }
       human.coins += 2;
+      TriggerHarvest(human, m);  // Harvest effects fire on collect
       m.phase = PHASE_DEVELOP;
       snprintf(m.message, 128, "Your turn - Development Phase (play cards)");
       m.messageTimer = 1.5f;
     }
 
-    if (m.phase == PHASE_DEVELOP) {
+    if (phaseSnap == PHASE_DEVELOP) {
       Vector2 mouse = GetMousePosition();
 
-      // Click on hand cards to play them
+      // Click on hand cards to play them (blocked during animations)
+      if (g_animUILocked) goto skip_human_input;
       for (int i = 0; i < human.handSize; i++) {
-        float cx = 60 + i * 95;
-        float cy = SCREEN_H - 120;
-        Rectangle cardRect = {cx, cy, 85, 110};
+        Rectangle cardRect = GetHandCardRect(i, human.handSize);
         if (CheckCollisionPointRec(mouse, cardRect) &&
             IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
           const CardDef &cd = GetCard(human.hand[i]);
@@ -3235,25 +4239,28 @@ static void UpdateMatch(float dt) {
         }
       }
 
-      // Press Space/Enter to advance to Activate phase
-      if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER)) {
+      // Next Phase button or Space/Enter
+      Rectangle nextPhaseBtn = {(float)(SCREEN_W - 187), (float)(SCREEN_H - 185), 177, 30};
+      bool advanceToActivate = IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER) ||
+          (CheckCollisionPointRec(mouse, nextPhaseBtn) && IsMouseButtonPressed(MOUSE_LEFT_BUTTON));
+      if (advanceToActivate) {
         m.phase = PHASE_ACTIVATE;
         m.selectedFieldIdx = -1;
         snprintf(m.message, 128,
-                 "Activation Phase - click your units to attack");
+                 "Activation Phase - click units to attack, right-click to defend");
         m.messageTimer = 1.5f;
       }
     }
+    skip_human_input:;
 
-    if (m.phase == PHASE_ACTIVATE) {
+    if (phaseSnap == PHASE_ACTIVATE && !g_animUILocked) {
       Vector2 mouse = GetMousePosition();
 
       // Select own unit to attack with
       if (m.selectedFieldIdx < 0) {
         for (int i = 0; i < human.fieldSize; i++) {
-          float cx = 60 + i * 110;
-          float cy = SCREEN_H / 2 - 30;
-          Rectangle unitRect = {cx, cy, 100, 65};
+          Rectangle unitRect =
+              GetFieldScreenRect(0, i, human.fieldSize, 65, 50);
           if (CheckCollisionPointRec(mouse, unitRect) &&
               IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             if (human.field[i].canActivate && !human.field[i].activated) {
@@ -3281,9 +4288,8 @@ static void UpdateMatch(float dt) {
             GetCard(human.field[m.selectedFieldIdx].cardId), "fly");
 
         for (int i = 0; i < ai.fieldSize; i++) {
-          float cx = 60 + i * 110;
-          float cy = 70;
-          Rectangle unitRect = {cx, cy, 100, 65};
+          Rectangle unitRect =
+              GetFieldScreenRect(1, i, ai.fieldSize, 65, 50);
           if (CheckCollisionPointRec(mouse, unitRect) &&
               IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             if (hasDefenders && !ai.field[i].isDefender && !atkHasFly) {
@@ -3299,8 +4305,9 @@ static void UpdateMatch(float dt) {
           }
         }
 
-        // Attack player button
-        Rectangle atkPlayerBtn = {(float)SCREEN_W - 180, 20, 160, 30};
+        // Attack player button (positioned to match HUD)
+        Rectangle atkPlayerBtn = {(float)SCREEN_W - 185, SCREEN_H - 213.0f,
+                                   175, 30};
         if (CheckCollisionPointRec(mouse, atkPlayerBtn) &&
             IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
           if (hasDefenders && !atkHasFly) {
@@ -3320,12 +4327,22 @@ static void UpdateMatch(float dt) {
         }
       }
 
-      // Assign defenders: click 'D' to toggle defender on selected unit
+      // Right-click on own unit (no attacker selected) = toggle defender
+      if (IsMouseButtonPressed(MOUSE_RIGHT_BUTTON) && m.selectedFieldIdx < 0) {
+        for (int i = 0; i < human.fieldSize; i++) {
+          Rectangle unitRect = GetFieldScreenRect(0, i, human.fieldSize, 65, 50);
+          if (CheckCollisionPointRec(mouse, unitRect)) {
+            const CardDef &cd = GetCard(human.field[i].cardId);
+            if (!strstr(cd.effect, "Cannot defend."))
+              human.field[i].isDefender = !human.field[i].isDefender;
+            break;
+          }
+        }
+      }
+      // D key also toggles defender (keep for compatibility)
       if (IsKeyPressed(KEY_D)) {
         for (int i = 0; i < human.fieldSize; i++) {
-          float cx = 60 + i * 110;
-          float cy = SCREEN_H / 2 - 30;
-          Rectangle unitRect = {cx, cy, 100, 65};
+          Rectangle unitRect = GetFieldScreenRect(0, i, human.fieldSize, 65, 50);
           if (CheckCollisionPointRec(mouse, unitRect)) {
             const CardDef &cd = GetCard(human.field[i].cardId);
             if (!strstr(cd.effect, "Cannot defend."))
@@ -3335,13 +4352,20 @@ static void UpdateMatch(float dt) {
         }
       }
 
-      // Press Space/Enter to end turn
-      if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER)) {
+      // End Turn button or Space/Enter
+      Rectangle endTurnBtn = {(float)(SCREEN_W - 187), (float)(SCREEN_H - 185), 177, 30};
+      bool doEndTurn = IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER) ||
+          (CheckCollisionPointRec(mouse, endTurnBtn) && IsMouseButtonPressed(MOUSE_LEFT_BUTTON));
+      if (doEndTurn) {
         m.phase = PHASE_END;
       }
     }
 
-    if (m.phase == PHASE_END) {
+    if (phaseSnap == PHASE_END) {
+      // Closure effects fire at end of player turn
+      TriggerClosure(human, m);
+      // Temporary DEF reductions (from this combat turn) expire
+      ResetTempModifiers(m);
       // Reset activation for next turn
       for (int i = 0; i < human.fieldSize; i++) {
         human.field[i].canActivate = true;
@@ -3368,7 +4392,9 @@ static void UpdateMatch(float dt) {
       // AI turn
       m.turn = 1;
       m.turnNumber++;
+      g_aiThinkTimer = 1.4f;  // show Thinking... indicator
       AITakeTurn(m);
+      g_aiThinkTimer = 0.0f;
 
       // Check again
       if (ai.life <= 0) {
@@ -3395,92 +4421,1318 @@ static void UpdateMatch(float dt) {
   }
 }
 
+// Forward declaration (DrawVFX defined later in overworld section)
+static void DrawVFX();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ARENA VISUAL HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Desert arena sky gradient background (drawn as 2D before 3D scene)
+static void DrawArenaBackground() {
+  DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H,
+                         {18, 12, 7, 255}, {38, 24, 14, 255});
+  // Amber horizon haze band
+  DrawRectangleGradientV(0, SCREEN_H / 2 - 50, SCREEN_W, 80,
+                         {0, 0, 0, 0}, {190, 105, 40, 20});
+  // Distant dune silhouette (procedural wave)
+  for (int x = 0; x < SCREEN_W; x += 2) {
+    int h = (int)(16.0f + sinf(x * 0.017f) * 9.0f + sinf(x * 0.044f + 1.1f) * 5.0f);
+    DrawRectangle(x, SCREEN_H / 2 - h, 2, h, {50, 30, 12, 55});
+  }
+}
+
+// Draw a card texture flat on the 3D table surface using rlgl quads.
+// Must be called inside BeginMode3D / EndMode3D.
+static void DrawCardFaceTexture(Vector3 pos, float hw, float hd,
+                                 int cardId, Color tint) {
+  if (cardId <= 0 || cardId >= 200) return;
+  Texture2D &tex = g_cardTextures[cardId];
+  if (tex.id == 0) return;
+  float y = pos.y + 0.09f;
+  rlSetTexture(tex.id);
+  rlBegin(RL_QUADS);
+    rlColor4ub(tint.r, tint.g, tint.b, tint.a);
+    rlTexCoord2f(0.0f, 0.0f); rlVertex3f(pos.x - hw, y, pos.z - hd);
+    rlTexCoord2f(0.0f, 1.0f); rlVertex3f(pos.x - hw, y, pos.z + hd);
+    rlTexCoord2f(1.0f, 1.0f); rlVertex3f(pos.x + hw, y, pos.z + hd);
+    rlTexCoord2f(1.0f, 0.0f); rlVertex3f(pos.x + hw, y, pos.z - hd);
+  rlEnd();
+  rlSetTexture(0);
+}
+
+// Draw 5 recessed slot depressions per side (always 5, to show empty slots)
+static void DrawSlotDepressions(int playerIdx, int numOccupied) {
+  const float spacing = 3.2f;
+  const float z = (playerIdx == 0) ? 3.5f : -2.5f;  // player near camera = bottom
+  const float startX = -(5 - 1) * spacing / 2.0f;
+  for (int i = 0; i < 5; i++) {
+    float cx = startX + i * spacing;
+    // Recessed felt pad (slightly lower, darker)
+    DrawCube({cx, -0.17f, z}, 2.35f, 0.04f, 3.15f, {10, 34, 18, 200});
+    // Slot outline — gold glow for occupied, faint for empty
+    Color bc = (i < numOccupied)
+                   ? Color{100, 85, 28, 110}
+                   : Color{50, 42, 14, 45};
+    DrawCubeWires({cx, -0.17f, z}, 2.40f, 0.05f, 3.20f, bc);
+  }
+}
+
+// Draw a 3D unit card with its texture on the top face + keyword VFX.
+// hasFly: hover higher + blob shadow
+// hasDash: orange aura double-ring
+// highlight: pulsing gold selection ring
+static void DrawCard3DUnit(Vector3 pos, float cw, float dep, float thick,
+                            int cardId, bool activated, bool highlight,
+                            bool hasFly, bool hasDash, Color frameCol) {
+  // Fly: card hovers 0.45 units higher
+  float yOff = hasFly ? 0.45f : 0.0f;
+  Vector3 rpos = {pos.x, pos.y + yOff, pos.z};
+
+  if (activated) {
+    // Tapped: rotate 90° around Y axis
+    rlPushMatrix();
+    rlTranslatef(rpos.x, rpos.y, rpos.z);
+    rlRotatef(90.0f, 0, 1, 0);
+    DrawCube({0, 0, 0}, dep, thick, cw, {45, 30, 18, 255});
+    DrawCubeWires({0, 0, 0}, dep, thick, cw, frameCol);
+    rlPopMatrix();
+  } else {
+    // Card slab body + art on top face
+    DrawCube(rpos, cw, thick, dep, {45, 30, 18, 255});
+    DrawCubeWires(rpos, cw, thick, dep, frameCol);
+    DrawCardFaceTexture(rpos, cw * 0.5f, dep * 0.5f, cardId, WHITE);
+  }
+
+  // Dash keyword: double aura ring (orange spark)
+  if (hasDash && !activated) {
+    float pulse = sinf(g_time * 8.0f) * 0.5f + 0.5f;
+    DrawCubeWires(rpos, cw + 0.18f, thick + 0.06f, dep + 0.18f,
+                  {255, 160, 40, (unsigned char)(80 + pulse * 100)});
+    DrawCubeWires(rpos, cw + 0.36f, thick + 0.10f, dep + 0.36f,
+                  {255, 210, 80, (unsigned char)(25 + pulse * 45)});
+  }
+
+  // Fly keyword: blob shadow below the floating card
+  if (hasFly) {
+    float shadowScale = 0.72f + sinf(g_time * 1.4f) * 0.04f;
+    DrawCube({pos.x, -0.14f, pos.z},
+             cw * shadowScale, 0.01f, dep * shadowScale, {0, 0, 0, 55});
+  }
+
+  // Selection highlight: pulsing gold ring
+  if (highlight) {
+    float glow = sinf(g_time * 5.5f) * 0.5f + 0.5f;
+    DrawCubeWires(rpos, cw + 0.28f, thick + 0.12f, dep + 0.28f,
+                  {255, 225, 50, (unsigned char)(130 + glow * 125)});
+  }
+}
+
+// Oblivion exile portal: concentric glowing rings that pulse
+static void DrawOblivionPortal3D(Vector3 pos) {
+  float pulse  = sinf(g_oblivionPulse) * 0.5f + 0.5f;
+  float pulse2 = cosf(g_oblivionPulse * 0.7f) * 0.5f + 0.5f;
+  DrawCylinder(pos, 0.40f + pulse * 0.12f, 0.65f + pulse * 0.18f,
+               0.06f, 16, {70, 15, 110, (unsigned char)(150 + pulse * 80)});
+  DrawCylinder({pos.x, pos.y + 0.03f, pos.z},
+               0.65f + pulse * 0.18f, 0.95f + pulse2 * 0.22f,
+               0.04f, 16, {120, 35, 175, (unsigned char)(55 + pulse2 * 55)});
+  // Inner void
+  DrawCylinder({pos.x, pos.y + 0.05f, pos.z},
+               0.0f, 0.38f, 0.04f, 16, {8, 4, 18, 230});
+}
+
+// Screen-space quadratic Bezier targeting arrow (Hearthstone style)
+static void DrawCombatArrow() {
+  if (!g_arrowActive) return;
+  Vector2 src  = g_arrowSrc;
+  Vector2 dst  = g_arrowDst;
+  Vector2 ctrl = {(src.x + dst.x) * 0.5f,
+                  fminf(src.y, dst.y) - 55.0f};
+  const int SEGS = 22;
+  Vector2 prev = src;
+  for (int i = 1; i <= SEGS; i++) {
+    float t = (float)i / SEGS;
+    float u = 1.0f - t;
+    Vector2 pt = {
+      u * u * src.x + 2 * u * t * ctrl.x + t * t * dst.x,
+      u * u * src.y + 2 * u * t * ctrl.y + t * t * dst.y
+    };
+    float alpha = 0.5f + 0.5f * t;
+    DrawLineEx(prev, pt, 3.2f, {255, 70, 60, (unsigned char)(alpha * 215)});
+    prev = pt;
+  }
+  // Arrow head
+  Vector2 dir  = Vector2Normalize(Vector2Subtract(dst, ctrl));
+  Vector2 perp = {-dir.y, dir.x};
+  DrawTriangle(
+    {dst.x + dir.x * 13,  dst.y + dir.y * 13},
+    {dst.x - dir.x * 6 + perp.x * 8, dst.y - dir.y * 6 + perp.y * 8},
+    {dst.x - dir.x * 6 - perp.x * 8, dst.y - dir.y * 6 - perp.y * 8},
+    {255, 80, 80, 220}
+  );
+}
+
+// Visual phase bar: 4 segments (COLLECT→DEVELOP→ACTIVATE→END), active glows
+static void DrawPhaseBar(MatchPhase phase, bool isPlayerTurn) {
+  const char *labels[]  = {"COLLECT", "DEVELOP", "ACTIVATE", "END"};
+  const Color phaseColors[] = {
+    {55, 175, 215, 255},   // COLLECT  – blue
+    {70, 175,  70, 255},   // DEVELOP  – green
+    {215,  75,  75, 255},  // ACTIVATE – red
+    {165, 140,  65, 255},  // END      – gold
+  };
+  int numPhases   = 4;
+  int activePhase = ((int)phase < numPhases) ? (int)phase : numPhases - 1;
+  float barW  = 290.0f;
+  float barH  = 22.0f;
+  float startX = SCREEN_W / 2.0f - barW / 2.0f;
+  float y      = 6.0f;
+  float segW   = barW / numPhases;
+
+  DrawRectangleRounded({startX - 4, y - 2, barW + 8, barH + 4},
+                        0.4f, 4, {14, 10, 7, 205});
+
+  for (int i = 0; i < numPhases; i++) {
+    float sx    = startX + i * segW;
+    bool  active = (i == activePhase && isPlayerTurn);
+    float pulse  = active ? (sinf(g_time * 4.0f) * 0.3f + 0.7f) : 0.32f;
+    Color col    = phaseColors[i];
+    col.a = (unsigned char)(pulse * 255);
+    if (!isPlayerTurn && !active) col.a = 50;
+    DrawRectangleRounded({sx + 1, y + 1, segW - 2, barH - 2},
+                          0.25f, 4, col);
+    int tw = MeasureText(labels[i], 8);
+    DrawText(labels[i], (int)(sx + segW / 2 - tw / 2), (int)(y + 7), 8,
+             active ? WHITE : Color{175, 165, 135, 150});
+    if (i < numPhases - 1)
+      DrawLine((int)(sx + segW), (int)y,
+               (int)(sx + segW), (int)(y + barH), {75, 65, 45, 140});
+  }
+}
+
+// Orbiting +/- counter orbs around a card (screen-space)
+static void DrawCounterOrbs(float sx, float sy, int power, int weak) {
+  int total = power + weak;
+  if (total <= 0) return;
+  float radius    = 19.0f;
+  float angleStep = (total > 1) ? (2.0f * PI / total) : 0.0f;
+  float startAngle = g_time * 1.4f;
+  int idx = 0;
+  for (int p = 0; p < power && idx < 8; p++, idx++) {
+    float a  = startAngle + idx * angleStep;
+    float ox = cosf(a) * radius;
+    float oy = sinf(a) * radius;
+    DrawCircle((int)(sx + ox), (int)(sy + oy), 6.0f, {35, 155, 45, 210});
+    DrawText("+", (int)(sx + ox - 4), (int)(sy + oy - 5), 10,
+             {190, 255, 190, 255});
+  }
+  for (int w = 0; w < weak && idx < 8; w++, idx++) {
+    float a  = startAngle + idx * angleStep;
+    float ox = cosf(a) * radius;
+    float oy = sinf(a) * radius;
+    DrawCircle((int)(sx + ox), (int)(sy + oy), 6.0f, {155, 35, 45, 210});
+    DrawText("-", (int)(sx + ox - 3), (int)(sy + oy - 5), 10,
+             {255, 190, 190, 255});
+  }
+}
+
+// Keyword icon badges rendered below the card name label (screen-space)
+static void DrawKeywordBadges(float sx, float sy, const CardDef &cd) {
+  float bx = sx - 30.0f;
+  float by = sy + 20.0f;
+  auto badge = [&](const char *kw, Color col) {
+    int w = MeasureText(kw, 8);
+    Color bg = {(unsigned char)(col.r / 4), (unsigned char)(col.g / 4),
+                (unsigned char)(col.b / 4), 200};
+    DrawRectangleRounded({bx, by, (float)(w + 6), 13}, 0.5f, 4, bg);
+    DrawRectangleRoundedLinesEx({bx, by, (float)(w + 6), 13},
+                                 0.5f, 4, 1.0f, col);
+    DrawText(kw, (int)(bx + 3), (int)(by + 2), 8, col);
+    bx += (float)(w + 10);
+  };
+  if (CardHasKeyword(cd, "fly"))      badge("FLY",  {175, 218, 255, 255});
+  if (CardHasKeyword(cd, "dash"))     badge("DASH", {255, 178,  55, 255});
+  if (CardHasKeyword(cd, "tenacity")) badge("TEN",  { 95, 255,  95, 255});
+  if (CardHasKeyword(cd, "overrun"))  badge("OVR",  {255, 115,  75, 255});
+}
+
+// "Thinking..." pulsing indicator above AI portrait (shown while AI processes)
+static void DrawAIThinkingIndicator() {
+  if (g_aiThinkTimer <= 0.0f) return;
+  int dotCount = (int)(g_time * 2.8f) % 4;
+  const char *dotStr = dotCount == 0 ? "." : dotCount == 1 ? ".." :
+                       dotCount == 2 ? "..." : "....";
+  char buf[32];
+  snprintf(buf, 32, "Thinking%s", dotStr);
+  int tw = MeasureText(buf, 12);
+  float bx = SCREEN_W / 2.0f - tw / 2.0f - 12;
+  DrawRectangleRounded({bx, 76, (float)(tw + 24), 22}, 0.35f, 4,
+                        {22, 17, 12, 215});
+  DrawRectangleRoundedLinesEx({bx, 76, (float)(tw + 24), 22}, 0.35f, 4,
+                               1.0f, {175, 148, 75, 195});
+  DrawText(buf, (int)bx + 12, 80, 12, {200, 178, 118, 225});
+}
+
+// Draw arena burst particles (2D overlay — called after EndMode3D)
+static void DrawArenaBursts() {
+  for (int i = 0; i < ARENA_BURST_MAX; i++) {
+    const ArenaBurst &b = g_arenaBursts[i];
+    if (!b.active) continue;
+    Color c = b.col;
+    c.a = (unsigned char)(b.life * 195.0f);
+    DrawRectangle((int)b.x, (int)b.y, (int)b.size, (int)b.size, c);
+  }
+}
+
+// ── §CARDVIEW  Dynamic High-Fidelity TCG Card Renderer  ───────────────────────
+// Layered GPU card renderer: gold filigree frame + art + foil + bloom pulse.
+//
+//   Layer 1 – Physical card body     CPU rounded rect + drop shadow
+//   Layer 2 – Gold filigree frame    GLSL SDF (metallic, roughness 0.2)
+//   Layer 3 – Art window             g_cardTextures sampled in fragment shader
+//   Layer 4 – UI text overlays       DrawText calls on top of shader pass
+//
+// Hover-tilt: rlgl quad with per-vertex skew → parallax light catch on gold.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── GLSL: Vertex (pass-through – tilt handled by skewed rlgl quad) ───────────
+static const char *CV_VERT = R"GLSL(
+#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+out vec2 fragTexCoord;
+out vec4 fragColor;
+void main() {
+    gl_Position  = mvp * vec4(vertexPosition, 1.0);
+    fragTexCoord = vertexTexCoord;
+    fragColor    = vertexColor;
+}
+)GLSL";
+
+// ── GLSL: Fragment  ───────────────────────────────────────────────────────────
+static const char *CV_FRAG = R"GLSL(
+#version 330
+in  vec2 fragTexCoord;
+in  vec4 fragColor;
+out vec4 finalColor;
+
+uniform sampler2D texture0;
+uniform float uTime;
+uniform float uRarity;    // 0=common  1=rare  2=unique
+uniform float uPlayable;  // 1 when player can afford card
+uniform float uHoverX;    // hover tilt X  (-0.25 .. 0.25 rad)
+uniform float uHoverY;    // hover tilt Y  (-0.25 .. 0.25 rad)
+
+// ── SDF helpers ───────────────────────────────────────────────────────────────
+float sdRoundBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// ── Gold metallic colour (PBR: metallic=1, roughness=0.2) ─────────────────────
+vec3 goldLit(vec2 p) {
+    // Desert-sun direction perturbed by hover tilt
+    vec2 ldir = normalize(vec2(0.55 + uHoverY * 0.60,
+                               0.70 - uHoverX * 0.60));
+    float ndotl = dot(normalize(p + vec2(0.0, 0.25)), ldir);
+    vec3 gBase  = vec3(0.82, 0.62, 0.08);
+    vec3 gLight = vec3(1.00, 0.92, 0.50);
+    vec3 gDark  = vec3(0.40, 0.28, 0.01);
+    vec3 g = mix(gDark, mix(gBase, gLight,
+                 clamp(ndotl * 0.8 + 0.5, 0.0, 1.0)), 0.9);
+    // Sharp specular spike (metallic roughness 0.2)
+    float spec = pow(max(0.0, ndotl), 38.0);
+    g += vec3(1.0, 0.95, 0.65) * spec * 0.90;
+    return g;
+}
+
+// ── Procedural filigree SDF (quarter-arcs + cross-hair per corner) ────────────
+float filigreeAtCorner(vec2 uv, vec2 corner) {
+    vec2 p = (uv - corner) * vec2(corner.x < 0.5 ? -1.0 : 1.0,
+                                   corner.y < 0.5 ? -1.0 : 1.0) * 7.0;
+    float d = 100.0;
+    // Three concentric quarter-arcs
+    for (int i = 0; i < 3; i++) {
+        float r   = 0.45 + float(i) * 0.55;
+        float arc = abs(length(p) - r) - 0.07;
+        if (p.x >= -0.05 && p.y >= -0.05) d = min(d, arc);
+    }
+    // Diagonal cross-hair
+    vec2 rp = vec2(p.x - p.y, p.x + p.y) * 0.7071;
+    d = min(d, abs(rp.x) - 0.055);
+    d = min(d, abs(rp.y) - 0.055);
+    return d;
+}
+
+// ── Cheap 2-D value noise (foil hue-shift) ────────────────────────────────────
+float hash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float noise2(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i),          hash21(i + vec2(1,0)), f.x),
+               mix(hash21(i + vec2(0,1)), hash21(i + vec2(1,1)), f.x), f.y);
+}
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    return c.z * mix(K.xxx, clamp(abs(fract(c.xxx + K.xyz)*6.0 - K.www) - K.xxx,
+                                  0.0, 1.0), c.y);
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+void main() {
+    vec2 uv = fragTexCoord;       // 0..1
+    vec2 p  = uv * 2.0 - 1.0;    // -1..1
+
+    // ── Layer 1: Rounded card body ───────────────────────────────────────────
+    float cardSDF  = sdRoundBox(p, vec2(0.86, 0.94), 0.055);
+    float cardMask = 1.0 - smoothstep(-0.004, 0.004, cardSDF);
+    if (cardMask < 0.01) discard;
+
+    // ── Layer 3: Art window (recessed centre) ────────────────────────────────
+    float artSDF  = sdRoundBox(p - vec2(0.0, -0.06), vec2(0.64, 0.42), 0.035);
+    float artMask = 1.0 - smoothstep(-0.004, 0.004, artSDF);
+
+    // ── Layer 2: Frame band = card minus art window ──────────────────────────
+    float frameMask = cardMask * (1.0 - artMask);
+
+    // Gold colour with metallic PBR lighting
+    vec3 goldCol = goldLit(p);
+
+    // Filigree ornaments at all four corners
+    vec2 corners[4];
+    corners[0] = vec2(0.08, 0.07);  corners[1] = vec2(0.92, 0.07);
+    corners[2] = vec2(0.08, 0.93);  corners[3] = vec2(0.92, 0.93);
+    float filigreeSDF = 100.0;
+    for (int i = 0; i < 4; i++)
+        filigreeSDF = min(filigreeSDF, filigreeAtCorner(uv, corners[i]));
+    float filigreeMask = (1.0 - smoothstep(-0.008, 0.008, filigreeSDF)) * frameMask;
+    goldCol = mix(goldCol, goldCol * 1.55, filigreeMask);
+
+    // Scrollwork name banner (top zone, tapered ends)
+    float bannerMask = step(-0.94, p.y) * step(p.y, -0.55)
+                     * step(-0.72, p.x) * step(p.x,  0.72)
+                     * (1.0 - smoothstep(0.60, 0.72, abs(p.x)));
+    float grain = noise2(uv * vec2(14.0, 4.0) + 0.5) * 0.18;
+    vec3 bannerCol = vec3(0.16 + grain, 0.08 + grain * 0.5, 0.02);
+
+    // Stat shield shapes
+    // ATK: bottom-left crimson
+    float atkSDF  = sdRoundBox(p - vec2(-0.55, 0.78), vec2(0.18, 0.10), 0.05);
+    float atkMask = (1.0 - smoothstep(-0.004, 0.004, atkSDF)) * cardMask;
+    float atkRim  = (1.0 - smoothstep(0.0, 0.018, abs(atkSDF))) * cardMask;
+    // DEF: bottom-right forest-green
+    float defSDF  = sdRoundBox(p - vec2( 0.55, 0.78), vec2(0.18, 0.10), 0.05);
+    float defMask = (1.0 - smoothstep(-0.004, 0.004, defSDF)) * cardMask;
+    float defRim  = (1.0 - smoothstep(0.0, 0.018, abs(defSDF))) * cardMask;
+    // Cost pip: top-left crimson disc
+    float costSDF  = length(p - vec2(-0.78, -0.82)) - 0.11;
+    float costMask = (1.0 - smoothstep(-0.004, 0.004, costSDF)) * cardMask;
+
+    // Dark leather text-box strip (lower centre)
+    float tbMask = step(-0.48, p.x) * step(p.x,  0.48)
+                 * step( 0.34, p.y) * step(p.y,  0.86) * cardMask;
+
+    // ── Layer 3: Art texture sample with hover parallax ──────────────────────
+    vec2 artUV     = uv + vec2(uHoverY * 0.012, uHoverX * 0.012) * artMask;
+    vec4 artSample = texture(texture0, artUV);
+
+    // ── Foil shimmer (rare / unique) ──────────────────────────────────────────
+    float foilAmt = step(0.5, uRarity);
+    float noiseF  = noise2(uv * 3.5 + vec2(uTime * 0.22, uTime * 0.15));
+    vec3  foilCol = hsv2rgb(vec3(noiseF + uTime * 0.10, 0.75, 1.0));
+
+    // ── Bloom pulse (playable card glow) ──────────────────────────────────────
+    float pulse    = sin(uTime * 4.2) * 0.5 + 0.5;
+    float edgeDist = 1.0 - smoothstep(0.0, 0.032, abs(cardSDF));
+    vec3  bloomCol = vec3(1.0, 0.88, 0.12) * (uPlayable * pulse * edgeDist * 1.8);
+
+    // ── Composite ─────────────────────────────────────────────────────────────
+    // Start from art texture with warm vignette
+    vec3 col = artSample.rgb;
+    float vig = 1.0 - smoothstep(0.4, 0.9, length(p * vec2(0.6, 0.8)));
+    col = mix(col * vec3(0.6, 0.45, 0.28), col, vig * 0.55 + 0.45);
+
+    col = mix(col, goldCol, frameMask * 0.93);
+    col = mix(col, bannerCol * 0.7 + goldCol * 0.3, bannerMask * frameMask * 0.88);
+    col = mix(col, vec3(0.55, 0.07, 0.07), atkMask);
+    col = mix(col, goldCol * 0.9,           atkRim);
+    col = mix(col, vec3(0.07, 0.38, 0.12),  defMask);
+    col = mix(col, goldCol * 0.9,           defRim);
+    col = mix(col, vec3(0.50, 0.06, 0.06),  costMask);
+    col = mix(col, vec3(0.11, 0.07, 0.03) + vec3(grain * 0.5),
+              tbMask * (1.0 - atkMask) * (1.0 - defMask));
+    col = mix(col, foilCol, artMask * foilAmt * 0.32);
+    col += bloomCol;
+    // Inner bevel highlight on art-window edge
+    float bevel = (1.0 - smoothstep(0.0, 0.012, abs(artSDF - 0.01))) * frameMask;
+    col = mix(col, goldCol * 1.3, bevel * 0.7);
+
+    finalColor = vec4(col, cardMask);
+}
+)GLSL";
+
+// CardView struct moved to forward declarations section (before DrawCardAnims)
+
+// ── Shader globals ────────────────────────────────────────────────────────────
+static Shader g_cardShader    = {0};
+static int    g_cvLocTime     = -1;
+static int    g_cvLocRarity   = -1;
+static int    g_cvLocPlayable = -1;
+static int    g_cvLocHoverX   = -1;
+static int    g_cvLocHoverY   = -1;
+
+static void InitCardShaders() {
+  g_cardShader    = LoadShaderFromMemory(CV_VERT, CV_FRAG);
+  g_cvLocTime     = GetShaderLocation(g_cardShader, "uTime");
+  g_cvLocRarity   = GetShaderLocation(g_cardShader, "uRarity");
+  g_cvLocPlayable = GetShaderLocation(g_cardShader, "uPlayable");
+  g_cvLocHoverX   = GetShaderLocation(g_cardShader, "uHoverX");
+  g_cvLocHoverY   = GetShaderLocation(g_cardShader, "uHoverY");
+}
+
+static void UnloadCardShaders() { UnloadShader(g_cardShader); }
+
+// ── g_handCardViews ───────────────────────────────────────────────────────────
+static CardView g_handCardViews[MAX_HAND];
+
+static void SyncHandCardViews(const MatchPlayer &pl) {
+  for (int i = 0; i < pl.handSize && i < MAX_HAND; i++) {
+    int cid = pl.hand[i];
+    if (g_handCardViews[i].cardId != cid)
+      g_handCardViews[i].Init(cid, /*doEnter=*/true);
+    g_handCardViews[i].isPlayable = (GetCard(cid).cost <= pl.coins);
+  }
+}
+
+// ── DrawCardView ──────────────────────────────────────────────────────────────
+// rect    : destination screen rectangle
+// view    : per-card state (tilt, rarity, playable flag, atk/def)
+// artTexId: which slot in g_cardTextures[] to use as art layer
+static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
+  const CardDef &cd = GetCard(view.cardId);
+  float W = rect.width, H = rect.height;
+  float X = rect.x,     Y = rect.y;
+
+  // ── Zone proportions ─────────────────────────────────────────────────────
+  float padX  = W * 0.055f;
+  float iX    = X + padX, iW = W - padX * 2.f;
+  float nameH = H * 0.135f;                      // 0%–13.5%  name band
+  float artT  = Y + nameH;                        // art top
+  float artH  = H * 0.415f;                       // art height (13.5%–55%)
+  float artB  = artT + artH;                       // art bottom
+  float typeH = H * 0.075f;                       // 55%–62.5% type strip
+  float typeB = artB + typeH;
+  float txtT  = typeB;                             // 62.5%–84% text box
+  float txtB  = Y + H * 0.840f;
+  float statT = txtB;                              // 84%–97%  stat band
+
+  // Font sizes scaled by card height
+  int fsName = Clamp((int)(H / 10.f),   7, 14);
+  int fsStat = Clamp((int)(H /  7.5f),  9, 17);
+  int fsType = Clamp((int)(H / 13.5f),  6, 10);
+  int fsKw   = Clamp((int)(H / 12.5f),  6, 11);
+  int fsEff  = Clamp((int)(H / 14.5f),  5,  9);
+
+  // ── Drop shadow ───────────────────────────────────────────────────────────
+  DrawRectangleRounded({X + 5, Y + 7, W, H}, 0.10f, 6, {0, 0, 0, 100});
+
+  // ── Card body ─────────────────────────────────────────────────────────────
+  DrawRectangleRounded(rect, 0.09f, 8, {22, 14, 7, 255});
+
+  // ── Triple gold border (3 layers = depth illusion) ───────────────────────
+  DrawRectangleRoundedLinesEx(rect, 0.09f, 8, 3.5f, {60, 32, 6, 255});            // dark shadow rim
+  DrawRectangleRoundedLinesEx({X+1.5f,Y+1.5f,W-3,H-3}, 0.09f, 8, 2.0f, {215, 170, 45, 255}); // bright gold
+  DrawRectangleRoundedLinesEx({X+3.5f,Y+3.5f,W-7,H-7}, 0.09f, 8, 1.0f, {255, 235, 130, 160}); // pale highlight
+  DrawRectangleRoundedLinesEx({X+5.0f,Y+5.0f,W-10,H-10}, 0.09f, 8, 0.5f, {90, 55, 10, 120}); // inner dark
+
+  // ── Name band ────────────────────────────────────────────────────────────
+  // Gradient panel behind name
+  DrawRectangleGradientV((int)iX, (int)Y, (int)iW, (int)(nameH + 1),
+                          {40, 22, 6, 255}, {12, 6, 2, 255});
+  // Gold separator line under name band
+  DrawRectangle((int)iX, (int)(Y + nameH - 1), (int)iW, 2, {190, 148, 38, 220});
+  DrawRectangle((int)iX, (int)(Y + nameH + 1), (int)iW, 1, {80, 50, 8, 140});
+
+  // Card name (centered, gold, shadow beneath)
+  {
+    int nw = MeasureText(cd.name, fsName);
+    int nx = (int)(X + W * 0.5f) - nw / 2;
+    int ny = (int)(Y + nameH * 0.22f);
+    DrawText(cd.name, nx + 1, ny + 1, fsName, {0, 0, 0, 160});
+    DrawText(cd.name, nx,     ny,     fsName, {248, 218, 145, 255});
+  }
+
+  // ── Art window ───────────────────────────────────────────────────────────
+  Rectangle artRect = {iX, artT, iW, artH};
+  // Art backing
+  DrawRectangle((int)iX, (int)artT, (int)iW, (int)artH, {15, 10, 4, 255});
+
+  // Art texture or procedural fill
+  {
+    Texture2D &tex = (artTexId > 0 && artTexId < 200)
+                     ? g_cardTextures[artTexId] : g_cardTextures[0];
+    if (tex.id != 0) {
+      Rectangle src2 = {0, 0, (float)CARD_TEX_W, (float)CARD_TEX_H};
+      // Shader path for rare/unique (foil) — fallback also looks great
+      if (g_cardShader.id > 0 && view.rarity >= 1) {
+        float t  = g_time; float rr = (float)view.rarity;
+        float pp = view.isPlayable ? 1.f : 0.f;
+        float hx = view.hoverRotX, hy = view.hoverRotY;
+        SetShaderValue(g_cardShader, g_cvLocTime,     &t,  SHADER_UNIFORM_FLOAT);
+        SetShaderValue(g_cardShader, g_cvLocRarity,   &rr, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(g_cardShader, g_cvLocPlayable, &pp, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(g_cardShader, g_cvLocHoverX,   &hx, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(g_cardShader, g_cvLocHoverY,   &hy, SHADER_UNIFORM_FLOAT);
+        BeginShaderMode(g_cardShader);
+        DrawTexturePro(tex, src2, artRect, {0, 0}, 0.f, {255, 255, 255, 230});
+        EndShaderMode();
+      } else {
+        DrawTexturePro(tex, src2, artRect, {0, 0}, 0.f, {255, 255, 255, 230});
+      }
+    }
+  }
+
+  // Art border: outer dark then inner gold (embossed look)
+  DrawRectangleLinesEx(artRect, 2.5f, {50, 30, 8, 255});
+  DrawRectangleLinesEx({iX+2.f, artT+2.f, iW-4.f, artH-4.f}, 1.5f, {190, 150, 40, 200});
+  DrawRectangleLinesEx({iX+4.f, artT+4.f, iW-8.f, artH-8.f}, 0.5f, {255, 220, 100, 80});
+
+  // Unplayable dimmer
+  if (!view.isPlayable)
+    DrawRectangle((int)iX, (int)artT, (int)iW, (int)artH, {0, 0, 0, 90});
+
+  // ── Type strip ───────────────────────────────────────────────────────────
+  // Color depends on card type: warm amber for unit, cool blue for support
+  Color typeBase = cd.isUnit ? Color{55, 30, 8, 245} : Color{15, 38, 60, 245};
+  DrawRectangle((int)iX, (int)artB, (int)iW, (int)typeH, typeBase);
+  DrawRectangle((int)iX, (int)artB,       (int)iW, 1, {200, 155, 45, 180});
+  DrawRectangle((int)iX, (int)(artB + typeH - 1), (int)iW, 1, {200, 155, 45, 150});
+
+  // Type text: "UNIT - Subtype" or "SUPPORT"
+  {
+    char typeBuf[48];
+    if (cd.isUnit && cd.subtype && cd.subtype[0])
+      snprintf(typeBuf, 48, "Unit - %s", cd.subtype);
+    else
+      snprintf(typeBuf, 48, cd.isUnit ? "Unit" : "Support");
+    int tw2 = MeasureText(typeBuf, fsType);
+    DrawText(typeBuf, (int)(iX + iW * 0.5f - tw2 * 0.5f),
+             (int)(artB + typeH * 0.15f), fsType, {225, 200, 140, 240});
+  }
+
+  // ── Text box ─────────────────────────────────────────────────────────────
+  DrawRectangle((int)iX, (int)txtT, (int)iW, (int)(txtB - txtT), {10, 6, 3, 245});
+  DrawRectangle((int)iX, (int)typeB, (int)iW, 1, {140, 105, 28, 160});
+
+  if (H > 70.f) {
+    float tbMaxW = iW - 4.f;
+    float curY   = txtT + 2.f;
+    float tbBot  = txtB - 2.f;
+
+    // Keywords (teal italic-style pills)
+    if (cd.keywords && cd.keywords[0]) {
+      static const struct { const char *id; const char *label; } KW[] = {
+        {"fly","Flight"},{"dash","Haste"},{"tenacity","Tenacity"},
+        {"overrun","Trample"},{"harvest","Harvest"},{"dig","Dig"},{nullptr,nullptr}
+      };
+      char kwLine[80] = {};
+      char kwTmp[64]; snprintf(kwTmp, 64, "%s", cd.keywords);
+      char *p = kwTmp; bool first = true;
+      while (*p) {
+        char *e = p; while (*e && *e != ';') ++e;
+        char sv = *e; *e = '\0';
+        const char *lbl = p;
+        for (int ki = 0; KW[ki].id; ki++)
+          if (strcmp(p, KW[ki].id) == 0) { lbl = KW[ki].label; break; }
+        if (!first) strncat(kwLine, ", ", sizeof(kwLine) - strlen(kwLine) - 1);
+        strncat(kwLine, lbl, sizeof(kwLine) - strlen(kwLine) - 1);
+        first = false; *e = sv; p = (*e) ? e + 1 : e;
+      }
+      strncat(kwLine, ".", sizeof(kwLine) - strlen(kwLine) - 1);
+      DrawText(kwLine, (int)(iX + 2), (int)curY, fsKw, {95, 215, 185, 255});
+      curY += fsKw + 3;
+    }
+
+    // Effect text — word-wrap
+    if (cd.effect && cd.effect[0] && curY < tbBot) {
+      char effTmp[128]; snprintf(effTmp, 128, "%s", cd.effect);
+      char *p = effTmp;
+      int lineH = fsEff + 2;
+      int maxC  = (int)(tbMaxW / fmaxf((float)MeasureText("n", fsEff), 1.f)) + 2;
+      if (maxC < 4) maxC = 4;
+      while (*p && curY + lineH <= tbBot) {
+        int len = (int)strlen(p);
+        if (len <= maxC) {
+          DrawText(p, (int)(iX + 2), (int)curY, fsEff, {210, 192, 158, 225});
+          break;
+        }
+        int brk = maxC;
+        for (int j = maxC; j > 1; j--) if (p[j] == ' ') { brk = j; break; }
+        char row[128]; memcpy(row, p, brk); row[brk] = '\0';
+        DrawText(row, (int)(iX + 2), (int)curY, fsEff, {210, 192, 158, 225});
+        p += brk; if (*p == ' ') p++;
+        curY += lineH;
+      }
+    }
+
+    // Card number (bottom of text box, dim gray)
+    {
+      char numBuf[16]; snprintf(numBuf, 16, "%d/%d", cd.id, NUM_ALL_CARDS);
+      int nw2 = MeasureText(numBuf, fsEff - 1);
+      DrawText(numBuf, (int)(X + W * 0.5f - nw2 * 0.5f),
+               (int)(txtB - fsEff - 1), fsEff - 1, {120, 100, 72, 160});
+    }
+  }
+
+  // ── Stat band divider line ────────────────────────────────────────────────
+  DrawRectangle((int)iX, (int)statT, (int)iW, 1, {185, 144, 35, 210});
+
+  // ── Cost gem (top-left corner, overlapping border) ───────────────────────
+  {
+    float gR  = W * 0.115f;
+    float gCX = X + padX * 0.35f + gR;
+    float gCY = Y + nameH * 0.5f;
+    // Outer ring
+    DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {50, 24, 4, 255});
+    // Deep blue gem
+    DrawCircle((int)gCX, (int)gCY, (int)(gR),         {28, 55, 130, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.72f), {45, 90, 190, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.40f), {85, 145, 235, 255});
+    // Glint
+    DrawCircle((int)(gCX - gR * 0.25f), (int)(gCY - gR * 0.28f),
+               (int)(gR * 0.18f), {210, 230, 255, 180});
+    // Cost number
+    char costB[4]; snprintf(costB, 4, "%d", view.cost);
+    int cfs = Clamp((int)(gR * 1.5f), 8, 15);
+    int cw  = MeasureText(costB, cfs);
+    DrawText(costB, (int)(gCX - cw * 0.5f + 1), (int)(gCY - cfs * 0.5f + 1), cfs, {0, 0, 0, 140});
+    DrawText(costB, (int)(gCX - cw * 0.5f),     (int)(gCY - cfs * 0.5f),     cfs, {240, 230, 200, 255});
+  }
+
+  // ── Rarity gem (top-right corner) ────────────────────────────────────────
+  if (view.rarity > 0) {
+    float gR  = W * 0.100f;
+    float gCX = X + W - padX * 0.35f - gR;
+    float gCY = Y + nameH * 0.5f;
+    float sh  = sinf(g_time * 5.f) * 0.5f + 0.5f;
+
+    Color c1 = (view.rarity == 2) ? Color{130, 40, 20, 255}  : Color{120, 90, 10, 255};
+    Color c2 = (view.rarity == 2) ? Color{220, 80, 40, 255}  : Color{210, 168, 40, 255};
+    Color c3 = (view.rarity == 2) ? Color{255, 145, 80, 255} : Color{255, 230, 100, 255};
+
+    DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {50, 24, 4, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR),         c1);
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.68f), c2);
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.36f), c3);
+    if (view.rarity == 2) {
+      // Animated shimmer for unique cards
+      Color shimmer = {255, (unsigned char)(190 + (int)(65 * sh)),
+                            (unsigned char)(80  + (int)(120 * sh)), 200};
+      DrawCircle((int)(gCX - gR * 0.2f), (int)(gCY - gR * 0.25f),
+                 (int)(gR * 0.22f), shimmer);
+    }
+    // Rarity label
+    const char *rlbl = (view.rarity == 2) ? "U" : "R";
+    int rfs = Clamp((int)(gR * 1.4f), 7, 13);
+    int rw  = MeasureText(rlbl, rfs);
+    DrawText(rlbl, (int)(gCX - rw * 0.5f), (int)(gCY - rfs * 0.5f), rfs, {255, 245, 210, 255});
+
+    // Star pips below gem
+    int stars = view.rarity + 1;
+    float sY = gCY + gR + 3.f, sGap = 5.5f, sW = 3.5f;
+    float sX0 = gCX - (stars * sGap - (sGap - sW)) * 0.5f;
+    Color sc = (view.rarity == 2) ? Color{220, 130, 255, 235} : Color{220, 185, 55, 225};
+    for (int s = 0; s < stars; s++)
+      DrawRectangle((int)(sX0 + s * sGap), (int)sY, (int)sW, (int)sW, sc);
+  }
+
+  // ── ATK / DEF stat badges (bottom band) ──────────────────────────────────
+  if (cd.isUnit) {
+    float bH  = H * 0.115f;
+    float bW  = iW * 0.425f;
+    float bY  = statT + (H * 0.13f - bH) * 0.5f;
+
+    // ATK badge — crimson left
+    Rectangle atkR = {iX, bY, bW, bH};
+    DrawRectangleRounded(atkR, 0.30f, 4, {75, 12, 10, 255});
+    DrawRectangleRounded(atkR, 0.30f, 4, {130, 25, 22, 200});
+    DrawRectangleRoundedLinesEx(atkR, 0.30f, 4, 1.5f, {215, 70, 50, 255});
+    DrawRectangleRoundedLinesEx({atkR.x+1,atkR.y+1,atkR.width-2,atkR.height-2},
+                                 0.30f, 4, 0.5f, {255, 160, 140, 80});
+
+    int sfs = Clamp((int)(bH * 0.65f), 7, 12);
+    DrawText("ATK", (int)(atkR.x + 4), (int)(atkR.y + 2),           sfs - 2, {255, 150, 130, 210});
+    char buf[8]; snprintf(buf, 8, "%d", view.atk);
+    int aw = MeasureText(buf, sfs);
+    DrawText(buf, (int)(atkR.x + bW - aw - 5), (int)(atkR.y + (bH - sfs) * 0.5f), sfs, {255, 242, 200, 255});
+
+    // DEF badge — teal right
+    Rectangle defR = {iX + iW - bW, bY, bW, bH};
+    DrawRectangleRounded(defR, 0.30f, 4, {8, 45, 35, 255});
+    DrawRectangleRounded(defR, 0.30f, 4, {16, 72, 58, 200});
+    DrawRectangleRoundedLinesEx(defR, 0.30f, 4, 1.5f, {40, 190, 150, 255});
+    DrawRectangleRoundedLinesEx({defR.x+1,defR.y+1,defR.width-2,defR.height-2},
+                                 0.30f, 4, 0.5f, {100, 255, 210, 80});
+
+    DrawText("DEF", (int)(defR.x + 4), (int)(defR.y + 2),           sfs - 2, {80, 230, 195, 210});
+    snprintf(buf, 8, "%d", view.def);
+    int dw = MeasureText(buf, sfs);
+    DrawText(buf, (int)(defR.x + bW - dw - 5), (int)(defR.y + (bH - sfs) * 0.5f), sfs, {195, 255, 225, 255});
+  }
+
+  // ── Playable green glow ring ──────────────────────────────────────────────
+  if (view.isPlayable) {
+    float pulse = sinf(g_time * 4.5f) * 0.28f + 0.72f;
+    unsigned char ga = (unsigned char)(160 * pulse);
+    DrawRectangleRoundedLinesEx({X - 2, Y - 2, W + 4, H + 4}, 0.09f, 8, 2.5f,
+      {50, (unsigned char)(205 * pulse), 100, ga});
+  }
+}
+// ── end §CARDVIEW ─────────────────────────────────────────────────────────────
+
 // ── Draw Match Scene ────────────────────────────────────────────────────────
 static void DrawMatchScene() {
   GameMatch &m = g_match;
   MatchPlayer &human = m.players[0];
-  MatchPlayer &ai = m.players[1];
+  MatchPlayer &ai    = m.players[1];
 
-  // The board is a flat surface placed in 3D space.
-  DrawPlane((Vector3){0, -0.2f, 0}, (Vector2){28, 22}, {10, 20, 15, 255});
-  DrawPlane((Vector3){0, -0.1f, 0}, (Vector2){26, 20}, {90, 70, 40, 255});
-  DrawCubeWires((Vector3){0, -0.1f, 0}, 26, 0.01f, 20, {140, 110, 60, 255});
-
-  // Divider line
-  DrawLine3D((Vector3){-12, 0, 0}, (Vector3){12, 0, 0}, {140, 110, 60, 200});
-
-  // Opponent cards appear farther away due to perspective.
-  float oppFieldZ = 4.0f;
-  float oppHandZ = 6.0f;
-  float cardWidth = 2.0f;
-  float cardHeight = 1.5f;
-
-  // ── Opponent hand (face-down cards)
-  for (int i = 0; i < ai.handSize; i++) {
-    float totalWidth = ai.handSize * 1.2f;
-    float startX = -totalWidth / 2.0f + 0.6f;
-    float cx = startX + i * 1.2f;
-    DrawCube((Vector3){cx, 0, oppHandZ}, 1.0f, 0.1f, 0.7f, {80, 60, 40, 255});
-    DrawCubeWires((Vector3){cx, 0, oppHandZ}, 1.0f, 0.1f, 0.7f,
-                  {120, 100, 60, 255});
-  }
-
-  // ── Opponent field (units)
-  for (int i = 0; i < ai.fieldSize; i++) {
-    float totalWidth = ai.fieldSize * (cardWidth + 0.2f);
-    float startX = -totalWidth / 2.0f + cardWidth / 2.0f;
-    float cx = startX + i * (cardWidth + 0.2f);
-    Color bg = ai.field[i].isDefender ? Color{60, 60, 120, 255}
-                                      : Color{70, 50, 35, 255};
-    DrawCube((Vector3){cx, 0, oppFieldZ}, cardWidth, 0.2f, cardHeight, bg);
-    DrawCubeWires((Vector3){cx, 0, oppFieldZ}, cardWidth, 0.2f, cardHeight,
-                  {180, 150, 80, 255});
-  }
-
-  // Player cards are positioned slightly closer to the camera.
-  float playerFieldZ = -4.0f;
-  float playerHandZ = -9.0f;
-
-  // ── Player field (units)
-  for (int i = 0; i < human.fieldSize; i++) {
-    float totalWidth = human.fieldSize * (cardWidth + 0.2f);
-    float startX = -totalWidth / 2.0f + cardWidth / 2.0f;
-    float cx = startX + i * (cardWidth + 0.2f);
-    Color bg = {50, 40, 30, 255};
-    if (human.field[i].isDefender)
-      bg = {40, 40, 90, 255};
-    if (m.selectedFieldIdx == i)
-      bg = {100, 80, 40, 255};
-    if (!human.field[i].canActivate)
-      bg = {40, 35, 25, 255};
-    DrawCube((Vector3){cx, 0, playerFieldZ}, cardWidth, 0.2f, cardHeight, bg);
-    Color border = (human.field[i].canActivate && !human.field[i].activated)
-                       ? Color{255, 220, 80, 255}
-                       : Color{120, 100, 60, 255};
-    DrawCubeWires((Vector3){cx, 0, playerFieldZ}, cardWidth, 0.2f, cardHeight,
-                  border);
-  }
-
-  // ── Player hand (full cards)
-  float handCardWidth = 2.2f;
-  float handCardHeight = 3.0f;
+  // ── Hover state detection ─────────────────────────────────────────────────
+  Vector2 mouse = GetMousePosition();
+  g_matchHoverHand       = -1;
+  g_matchHoverField      = -1;
+  g_matchHoverEnemyField = -1;
   for (int i = 0; i < human.handSize; i++) {
-    const CardDef &cd = GetCard(human.hand[i]);
-    float totalWidth = human.handSize * (handCardWidth + 0.2f);
-    float startX = -totalWidth / 2.0f + handCardWidth / 2.0f;
-    float cx = startX + i * (handCardWidth + 0.2f);
-    Color bg = cd.isUnit ? Color{50, 60, 50, 255} : Color{60, 50, 60, 255};
-    if (cd.cost > human.coins)
-      bg = {40, 30, 30, 255}; // dim if can't afford
+    Rectangle r = GetHandCardRect(i, human.handSize);
+    if (CheckCollisionPointRec(mouse, r)) { g_matchHoverHand = i; break; }
+  }
+  for (int i = 0; i < human.fieldSize; i++) {
+    Rectangle r = GetFieldScreenRect(0, i, human.fieldSize, 60, 45);
+    if (CheckCollisionPointRec(mouse, r)) { g_matchHoverField = i; break; }
+  }
+  for (int i = 0; i < ai.fieldSize; i++) {
+    Rectangle r = GetFieldScreenRect(1, i, ai.fieldSize, 60, 45);
+    if (CheckCollisionPointRec(mouse, r)) { g_matchHoverEnemyField = i; break; }
+  }
 
-    // NOTE: Drawing text and detailed card art in a 3D perspective requires a
-    // more complex solution (e.g., rendering cards to a texture and drawing
-    // that texture). For this 3D transformation, we are only drawing colored
-    // cubes as placeholders.
-    DrawCube((Vector3){cx, 0, playerHandZ}, handCardWidth, 0.1f, handCardHeight,
-             bg);
-    DrawCubeWires((Vector3){cx, 0, playerHandZ}, handCardWidth, 0.1f,
-                  handCardHeight, {160, 140, 80, 255});
+  // ── Combat targeting arrow: track selected attacker to mouse ─────────────
+  if (m.turn == 0 && m.phase == PHASE_ACTIVATE && m.selectedFieldIdx >= 0) {
+    g_arrowActive = true;
+    Vector3 srcPos = GetFieldSlotPos(0, m.selectedFieldIdx, human.fieldSize);
+    g_arrowSrc = GetWorldToScreen(srcPos, g_matchCam);
+    g_arrowDst = mouse;
+  } else {
+    g_arrowActive = false;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  2D: Desert arena background (rendered first, under 3D scene)
+  // ══════════════════════════════════════════════════════════════════════════
+  DrawArenaBackground();
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  3D TABLE SCENE  (60-degree perspective, desert hardwood table)
+  // ══════════════════════════════════════════════════════════════════════════
+  BeginMode3D(g_matchCam);
+
+  // ── Table body (desert hardwood) ──────────────────────────────────────────
+  DrawCube({0, -1.2f, 0.5f}, 28, 2.0f, 20, {68, 40, 17, 255});
+  DrawCubeWires({0, -1.2f, 0.5f}, 28, 2.0f, 20, {90, 55, 24, 255});
+
+  // Table legs (key light: left side slightly brighter)
+  float legH = 4.0f, legR = 0.40f;
+  DrawCylinder({-12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR, legH, 6, {52, 30, 11, 255});
+  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR, legH, 6, {46, 26,  9, 255});
+  DrawCylinder({-12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR, legH, 6, {52, 30, 11, 255});
+  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR, legH, 6, {46, 26,  9, 255});
+
+  // Felt surface
+  DrawCube({0, -0.15f, 0.5f}, 26, 0.08f, 18, {20, 56, 30, 255});
+  // Gold edge trim
+  DrawCubeWires({0, -0.10f, 0.5f}, 26.2f, 0.12f, 18.2f, {182, 152, 62, 200});
+  // Centre dividing gold strip
+  DrawCube({0, -0.10f, 0.5f}, 24, 0.02f, 0.09f, {182, 152, 62, 190});
+
+  // Zone area felt shading
+  DrawCube({0, -0.12f, -2.5f}, 18, 0.01f, 4.0f, {15, 46, 25, 255});
+  DrawCube({0, -0.12f,  3.5f}, 18, 0.01f, 4.0f, {15, 46, 25, 255});
+
+  // Corner markers
+  float cmY = -0.09f;
+  DrawSphere({-9.0f, cmY, -4.5f}, 0.12f, {182, 152, 62, 148});
+  DrawSphere({ 9.0f, cmY, -4.5f}, 0.12f, {182, 152, 62, 148});
+  DrawSphere({-9.0f, cmY,  5.5f}, 0.12f, {182, 152, 62, 148});
+  DrawSphere({ 9.0f, cmY,  5.5f}, 0.12f, {182, 152, 62, 148});
+
+  // ── Slot depressions (5 per side, always visible) ─────────────────────────
+  DrawSlotDepressions(0, human.fieldSize);
+  DrawSlotDepressions(1, ai.fieldSize);
+
+  // Card slab dimensions
+  const float CW = 2.2f, CDEP = 3.0f, CTHK = 0.14f;
+
+  // ── AI field units ─────────────────────────────────────────────────────────
+  for (int i = 0; i < ai.fieldSize; i++) {
+    FieldUnit &fu = ai.field[i];
+    Vector3 pos3  = GetFieldSlotPos(1, i, ai.fieldSize);
+    const CardDef &cd = GetCard(fu.cardId);
+    bool hasFly  = CardHasKeyword(cd, "fly");
+    bool hasDash = CardHasKeyword(cd, "dash");
+    Color frame  = fu.isDefender ? Color{55, 55, 200, 255} : Color{200, 162, 72, 255};
+    if (i == g_matchHoverEnemyField) frame = {255, 100, 80, 255};
+    DrawCard3DUnit(pos3, CW, CDEP, CTHK, fu.cardId, fu.activated,
+                   (i == g_matchHoverEnemyField), hasFly, hasDash, frame);
+  }
+
+  // ── Player field units ────────────────────────────────────────────────────
+  for (int i = 0; i < human.fieldSize; i++) {
+    FieldUnit &fu = human.field[i];
+    Vector3 pos3  = GetFieldSlotPos(0, i, human.fieldSize);
+    const CardDef &cd = GetCard(fu.cardId);
+    bool hasFly  = CardHasKeyword(cd, "fly");
+    bool hasDash = CardHasKeyword(cd, "dash");
+    bool sel     = (m.selectedFieldIdx == i);
+    Color frame  = (fu.canActivate && !fu.activated)
+                       ? Color{255, 222, 82, 255} : Color{122, 102, 62, 255};
+    if (fu.isDefender) frame = {62, 102, 222, 255};
+    DrawCard3DUnit(pos3, CW, CDEP, CTHK, fu.cardId, fu.activated,
+                   sel, hasFly, hasDash, frame);
+  }
+
+  // ── AI face-down hand cards (top edge of table, patterned card backs) ───────
+  for (int i = 0; i < ai.handSize; i++) {
+    float spacing = 1.5f;
+    float startX  = -(ai.handSize - 1) * spacing * 0.5f;
+    float cx = startX + i * spacing;
+    float cz = -7.5f;
+    // Card body
+    DrawCube({cx, -0.05f, cz}, 1.25f, 0.10f, 1.85f, {42, 28, 16, 255});
+    // Card back design — two crossing diagonal lines on top face
+    float topY = 0.001f;
+    float hw = 0.55f, hd = 0.88f;
+    // Border strip
+    rlPushMatrix();
+    rlTranslatef(cx, topY, cz);
+    DrawCube({0, 0, 0}, 1.25f, 0.001f, 1.85f, {55, 38, 22, 255});
+    DrawCube({0, 0.001f, 0}, 1.05f, 0.001f, 1.65f, {30, 18, 10, 255});
+    // Inner diamond pattern
+    DrawCube({0, 0.002f, 0}, 0.70f, 0.001f, 0.70f, {55, 38, 22, 200});
+    rlPopMatrix();
+    // Gold frame wire
+    DrawCubeWires({cx, -0.05f, cz}, 1.28f, 0.12f, 1.88f, {120, 95, 42, 200});
+  }
+
+  // ── Deck stacks (player + AI, right side) ────────────────────────────────
+  auto drawDeckStack = [](float cx, float cz, int deckSz) {
+    if (deckSz <= 0) return;
+    int layers = (deckSz > 6) ? 6 : deckSz;
+    for (int i = 0; i < layers; i++)
+      DrawCube({cx, -0.05f + i * 0.06f, cz}, 1.8f, 0.05f, 2.5f,
+               {55, 38, 22, 255});
+    DrawCubeWires({cx, -0.05f + (layers - 1) * 0.06f, cz},
+                  1.8f, 0.05f, 2.5f, {122, 102, 62, 255});
+  };
+  drawDeckStack(10.5f,  5.5f, human.deckSize);   // player near camera = bottom
+  drawDeckStack(10.5f, -6.5f, ai.deckSize);      // AI far = top
+
+  // ── Graveyard stacks with top card face texture ───────────────────────────
+  auto drawGraveStack = [&](float cx, float cz, MatchPlayer &mp) {
+    if (mp.graveSize <= 0) return;
+    int layers = (mp.graveSize > 6) ? 6 : mp.graveSize;
+    for (int i = 0; i < layers; i++)
+      DrawCube({cx, -0.05f + i * 0.06f, cz}, 1.8f, 0.05f, 2.5f,
+               {46, 22, 46, 255});
+    DrawCubeWires({cx, -0.05f + (layers - 1) * 0.06f, cz},
+                  1.8f, 0.05f, 2.5f, {102, 62, 102, 255});
+    // Top card face texture
+    float topY = -0.05f + (layers - 1) * 0.06f;
+    int topId = mp.grave[mp.graveSize - 1];
+    DrawCardFaceTexture({cx, topY, cz}, 0.85f, 1.2f, topId, {255, 200, 200, 215});
+  };
+  drawGraveStack(-10.5f,  5.5f, human);   // player near camera = bottom
+  drawGraveStack(-10.5f, -6.5f, ai);      // AI far = top
+
+  // ── Oblivion exile portals (glowing, left side) ───────────────────────────
+  DrawOblivionPortal3D({-10.5f, 0.08f,  7.8f});   // player = near camera = bottom
+  if (human.oblivionSize > 0)
+    DrawCardFaceTexture({-10.5f, 0.20f,  7.8f}, 0.68f, 0.95f,
+                        human.oblivion[human.oblivionSize - 1],
+                        {210, 110, 255, 185});
+
+  DrawOblivionPortal3D({-10.5f, 0.08f, -8.8f});   // AI = far = top
+  if (ai.oblivionSize > 0)
+    DrawCardFaceTexture({-10.5f, 0.20f, -8.8f}, 0.68f, 0.95f,
+                        ai.oblivion[ai.oblivionSize - 1],
+                        {210, 110, 255, 185});
+
+  // Ambient decorative coins (desert flavour)
+  DrawSphere({-12.0f, 0.10f, 0.5f}, 0.26f, {202, 182, 62, 200});
+  DrawSphere({-12.3f, 0.08f, 0.9f}, 0.18f, {202, 182, 62, 150});
+
+  EndMode3D();
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  2D HUD OVERLAY
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── Visual phase bar (top centre) ─────────────────────────────────────────
+  DrawPhaseBar(m.phase, m.turn == 0);
+
+  // ── Field card overlays: compact stat badge + keywords + orbs ──────────────
+  // (card name removed — it's already rendered on the 3D card face texture)
+  for (int side = 0; side < 2; side++) {
+    MatchPlayer &mp = m.players[side];
+    for (int i = 0; i < mp.fieldSize; i++) {
+      FieldUnit &fu = mp.field[i];
+      const CardDef &cd = GetCard(fu.cardId);
+      Vector3 pos3 = GetFieldSlotPos(side, i, mp.fieldSize);
+      if (CardHasKeyword(cd, "fly")) pos3.y += 0.45f;
+      Vector2 sp = GetWorldToScreen(pos3, g_matchCam);
+
+      int ea = fu.curAtk + fu.powerCounters - fu.weakCounters + fu.bonusAtk;
+      int ed = fu.curDef + fu.powerCounters - fu.weakCounters + fu.bonusDef;
+      if (ea < 0) ea = 0;
+      if (ed < 0) ed = 0;
+
+      // ── ATK / DEF pill badge ──────────────────────────────────────────────
+      // Left shield: ATK (red-orange)
+      {
+        char buf[8]; snprintf(buf, 8, "%d", ea);
+        int w = MeasureText(buf, 11);
+        float bx = sp.x - 28 - w * 0.5f, by = sp.y + 14;
+        Color bg = (fu.powerCounters > 0) ? Color{20,60,15,220}
+                 : (fu.weakCounters  > 0) ? Color{60,15,15,220}
+                                          : Color{65,20,18,215};
+        DrawRectangleRounded({bx, by, (float)(w + 10), 16}, 0.55f, 4, bg);
+        DrawRectangleRoundedLinesEx({bx, by, (float)(w + 10), 16}, 0.55f, 4,
+                                     1.0f, {220, 100, 80, 200});
+        DrawText(buf, (int)(bx + 5), (int)(by + 2), 11,
+                 {255, 190, 160, 255});
+      }
+      // Right shield: DEF (blue-green)
+      {
+        char buf[8]; snprintf(buf, 8, "%d", ed);
+        int w = MeasureText(buf, 11);
+        float bx = sp.x + 18 - w * 0.5f, by = sp.y + 14;
+        Color bg = (fu.powerCounters > 0) ? Color{15,55,20,220}
+                 : (fu.weakCounters  > 0) ? Color{55,15,15,220}
+                                          : Color{15,40,62,215};
+        DrawRectangleRounded({bx, by, (float)(w + 10), 16}, 0.55f, 4, bg);
+        DrawRectangleRoundedLinesEx({bx, by, (float)(w + 10), 16}, 0.55f, 4,
+                                     1.0f, {80, 180, 240, 200});
+        DrawText(buf, (int)(bx + 5), (int)(by + 2), 11,
+                 {170, 225, 255, 255});
+      }
+
+      // Keyword badges
+      DrawKeywordBadges(sp.x, sp.y - 8, cd);
+
+      // Defender badge (blue pill above card)
+      if (fu.isDefender) {
+        DrawRectangleRounded({sp.x - 20, sp.y - 46, 40, 14}, 0.5f, 4,
+                              {14, 18, 78, 220});
+        DrawRectangleRoundedLinesEx({sp.x - 20, sp.y - 46, 40, 14},
+                                     0.5f, 4, 1.0f, {100, 148, 255, 255});
+        DrawText("GUARD", (int)sp.x - 16, (int)sp.y - 44, 8,
+                 {140, 185, 255, 255});
+      }
+
+      // Tapped label
+      if (fu.activated) {
+        int tw = MeasureText("TAPPED", 8);
+        DrawRectangleRounded({sp.x - tw/2.f - 4, sp.y + 33, (float)(tw + 8), 13},
+                              0.5f, 4, {45, 18, 18, 200});
+        DrawText("TAPPED", (int)sp.x - tw / 2, (int)sp.y + 35, 8,
+                 {200, 80, 80, 200});
+      }
+
+      // Orbiting power / weakness tokens
+      DrawCounterOrbs(sp.x, sp.y - 14, fu.powerCounters, fu.weakCounters);
+    }
+  }
+
+  // ── Zone count badges projected from 3D ──────────────────────────────────
+  {
+    auto zBadge = [&](Vector3 wp, const char *label, int val, Color bg, Color fg) {
+      Vector2 sp = GetWorldToScreen(wp, g_matchCam);
+      char buf[20]; snprintf(buf, 20, "%s%d", label, val);
+      int tw = MeasureText(buf, 9);
+      DrawRectangleRounded({sp.x - tw/2.f - 5, sp.y - 10, (float)(tw + 10), 15},
+                            0.5f, 4, bg);
+      DrawText(buf, (int)(sp.x - tw/2), (int)(sp.y - 9), 9, fg);
+    };
+    zBadge({ 10.5f, 0.5f,  5.5f}, "DECK:", human.deckSize,
+           {28,22,14,215}, {200, 180, 130, 255});
+    zBadge({-10.5f, 0.5f,  5.5f}, "GRV:",  human.graveSize,
+           {28,14,28,215}, {185, 120, 185, 255});
+    zBadge({ 10.5f, 0.5f, -6.5f}, "DECK:", ai.deckSize,
+           {22,18,12,190}, {180, 160, 118, 230});
+    zBadge({-10.5f, 0.5f, -6.5f}, "GRV:",  ai.graveSize,
+           {24,12,24,190}, {165, 100, 165, 230});
+    zBadge({-10.5f, 0.5f,  7.8f}, "OBL:",  human.oblivionSize,
+           {22,10,38,215}, {165,  82, 210, 255});
+    zBadge({-10.5f, 0.5f, -8.8f}, "OBL:",  ai.oblivionSize,
+           {18, 8,32,190}, {145,  65, 190, 230});
+  }
+
+  // ── Hand zone: radial fan at bottom with gold-trim matte backdrop ──────────
+  DrawRectangleGradientV(0, SCREEN_H - 178, SCREEN_W, 32,
+                         {0, 0, 0, 0}, {10, 6, 4, 245});
+  DrawRectangle(0, SCREEN_H - 146, SCREEN_W, 146, {10, 6, 4, 248});
+  // Gold separator rule at top of hand zone
+  DrawRectangle(0, SCREEN_H - 146, SCREEN_W, 1, {182, 152, 62, 160});
+  // Subtle inner highlight strip
+  DrawRectangleGradientV(0, SCREEN_H - 145, SCREEN_W, 12,
+                         {182, 152, 62, 25}, {0, 0, 0, 0});
+
+  // Sync live CardView states (dynamic atk/def, playable flag)
+  SyncHandCardViews(human);
+  {
+    Vector2 mouse2 = GetMousePosition();
+    float fanCenter = (human.handSize - 1) * 0.5f;
+    for (int i = 0; i < human.handSize && i < MAX_HAND; i++) {
+      Rectangle r = GetHandCardRect(i, human.handSize);
+      r.x += g_hspringOff[i];
+
+      bool hov = (i == g_matchHoverHand);
+
+      // Update hover-tilt spring
+      Vector2 mrel = {mouse2.x - (r.x + r.width  * 0.5f),
+                      mouse2.y - (r.y + r.height * 0.5f)};
+      g_handCardViews[i].Update(GetFrameTime(), hov, mrel);
+
+      // Fan pseudo-rotation: blend base fan-tilt into hoverRotX so the
+      // parallelogram skew in DrawCardView gives a natural "fanned" look.
+      float fanTilt = (i - fanCenter) /
+                      fmaxf((float)(human.handSize - 1), 1.0f) * 0.55f;
+      CardView fv = g_handCardViews[i];
+      fv.hoverRotX += fanTilt * (hov ? 0.20f : 1.0f);  // flatten on hover
+
+      // Scale: 1.4× on hover
+      float scl   = hov ? 1.4f : fv.scale;
+      Rectangle drawR = r;
+      if (hov) {
+        drawR = {r.x - r.width  * (scl - 1.0f) * 0.5f,
+                 r.y - r.height * (scl - 1.0f),
+                 r.width  * scl,
+                 r.height * scl};
+      }
+
+      // Full layered GPU render + text overlays
+      DrawCardView(drawR, fv, human.hand[i]);
+    }
+  }
+
+  // ── Opponent hand count ───────────────────────────────────────────────────
+  {
+    char buf[32]; snprintf(buf, 32, "Opponent Hand: %d", ai.handSize);
+    DrawText(buf, SCREEN_W / 2 - 50, 34, 12, {180, 162, 122, 200});
+  }
+
+  // ── TCG Portrait Panels — glass-matte style ──────────────────────────────
+  auto DrawHUDPanel = [](float px, float py, int life, int coins,
+                         bool isPlayer) {
+    float pw = 196.f, ph = 54.f;
+    // Outer ambient glow
+    DrawRectangleRoundedLinesEx({px - 2, py - 2, pw + 4, ph + 4},
+                                 0.35f, 4, 2.5f,
+                                 isPlayer ? Color{182, 152, 62, 60}
+                                          : Color{182,  82, 62, 60});
+    // Main body — deep matte
+    DrawRectangleRounded({px, py, pw, ph}, 0.28f, 4, {12, 8, 5, 248});
+    // Inner glass highlight (top gradient strip)
+    DrawRectangleGradientV((int)px + 2, (int)py + 2, (int)pw - 4, 18,
+                            {255, 255, 255, 18}, {0, 0, 0, 0});
+    // Gold border
+    Color borderCol = isPlayer ? Color{182, 152, 62, 210}
+                               : Color{182,  82, 62, 210};
+    DrawRectangleRoundedLinesEx({px, py, pw, ph}, 0.28f, 4, 1.5f, borderCol);
+
+    // ── Portrait circle ───────────────────────────────────────────────────
+    float cx = px + 22, cy = py + ph * 0.5f;
+    DrawCircle((int)cx, (int)cy, 16.f, {28, 20, 12, 230});
+    DrawCircle((int)cx, (int)cy, 14.f,
+               isPlayer ? Color{80, 160, 220, 200} : Color{220, 80, 80, 200});
+    // Avatar initials
+    const char *initials = isPlayer ? "P" : "AI";
+    int iw = MeasureText(initials, 11);
+    DrawText(initials, (int)cx - iw/2, (int)(cy - 6), 11, {240, 240, 240, 255});
+    // Portrait ring
+    DrawCircleLines((int)cx, (int)cy, 16.f, borderCol);
+
+    // ── HP label + value ──────────────────────────────────────────────────
+    char hpBuf[16]; snprintf(hpBuf, 16, "%d", life);
+    DrawText("HP", (int)(px + 44), (int)(py + 8), 9, {180, 155, 100, 190});
+    DrawText(hpBuf, (int)(px + 60), (int)(py + 5), 16, {255, 222, 152, 255});
+
+    // ── HP bar ────────────────────────────────────────────────────────────
+    float hpFrac = fmaxf(0.0f, fminf(1.0f, (float)life / 20.0f));
+    float barX = px + 44, barY = py + 28, barW = 144, barH = 9;
+    // Track
+    DrawRectangleRounded({barX, barY, barW, barH}, 0.6f, 4, {35, 18, 18, 220});
+    // Fill — green → orange → red gradient based on HP fraction
+    Color fillCol = hpFrac > 0.5f ? Color{72, (unsigned char)(202*hpFrac), 52, 245}
+                                  : Color{(unsigned char)(255*(1-hpFrac)*2),
+                                          (unsigned char)(140*hpFrac*2), 30, 245};
+    if (hpFrac > 0.001f)
+      DrawRectangleRounded({barX, barY, barW * hpFrac, barH}, 0.6f, 4, fillCol);
+    // Bar shine overlay
+    DrawRectangleGradientV((int)barX + 1, (int)barY + 1,
+                            (int)(barW * hpFrac) - 2, 3,
+                            {255, 255, 255, 55}, {0, 0, 0, 0});
+
+    // ── Coins ─────────────────────────────────────────────────────────────
+    DrawCircle((int)(px + 48), (int)(py + 43), 5, {200, 180, 40, 220});
+    DrawCircleLines((int)(px + 48), (int)(py + 43), 5, {240, 215, 80, 200});
+    char coinBuf[16]; snprintf(coinBuf, 16, "%d", coins);
+    DrawText(coinBuf, (int)(px + 57), (int)(py + 38), 11, {222, 198, 55, 255});
+  };
+
+  // Player panel (bottom-left)
+  DrawHUDPanel(8.f, (float)(SCREEN_H - 192), human.life, human.coins, true);
+  // AI panel (top-left)
+  DrawHUDPanel(8.f, 30.f, ai.life, ai.coins, false);
+
+  // ── Turn indicator ────────────────────────────────────────────────────────
+  {
+    const char *turnText = (m.turn == 0) ? "YOUR TURN" : "OPPONENT'S TURN";
+    int tw = MeasureText(turnText, 10);
+    DrawText(turnText, SCREEN_W / 2 - tw / 2, 34, 10, {200, 182, 142, 200});
+  }
+
+  // ── Phase action buttons ──────────────────────────────────────────────────
+  // Phase action buttons (clickable)
+  if (m.turn == 0 && m.phase == PHASE_DEVELOP) {
+    DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+                          177, 30}, 0.3f, 4, {40, 80, 40, 235});
+    DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+                                  177, 30}, 0.3f, 4, 1.5f, {100, 220, 100, 200});
+    DrawText("▶ ACTIVATE PHASE", SCREEN_W - 182, SCREEN_H - 178,
+             10, {160, 255, 160, 255});
+  }
+  if (m.turn == 0 && m.phase == PHASE_ACTIVATE) {
+    DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+                          177, 30}, 0.3f, 4, {90, 40, 40, 235});
+    DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+                                  177, 30}, 0.3f, 4, 1.5f, {220, 100, 100, 200});
+    DrawText("■ END TURN", SCREEN_W - 182, SCREEN_H - 178,
+             11, {255, 180, 180, 255});
+    // Right-click hint
+    DrawText("Right-click unit = DEFEND toggle", SCREEN_W - 182, SCREEN_H - 205,
+             8, {180, 180, 255, 180});
+    if (m.selectedFieldIdx >= 0) {
+      DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 220),
+                            177, 30}, 0.3f, 4, {122, 42, 42, 225});
+      DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 220),
+                                    177, 30}, 0.3f, 4, 1.5f, {220, 80, 80, 200});
+      DrawText("⚔ ATTACK PLAYER", SCREEN_W - 182, SCREEN_H - 213,
+               10, {255, 160, 160, 255});
+    }
+  }
+
+  // ── Combat targeting arrow (Hearthstone-style Bezier) ────────────────────
+  DrawCombatArrow();
+
+  // ── AI "Thinking..." indicator ────────────────────────────────────────────
+  DrawAIThinkingIndicator();
+
+  // ── Arena combat burst particles ─────────────────────────────────────────
+  DrawArenaBursts();
+
+  // ── Card animations (highest Z — always on top) ───────────────────────────
+  DrawCardAnims();
+
+  // ── Message bar ───────────────────────────────────────────────────────────
+  if (m.messageTimer > 0) {
+    int mw = MeasureText(m.message, 14);
+    float alpha = fminf(m.messageTimer, 1.0f) * 255.0f;
+    DrawRectangleRounded(
+        {SCREEN_W / 2.0f - mw / 2.0f - 15, SCREEN_H / 2.0f - 90,
+         (float)mw + 30, 30},
+        0.3f, 4,
+        {20, 15, 10, (unsigned char)(alpha * 0.78f)});
+    DrawText(m.message, SCREEN_W / 2 - mw / 2,
+             (int)(SCREEN_H / 2.0f - 82), 14,
+             {255, 232, 162, (unsigned char)alpha});
+  }
+
+  // ── Game Over overlay ─────────────────────────────────────────────────────
+  if (m.phase == PHASE_GAME_OVER) {
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 162});
+    const char *result = m.playerWon ? "VICTORY!" : "DEFEAT!";
+    Color rc = m.playerWon ? Color{255, 222, 82, 255} : Color{255, 82, 82, 255};
+    // Glow ring behind text
+    float glow = sinf(g_time * 3.0f) * 0.5f + 0.5f;
+    DrawCircle(SCREEN_W / 2, SCREEN_H / 2 - 28,
+               (int)(88 + glow * 12),
+               {(unsigned char)(rc.r / 5), (unsigned char)(rc.g / 5),
+                (unsigned char)(rc.b / 5), (unsigned char)(58 + glow * 42)});
+    int rw = MeasureText(result, 50);
+    DrawText(result, SCREEN_W / 2 - rw / 2, SCREEN_H / 2 - 50, 50, rc);
+    DrawText("Press ENTER to continue", SCREEN_W / 2 - 95,
+             SCREEN_H / 2 + 22, 14, {202, 182, 142, 255});
+  }
+
+  // ── Floating damage / effect text ────────────────────────────────────────
+  DrawFloatTexts();
+
+  // ── Desert Wind & Dust atmospherics (shared with overworld system) ────────
+  DrawVFX();
+
+  // ── Hover tooltip: hand card ──────────────────────────────────────────────
+  if (g_matchHoverHand >= 0 && g_matchHoverHand < human.handSize) {
+    const CardDef &cd = GetCard(human.hand[g_matchHoverHand]);
+    Rectangle hr = GetHandCardRect(g_matchHoverHand, human.handSize);
+    float tipY = hr.y - 88;
+    float tipX = hr.x - 28;
+    if (tipX < 5) tipX = 5;
+    if (tipX > SCREEN_W - 222) tipX = SCREEN_W - 222;
+    DrawRectangleRounded({tipX, tipY, 215, 84}, 0.2f, 4, {24, 19, 14, 248});
+    DrawRectangleRoundedLinesEx({tipX, tipY, 215, 84}, 0.2f, 4, 1.5f,
+                                 {182, 152, 62, 255});
+    DrawText(cd.name, (int)tipX + 6, (int)tipY + 5, 12, {255, 232, 162, 255});
+    if (cd.effect[0])
+      DrawText(cd.effect, (int)tipX + 6, (int)tipY + 22, 8,
+               {202, 182, 142, 222});
+    if (cd.isUnit) {
+      char sb[52];
+      snprintf(sb, 52, "ATK:%d  DEF:%d  Cost:%d", cd.atk, cd.def, cd.cost);
+      DrawText(sb, (int)tipX + 6, (int)tipY + 56, 9, {222, 202, 162, 255});
+      if (cd.keywords[0]) {
+        char kb[52];
+        snprintf(kb, 52, "Keywords: %s", cd.keywords);
+        DrawText(kb, (int)tipX + 6, (int)tipY + 70, 8, {182, 222, 255, 222});
+      }
+    } else {
+      char sb[18]; snprintf(sb, 18, "Cost: %d", cd.cost);
+      DrawText(sb, (int)tipX + 6, (int)tipY + 56, 9, {222, 202, 162, 255});
+    }
+  }
+
+  // ── Hover tooltip: player field unit ─────────────────────────────────────
+  if (g_matchHoverField >= 0 && g_matchHoverField < human.fieldSize) {
+    FieldUnit &fu = human.field[g_matchHoverField];
+    const CardDef &cd = GetCard(fu.cardId);
+    Rectangle fr = GetFieldScreenRect(0, g_matchHoverField, human.fieldSize,
+                                       60, 45);
+    float tipX = fr.x + fr.width + 5;
+    float tipY = fr.y - 22;
+    if (tipX > SCREEN_W - 204) tipX = fr.x - 207;
+    DrawRectangleRounded({tipX, tipY, 202, 68}, 0.2f, 4, {24, 19, 14, 238});
+    DrawRectangleRoundedLinesEx({tipX, tipY, 202, 68}, 0.2f, 4, 1.5f,
+                                 {142, 122, 62, 255});
+    DrawText(cd.name, (int)tipX + 5, (int)tipY + 5, 11, {255, 232, 162, 255});
+    if (cd.effect[0])
+      DrawText(cd.effect, (int)tipX + 5, (int)tipY + 20, 7,
+               {202, 182, 142, 222});
+    if (cd.keywords[0]) {
+      char kb[34]; snprintf(kb, 34, "[%s]", cd.keywords);
+      DrawText(kb, (int)tipX + 5, (int)tipY + 52, 8, {182, 222, 255, 222});
+    }
   }
 }
 
@@ -3617,10 +5869,6 @@ static void DrawShopScene() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // CARD FRAME GENERATION — Pixel-art card textures (96x128)
 // ═══════════════════════════════════════════════════════════════════════════════
-static constexpr int CARD_TEX_W = 96;
-static constexpr int CARD_TEX_H = 128;
-static Texture2D g_cardTextures[200]; // one per card ID (up to 193 + extra)
-static int g_numCardTextures = 0;
 
 // Desert-themed 16-color pixel palette
 static const Color PALETTE[] = {
@@ -3857,6 +6105,7 @@ static void GenerateAllCardTextures() {
   g_numCardTextures = NUM_ALL_CARDS;
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // NPC DIALOG — RPG-style bottom-screen Name Box + Message Box
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3898,7 +6147,10 @@ static void DrawNPCDialog() {
              10, {180, 160, 120, 180});
   } else {
     // ── Menu phase: Talk / Trade / Duel / Close ────────────────────────
-    const char *options[] = {"Talk", "Trade", "Duel", "Close"};
+    bool isTournamentMaster = (g_targetNPC >= 0 &&
+        g_npcs[g_targetNPC].role == NPC_ROLE_TOURNAMENT);
+    const char *duelLabel = isTournamentMaster ? "Tournament" : "Duel";
+    const char *options[] = {"Talk", "Trade", duelLabel, "Close"};
     for (int i = 0; i < 4; i++) {
       bool sel = (i == g_dialogSelection);
       Color col = sel ? Color{255, 220, 80, 255} : Color{210, 200, 170, 255};
@@ -3906,6 +6158,20 @@ static void DrawNPCDialog() {
       char buf[64];
       snprintf(buf, sizeof(buf), "%s%s", arrow, options[i]);
       DrawText(buf, msgBoxX + 18, msgBoxY + 14 + i * 20, 16, col);
+    }
+    // Tournament master: show city round progress in dialog
+    if (isTournamentMaster) {
+      int ci = g_npcs[g_targetNPC].cityIndex;
+      bool badgeEarned = g_tournament.cityChampionDefeated[ci];
+      char statusBuf[80];
+      if (badgeEarned) {
+        snprintf(statusBuf, sizeof(statusBuf), "City Badge: EARNED");
+        DrawText(statusBuf, msgBoxX + msgBoxW - 180, msgBoxY + 14, 10, {100,255,100,200});
+      } else {
+        snprintf(statusBuf, sizeof(statusBuf), "Round %d/3",
+                 (g_tournament.currentCity == ci) ? g_tournament.roundsWon : 0);
+        DrawText(statusBuf, msgBoxX + msgBoxW - 120, msgBoxY + 14, 10, {220,200,100,200});
+      }
     }
     DrawText("[W/S] Select  [Enter/E] Confirm  [Esc] Close",
              msgBoxX + 18, msgBoxY + msgBoxH - 22, 10,
@@ -3950,27 +6216,38 @@ static void UpdateNPCDialog() {
       break;
     }
     case 1: // Trade
-      if (g_targetNPC == 2) { // Merchant Yara
+      if (g_targetNPC >= 0 && (g_targetNPC == 2 ||
+          g_npcs[g_targetNPC].role == NPC_ROLE_SHOP)) {
         g_scene = SCENE_SHOP;
         g_npcDialogOpen = false;
         g_dialogPhase = DIALOG_MENU;
       } else {
-        g_dialogText = "I have nothing to trade right now.\nTry the merchant at Yara's Bazaar.";
+        g_dialogText = "I have nothing to trade right now.\nVisit the city bazaar to shop!";
         g_dialogPhase = DIALOG_TALK;
       }
       break;
-    case 2: // Duel
+    case 2: // Duel / Tournament
       if (!g_hasStarterDeck) {
         g_dialogText = "You need a deck first! Visit the bazaar\nand pick up a starter pack.";
         g_dialogPhase = DIALOG_TALK;
-      } else if (g_playerDeckSize >= 20) {
+      } else if (g_playerDeckSize < 20) {
+        g_dialogText = "Your deck needs at least 20 cards.\nOpen some packs at the bazaar!";
+        g_dialogPhase = DIALOG_TALK;
+      } else if (g_targetNPC >= 0 &&
+                 g_npcs[g_targetNPC].role == NPC_ROLE_TOURNAMENT) {
+        // Tournament round
+        int cityIdx = g_npcs[g_targetNPC].cityIndex;
+        g_tournament.currentCity = cityIdx;
+        g_tournamentMode = true;
         StartMatch(g_targetNPC);
         g_scene = SCENE_MATCH;
         g_npcDialogOpen = false;
         g_dialogPhase = DIALOG_MENU;
       } else {
-        g_dialogText = "Your deck needs at least 20 cards.\nOpen some packs at the bazaar!";
-        g_dialogPhase = DIALOG_TALK;
+        StartMatch(g_targetNPC);
+        g_scene = SCENE_MATCH;
+        g_npcDialogOpen = false;
+        g_dialogPhase = DIALOG_MENU;
       }
       break;
     case 3: // Close
@@ -4108,11 +6385,11 @@ static void DrawMenuOverlay() {
         int cy2 = gridY + row * (cardH + gapY);
         int cid = g_cardCopies[idx].cardId;
 
-        // Draw card texture
-        if (cid > 0 && cid < 200 && g_cardTextures[cid].id) {
-          Rectangle src = {0, 0, (float)CARD_TEX_W, (float)CARD_TEX_H};
+        // Draw card with full frame layout
+        if (cid > 0 && cid <= NUM_ALL_CARDS) {
+          CardView cv; cv.Init(cid);
           Rectangle dst = {(float)cx2, (float)cy2, (float)cardW, (float)cardH};
-          DrawTexturePro(g_cardTextures[cid], src, dst, {0, 0}, 0, WHITE);
+          DrawCardView(dst, cv, cid);
         }
 
         // Highlight selected
@@ -4146,13 +6423,11 @@ static void DrawMenuOverlay() {
 
     if (g_selectedCardId > 0) {
       const CardDef &cd = GetCard(g_selectedCardId);
-      // Large card preview
-      if (g_cardTextures[g_selectedCardId].id) {
-        Rectangle src = {0, 0, (float)CARD_TEX_W, (float)CARD_TEX_H};
-        Rectangle dst = {(float)(detX + detW / 2 - 72), (float)(gridY + 8), 144,
-                         192};
-        DrawTexturePro(g_cardTextures[g_selectedCardId], src, dst, {0, 0}, 0,
-                       WHITE);
+      // Large card preview — full frame layout
+      {
+        Rectangle dst = {(float)(detX + detW / 2 - 72), (float)(gridY + 8), 144, 192};
+        CardView pv; pv.Init(g_selectedCardId);
+        DrawCardView(dst, pv, g_selectedCardId);
       }
       // Card details below
       int ty = gridY + 208;
@@ -5232,6 +7507,23 @@ struct RockInstance {
 };
 static RockInstance g_rockInstances[MAX_ROCKS];
 static int g_numRocks = 0;
+// ── Vegetation instances (Northern Wastes cacti, agave, dry trees) ──────────
+static constexpr int MAX_VEGETATION = 80;
+enum VegType { VEG_SAGUARO = 0, VEG_PRICKLY_PEAR, VEG_AGAVE, VEG_DRY_TREE };
+struct VegetationInstance {
+  float x, z;
+  float rotY;
+  float scale;
+  VegType type;
+  float colliderRadius; // for sphere-slide collision
+};
+static VegetationInstance g_vegInstances[MAX_VEGETATION];
+static int g_numVeg = 0;
+
+// Northern Wastes point-of-interest: ancient obelisk at north edge
+static constexpr float OBELISK_X = 100.0f;
+static constexpr float OBELISK_Z = 7.5f;
+
 
 static void InitProceduralRocks() {
   g_numRocks = 0;
@@ -5242,9 +7534,6 @@ static void InitProceduralRocks() {
   for (int i = 0; i < MAX_ROCKS && g_numRocks < MAX_ROCKS; i++) {
     int rx = GetRandomValue(2, MAP_W - 3);
     int ry = GetRandomValue(2, MAP_H - 3);
-    if (g_collision[ry][rx])
-      continue; // skip occupied
-    g_collision[ry][rx] = 1;
     RockInstance &ri = g_rockInstances[g_numRocks++];
     ri.x = (float)rx;
     ri.z = (float)ry;
@@ -5274,7 +7563,7 @@ struct TentInstance {
   float frontAlpha;         // same for front wall
 };
 
-static constexpr int MAX_TENTS = 4;
+static constexpr int MAX_TENTS = 30;
 static TentInstance g_tentInstances[MAX_TENTS];
 static int g_numTents = 0;
 
@@ -5295,18 +7584,7 @@ static void PlaceTent(int gx, int gy, Color wall, Color roof, const char *sign,
   // Door: centered on south face (bottom center, one tile outside)
   t.doorGX = gx + 2;
   t.doorGY = gy + TENT_SIZE; // centered south, just outside wall
-  // Mark wall collision around the 4×4 footprint perimeter only.
-  // Interior tiles are walkable (player walks in, ceiling hides).
-  // Border ring (1 tile outside walls)
-  for (int dy = -1; dy <= TENT_SIZE; dy++)
-    for (int ddx = -1; ddx <= TENT_SIZE; ddx++) {
-      int tx = gx + ddx, ty = gy + dy;
-      // Only mark the outer ring and the wall tiles (not pure interior)
-      bool isWall = (ddx == -1 || ddx == TENT_SIZE || dy == -1 || dy == TENT_SIZE);
-      bool isEdge = (ddx == 0 || ddx == TENT_SIZE - 1 || dy == 0 || dy == TENT_SIZE - 1);
-      if ((isWall || isEdge) && tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H)
-        g_collision[ty][tx] = 1;
-    }
+  // Collision is mesh-based (wallAABB below) — no tile marks needed.
   // Clear interior tiles (full walkable area inside the tent walls)
   for (int dy = 1; dy < TENT_SIZE - 1; dy++)
     for (int ddx = 1; ddx < TENT_SIZE - 1; ddx++) {
@@ -5335,10 +7613,10 @@ static void PlaceTent(int gx, int gy, Color wall, Color roof, const char *sign,
   // AABB: full tent walls (4×4×4 world units)
   t.wallAABB.min = {t.worldX - 2.0f, 0.0f, t.worldZ - 2.0f};
   t.wallAABB.max = {t.worldX + 2.0f, 4.0f, t.worldZ + 2.0f};
-  // AABB: door trigger (0.4 wide × 0.5 deep, centered on door tile)
+  // AABB: door trigger (2.0 wide × 1.2 deep, centered on door tile)
   float ddx = (float)t.doorGX + 0.5f, ddz = (float)t.doorGY + 0.5f;
-  t.doorAABB.min = {ddx - 0.2f, 0.0f, ddz - 0.25f};
-  t.doorAABB.max = {ddx + 0.2f, 2.0f, ddz + 0.25f};
+  t.doorAABB.min = {ddx - 1.0f, 0.0f, ddz - 0.6f};
+  t.doorAABB.max = {ddx + 1.0f, 2.0f, ddz + 0.6f};
   // AABB: interior volume for ceiling-hide (covers interior + doorway approach)
   t.interiorAABB.min = {t.worldX - 1.6f, 0.0f, t.worldZ - 1.6f};
   t.interiorAABB.max = {t.worldX + 1.6f, 4.0f, t.worldZ + 2.4f}; // extends south through doorway
@@ -5675,7 +7953,11 @@ static void UpdateMicroParticles(float dt) {
       p.y = (float)GetRandomValue(0, SCREEN_H);
       p.phase = (float)GetRandomValue(0, 628) * 0.01f;
       p.speed = 14.0f + (float)GetRandomValue(0, 20) * 0.5f;
-      p.alpha = 0.12f + (float)GetRandomValue(0, 8) * 0.01f;
+      float halfH2 = (float)(MAP_H / 2);
+      float northP2 = Clamp((halfH2 - g_player.posZ) / halfH2, 0.0f, 1.0f);
+      float southP2 = Clamp((g_player.posZ - halfH2) / halfH2, 0.0f, 1.0f);
+      float alphaMult = 1.0f + northP2 * 1.6f + southP2 * 2.8f;
+      p.alpha = (0.12f + (float)GetRandomValue(0, 8) * 0.01f) * alphaMult;
       p.size = GetRandomValue(1, 2);
     }
   }
@@ -5699,11 +7981,18 @@ static void SpawnWindGust() {
 
 static void UpdateVFX(float dt) {
   UpdateMicroParticles(dt);
+  // Dust density: higher at northern + southern extremes
+  float halfH = (float)(MAP_H / 2);
+  float northP = Clamp((halfH - g_player.posZ) / halfH, 0.0f, 1.0f);
+  float southP = Clamp((g_player.posZ - halfH) / halfH, 0.0f, 1.0f);
+  float dustMult = 1.0f + northP * 1.8f + southP * 3.2f; // sandstorm stronger in south
+  float gustInterval = (8.5f + (float)GetRandomValue(0, 400) * 0.01f) / dustMult;
   g_gustTimer += dt;
   if (g_gustTimer >= g_nextGust) {
     g_gustTimer = 0.0f;
-    g_nextGust = 8.5f + (float)GetRandomValue(0, 400) * 0.01f;
-    SpawnWindGust();
+    g_nextGust = gustInterval;
+    int extraGusts = (int)dustMult;
+    for (int eg = 0; eg < extraGusts; eg++) SpawnWindGust();
   }
   for (int i = 0; i < g_windCount; i++) {
     WindLine &wl = g_windLines[i];
@@ -5777,12 +8066,129 @@ static void DrawSoftShadow(Vector3 objPos, float radius, float height) {
     float gy = GetDuneHeight(shadowX + ox, shadowZ + oz) + 0.02f;
     Vector3 p = {shadowX + ox, gy, shadowZ + oz};
     DrawCylinder(p, radius * 1.2f, radius * 1.2f, 0.01f, 12,
-                 {0, 0, 0, (unsigned char)Clamp(baseAlpha, 0, 60)});
+                 {40, 24, 6, (unsigned char)Clamp(baseAlpha, 0, 50)});
   }
   // Center shadow (stronger)
   float gyc = GetDuneHeight(shadowX, shadowZ) + 0.015f;
   DrawCylinder({shadowX, gyc, shadowZ}, radius, radius, 0.01f, 12,
-               {0, 0, 0, (unsigned char)Clamp(baseAlpha * 2.0f, 0, 50)});
+               {32, 18, 4, (unsigned char)Clamp(baseAlpha * 2.0f, 0, 42)});
+}
+
+
+// ─── Vegetation draw helpers (matte vinyl low-poly style) ────────────────────
+static void DrawSaguaro(Vector3 base, float sc) {
+  Color trunk  = {58, 92, 46, 255};
+  Color trunkL = {72, 112, 56, 255};
+  float h = 3.2f * sc;
+  float r = 0.22f * sc;
+  // Main trunk
+  DrawCylinder(base, r, r * 0.85f, h, 7, trunk);
+  DrawCylinderWires(base, r, r * 0.85f, h, 7, trunkL);
+  // Left arm (branches up at 55% height)
+  float ay = base.y + h * 0.55f;
+  Vector3 armLBase = {base.x - r * 1.6f, ay, base.z};
+  Vector3 armLTip  = {base.x - 0.7f * sc, ay + 0.9f * sc, base.z};
+  DrawCylinder(armLBase, r * 0.72f, r * 0.6f, 0.55f * sc, 6, trunk);
+  DrawCylinder(armLTip,  r * 0.6f,  r * 0.5f, 0.8f * sc, 6, trunk);
+  // Right arm (branches up at 40% height)
+  Vector3 armRBase = {base.x + r * 1.6f, base.y + h * 0.40f, base.z};
+  Vector3 armRTip  = {base.x + 0.65f * sc, base.y + h * 0.40f + 0.8f * sc, base.z};
+  DrawCylinder(armRBase, r * 0.72f, r * 0.60f, 0.50f * sc, 6, trunk);
+  DrawCylinder(armRTip,  r * 0.60f, r * 0.50f, 0.75f * sc, 6, trunk);
+  // Top cap
+  Vector3 top = {base.x, base.y + h, base.z};
+  DrawSphere(top, r * 0.9f, trunk);
+}
+
+static void DrawPricklyPear(Vector3 base, float sc) {
+  Color padCol  = {65, 108, 55, 255};
+  Color padEdge = {80, 132, 68, 255};
+  float r = 0.30f * sc;
+  // Three flattened pads stacked
+  Vector3 p0 = {base.x, base.y + 0.05f, base.z};
+  Vector3 p1 = {base.x + 0.18f * sc, base.y + 0.35f * sc, base.z + 0.05f * sc};
+  Vector3 p2 = {base.x - 0.08f * sc, base.y + 0.60f * sc, base.z - 0.05f * sc};
+  DrawCylinder(p0, r * 1.2f, r * 1.1f, 0.22f * sc, 8, padCol);
+  DrawCylinderWires(p0, r * 1.2f, r * 1.1f, 0.22f * sc, 8, padEdge);
+  DrawCylinder(p1, r * 0.9f, r * 0.8f, 0.20f * sc, 8, padCol);
+  DrawCylinderWires(p1, r * 0.9f, r * 0.8f, 0.20f * sc, 8, padEdge);
+  DrawCylinder(p2, r * 0.7f, r * 0.65f, 0.18f * sc, 8, padCol);
+}
+
+static void DrawAgave(Vector3 base, float sc) {
+  Color leafCol = {78, 118, 68, 255};
+  Color tipCol  = {190, 210, 155, 255};
+  int leafCount = 8;
+  float leafLen = 0.95f * sc;
+  for (int i = 0; i < leafCount; i++) {
+    float a = (float)i * (6.2832f / (float)leafCount);
+    float tilt = 0.28f; // slight droop downward
+    Vector3 tip = {base.x + cosf(a) * leafLen,
+                   base.y + 0.12f * sc - sinf(tilt) * leafLen,
+                   base.z + sinf(a) * leafLen};
+    // Leaf as narrow cylinder tapering to a point
+    DrawCylinder(base, 0.06f * sc, 0.01f * sc, leafLen, 5, leafCol);
+    DrawSphere(tip, 0.045f * sc, tipCol);
+    // Rotate each leaf by rotating base — approximate with offset cylinders
+    (void)tip;
+  }
+  // Center rosette
+  DrawCylinder(base, 0.10f * sc, 0.08f * sc, 0.18f * sc, 7, leafCol);
+}
+
+static void DrawDryTree(Vector3 base, float sc) {
+  Color bark  = {82, 62, 42, 255};
+  Color barkL = {100, 78, 52, 255};
+  float h = 2.4f * sc;
+  float r = 0.14f * sc;
+  // Main trunk (twisted: slight tilt in X)
+  DrawCylinder(base, r, r * 0.7f, h, 6, bark);
+  DrawCylinderWires(base, r, r * 0.7f, h, 6, barkL);
+  // 3 dead branches
+  float bh = base.y + h * 0.65f;
+  Vector3 b0s = {base.x, bh, base.z};
+  Vector3 b1s = {base.x, base.y + h * 0.80f, base.z};
+  Vector3 b2s = {base.x, base.y + h * 0.50f, base.z};
+  DrawCylinder(b0s, r * 0.55f, r * 0.25f, 0.70f * sc, 5, bark);
+  DrawCylinder(b1s, r * 0.45f, r * 0.20f, 0.55f * sc, 5, bark);
+  DrawCylinder(b2s, r * 0.40f, r * 0.18f, 0.45f * sc, 5, bark);
+  // Stubs
+  Vector3 top = {base.x, base.y + h, base.z};
+  DrawSphere(top, r * 0.6f, bark);
+}
+
+static void DrawNorthernObelisk() {
+  float oy = GetDuneHeight(OBELISK_X, OBELISK_Z);
+  Vector3 base = {OBELISK_X, oy, OBELISK_Z};
+  Color stone  = {142, 128, 105, 255};
+  Color glow   = {200, 170,  80, 255};
+  float pulse  = sinf(g_time * 1.8f) * 0.5f + 0.5f;
+  // Base plinth
+  DrawCube({base.x, oy + 0.15f, base.z}, 1.2f, 0.30f, 1.2f, stone);
+  // Shaft
+  DrawCube({base.x, oy + 1.10f, base.z}, 0.55f, 1.60f, 0.55f, stone);
+  DrawCubeWires({base.x, oy + 1.10f, base.z}, 0.55f, 1.60f, 0.55f,
+               {160, 148, 120, 180});
+  // Pyramid cap
+  DrawCylinder({base.x, oy + 1.90f, base.z}, 0.35f, 0.0f, 0.60f, 5, stone);
+  // Glow ring
+  float gr = 0.60f + pulse * 0.15f;
+  Color gc = {(unsigned char)(glow.r),
+              (unsigned char)(glow.g),
+              (unsigned char)(glow.b),
+              (unsigned char)(60 + (int)(pulse * 80))};
+  DrawCylinder({base.x, oy + 0.30f, base.z}, gr, gr, 0.04f, 16, gc);
+}
+
+static void DrawVegetationInstance(const VegetationInstance &vi) {
+  float vy = GetDuneHeight(vi.x, vi.z);
+  Vector3 base = {vi.x, vy, vi.z};
+  switch (vi.type) {
+    case VEG_SAGUARO:    DrawSaguaro(base, vi.scale);    break;
+    case VEG_PRICKLY_PEAR: DrawPricklyPear(base, vi.scale); break;
+    case VEG_AGAVE:      DrawAgave(base, vi.scale);      break;
+    case VEG_DRY_TREE:   DrawDryTree(base, vi.scale);    break;
+  }
 }
 
 // Draw tent shadow (large, soft PCF)
@@ -5910,10 +8316,84 @@ static constexpr float DUNE_FREQUENCY = 0.16f;
 
 static float GetDuneHeight(float x, float z) {
   float n = PerlinFBM(x * DUNE_FREQUENCY, z * DUNE_FREQUENCY, 5, 0.5f);
-  float h = n - 0.5f; // center around 0
+  float h = n - 0.5f;
   float s = powf(fabsf(h), 1.6f);
-  h = 0.7f * h + 0.3f * (h >= 0.0f ? s : -s); // smooth rolling peaks
-  return h * DUNE_MAX_HEIGHT;
+  h = 0.7f * h + 0.3f * (h >= 0.0f ? s : -s);
+  float base = h * DUNE_MAX_HEIGHT;
+
+  // ── Zahav: steep mountain (early-exit if > 26 units away) ────────────────
+  {
+    float dx = x - CITY_ZAHAV_X, dz = z - CITY_ZAHAV_Z;
+    float d2 = dx*dx + dz*dz;
+    if (d2 < 676.0f) { // 26*26
+      float mountain = expf(-d2 / (13.0f*13.0f)) * 13.0f;
+      float cone     = fmaxf(0.0f, 1.0f - sqrtf(d2) / 6.0f) * 5.0f;
+      base += mountain + cone;
+    }
+  }
+  // ── Ma'ayan: oasis depression (early-exit > 18 units) ────────────────────
+  {
+    float dx = x - CITY_MAAYAN_X, dz = z - CITY_MAAYAN_Z;
+    float d2 = dx*dx + dz*dz;
+    if (d2 < 324.0f) // 18*18
+      base -= expf(-d2 / (10.0f*10.0f)) * 1.8f;
+  }
+  // ── Avak: flat eroded plain (early-exit > 20 units) ──────────────────────
+  {
+    float dx = x - CITY_AVAK_X, dz = z - CITY_AVAK_Z;
+    float d2 = dx*dx + dz*dz;
+    if (d2 < 400.0f) { // 20*20
+      float flat = expf(-d2 / (13.0f*13.0f));
+      base *= (1.0f - flat * 0.85f);
+    }
+  }
+  // ── Gan: terraced hills (early-exit > 22 units) ───────────────────────────
+  {
+    float dx = x - CITY_GAN_X, dz = z - CITY_GAN_Z;
+    float d2 = dx*dx + dz*dz;
+    if (d2 < 484.0f) { // 22*22
+      float dist      = sqrtf(d2);
+      float influence = expf(-d2 / (14.0f*14.0f));
+      float tier      = fmaxf(0.0f, floorf((14.0f - dist) / 3.0f));
+      base += influence * tier * 0.5f;
+    }
+  }
+  // ── Sela: canyon trench (early-exit > 20 units) ───────────────────────────
+  {
+    float dx = x - CITY_SELA_X, dz = z - CITY_SELA_Z;
+    float d2 = dx*dx + dz*dz;
+    if (d2 < 400.0f) { // 20*20
+      float crossSect = expf(-(dz*dz) / (5.5f*5.5f))
+                      * expf(-(dx*dx) / (13.0f*13.0f));
+      base -= crossSect * 5.5f;
+    }
+  }
+
+  return base;
+}
+
+// Bilinear sample matching the terrain mesh's 0.5-unit vertex grid.
+// Prevents player from sinking into valleys where GetDuneHeight(exact pos)
+// dips below the mesh's linearly-interpolated surface.
+static float GetTerrainBilinear(float x, float z) {
+  const float step = 0.5f;
+  float kx = floorf((x + 0.5f) / step);
+  float kz = floorf((z + 0.5f) / step);
+  float x0 = kx * step - 0.5f, x1 = x0 + step;
+  float z0 = kz * step - 0.5f, z1 = z0 + step;
+  float fx = Clamp((x - x0) / step, 0.f, 1.f);
+  float fz = Clamp((z - z0) / step, 0.f, 1.f);
+  float h00 = GetDuneHeight(x0, z0), h10 = GetDuneHeight(x1, z0);
+  float h01 = GetDuneHeight(x0, z1), h11 = GetDuneHeight(x1, z1);
+  // Use the same diagonal split as GenerateTerrainMesh:
+  //   T1 (upper-left): (x0,z0),(x1,z0),(x0,z1)  — when fx+fz <= 1
+  //   T2 (lower-right): (x1,z0),(x1,z1),(x0,z1) — when fx+fz >  1
+  // Bilinear would underestimate the mesh surface when h00+h11 < h10+h01,
+  // causing the player to clip through the terrain.
+  if (fx + fz <= 1.0f)
+    return h00 * (1.f - fx - fz) + h10 * fx + h01 * fz;
+  else
+    return h10 * (1.f - fz) + h11 * (fx + fz - 1.f) + h01 * (1.f - fx);
 }
 
 // ── Generate terrain mesh (single mesh for entire MAP) ──────────────────────
@@ -5987,7 +8467,7 @@ static Texture2D GenerateSandGritTexture() {
 
 static void GenerateTerrainMesh() {
   // Subdivided grid: 2 triangles per tile, with heightmap displacement
-  int resX = MAP_W * 4, resZ = MAP_H * 4; // 4x subdivision for smoother dunes
+  int resX = MAP_W * 2, resZ = MAP_H * 2; // 2x subdivision (larger map — still smooth)
   int vertCount = (resX + 1) * (resZ + 1);
   int triCount = resX * resZ * 2;
 
@@ -6016,6 +8496,30 @@ static void GenerateTerrainMesh() {
         maxH = h;
     }
 
+  // Smooth vertex normals: central-difference gradient per grid vertex
+  std::vector<Vector3> smoothNormals((resX + 1) * (resZ + 1));
+  for (int zy = 0; zy <= resZ; zy++) {
+    for (int zx = 0; zx <= resX; zx++) {
+      float hL = heights[zy*(resX+1) + (zx > 0    ? zx-1 : zx)];
+      float hR = heights[zy*(resX+1) + (zx < resX ? zx+1 : zx)];
+      float hD = heights[(zy > 0    ? zy-1 : zy)*(resX+1) + zx];
+      float hU = heights[(zy < resZ ? zy+1 : zy)*(resX+1) + zx];
+      Vector3 dX = {stepX * 2.0f, hR - hL, 0.0f};
+      Vector3 dZ = {0.0f,         hU - hD, stepZ * 2.0f};
+      Vector3 sn = {dX.y*dZ.z - dX.z*dZ.y,
+                    dX.z*dZ.x - dX.x*dZ.z,
+                    dX.x*dZ.y - dX.y*dZ.x};
+      float snl = sqrtf(sn.x*sn.x + sn.y*sn.y + sn.z*sn.z);
+      if (snl > 0.001f) { sn.x /= snl; sn.y /= snl; sn.z /= snl; }
+      smoothNormals[zy*(resX+1)+zx] = sn;
+    }
+  }
+
+  // Helper: get precomputed smooth normal at grid vertex (gx, gz)
+  auto getSN = [&](int gx, int gz) -> Vector3 {
+    return smoothNormals[gz*(resX+1)+gx];
+  };
+
   int vi = 0;
   for (int zy = 0; zy < resZ; zy++)
     for (int zx = 0; zx < resX; zx++) {
@@ -6025,83 +8529,54 @@ static void GenerateTerrainMesh() {
       float h10 = heights[zy * (resX + 1) + zx + 1];
       float h01 = heights[(zy + 1) * (resX + 1) + zx];
       float h11 = heights[(zy + 1) * (resX + 1) + zx + 1];
-      // UV tiling (triplanar-like: 1 UV per world unit)
       float u0 = x0, u1 = x1, v0 = z0, v1 = z1;
 
-      // Triangle 1: (00, 10, 01)
-      Vector3 p0 = {x0, h00, z0}, p1 = {x1, h10, z0}, p2 = {x0, h01, z1};
-      Vector3 e1 = {p1.x - p0.x, p1.y - p0.y, p1.z - p0.z};
-      Vector3 e2 = {p2.x - p0.x, p2.y - p0.y, p2.z - p0.z};
-      Vector3 n1 = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z,
-                    e1.x * e2.y - e1.y * e2.x};
-      float nl = sqrtf(n1.x * n1.x + n1.y * n1.y + n1.z * n1.z);
-      if (nl > 0.001f) {
-        n1.x /= nl;
-        n1.y /= nl;
-        n1.z /= nl;
-      }
-
-      Vector3 pts1[3] = {p0, p1, p2};
+      // Triangle 1: vertices (zx,zy), (zx+1,zy), (zx,zy+1)
+      Vector3 pts1[3] = {{x0,h00,z0},{x1,h10,z0},{x0,h01,z1}};
+      Vector3 nrm1[3] = {getSN(zx,zy), getSN(zx+1,zy), getSN(zx,zy+1)};
       float uvs1[6] = {u0, v0, u1, v0, u0, v1};
       for (int k = 0; k < 3; k++) {
-        mesh.vertices[vi * 3] = pts1[k].x;
+        mesh.vertices[vi * 3]     = pts1[k].x;
         mesh.vertices[vi * 3 + 1] = pts1[k].y;
         mesh.vertices[vi * 3 + 2] = pts1[k].z;
-        mesh.normals[vi * 3] = n1.x;
-        mesh.normals[vi * 3 + 1] = n1.y;
-        mesh.normals[vi * 3 + 2] = n1.z;
-        mesh.texcoords[vi * 2] = uvs1[k * 2] * 0.25f;
+        mesh.normals[vi * 3]      = nrm1[k].x;
+        mesh.normals[vi * 3 + 1]  = nrm1[k].y;
+        mesh.normals[vi * 3 + 2]  = nrm1[k].z;
+        mesh.texcoords[vi * 2]     = uvs1[k * 2] * 0.25f;
         mesh.texcoords[vi * 2 + 1] = uvs1[k * 2 + 1] * 0.25f;
-        // Sun lighting baked into vertex color
-        float sunDot = Clamp(n1.x * (-SUN_DIR.x) + n1.y * (-SUN_DIR.y) +
-                                 n1.z * (-SUN_DIR.z),
-                             0, 1);
+        float sunDot = Clamp(nrm1[k].x * (-SUN_DIR.x) + nrm1[k].y * (-SUN_DIR.y) +
+                             nrm1[k].z * (-SUN_DIR.z), 0, 1);
         float light = 0.55f + 0.45f * sunDot;
-        // Ambient occlusion style valley darkening / crest brightening
         float yNorm = (pts1[k].y - minH) / (maxH - minH + 1e-5f);
-        float ao = 0.82f + (1.12f - 0.82f) * yNorm;
-        light *= ao;
-        mesh.colors[vi * 4 + 0] = (unsigned char)(210 * light);
-        mesh.colors[vi * 4 + 1] = (unsigned char)(185 * light);
-        mesh.colors[vi * 4 + 2] = (unsigned char)(140 * light);
+        light *= 0.82f + 0.30f * yNorm;
+        mesh.colors[vi * 4 + 0] = (unsigned char)Clamp(210 * light, 0, 255);
+        mesh.colors[vi * 4 + 1] = (unsigned char)Clamp(185 * light, 0, 255);
+        mesh.colors[vi * 4 + 2] = (unsigned char)Clamp(140 * light, 0, 255);
         mesh.colors[vi * 4 + 3] = 255;
         vi++;
       }
 
-      // Triangle 2: (10, 11, 01)
-      Vector3 p3 = {x1, h11, z1};
-      Vector3 e3 = {p3.x - p1.x, p3.y - p1.y, p3.z - p1.z};
-      Vector3 e4 = {p2.x - p1.x, p2.y - p1.y, p2.z - p1.z};
-      Vector3 n2 = {e3.y * e4.z - e3.z * e4.y, e3.z * e4.x - e3.x * e4.z,
-                    e3.x * e4.y - e3.y * e4.x};
-      nl = sqrtf(n2.x * n2.x + n2.y * n2.y + n2.z * n2.z);
-      if (nl > 0.001f) {
-        n2.x /= nl;
-        n2.y /= nl;
-        n2.z /= nl;
-      }
-
-      Vector3 pts2[3] = {p1, p3, p2};
+      // Triangle 2: vertices (zx+1,zy), (zx+1,zy+1), (zx,zy+1)
+      Vector3 pts2[3] = {{x1,h10,z0},{x1,h11,z1},{x0,h01,z1}};
+      Vector3 nrm2[3] = {getSN(zx+1,zy), getSN(zx+1,zy+1), getSN(zx,zy+1)};
       float uvs2[6] = {u1, v0, u1, v1, u0, v1};
       for (int k = 0; k < 3; k++) {
-        mesh.vertices[vi * 3] = pts2[k].x;
+        mesh.vertices[vi * 3]     = pts2[k].x;
         mesh.vertices[vi * 3 + 1] = pts2[k].y;
         mesh.vertices[vi * 3 + 2] = pts2[k].z;
-        mesh.normals[vi * 3] = n2.x;
-        mesh.normals[vi * 3 + 1] = n2.y;
-        mesh.normals[vi * 3 + 2] = n2.z;
-        mesh.texcoords[vi * 2] = uvs2[k * 2] * 0.25f;
+        mesh.normals[vi * 3]      = nrm2[k].x;
+        mesh.normals[vi * 3 + 1]  = nrm2[k].y;
+        mesh.normals[vi * 3 + 2]  = nrm2[k].z;
+        mesh.texcoords[vi * 2]     = uvs2[k * 2] * 0.25f;
         mesh.texcoords[vi * 2 + 1] = uvs2[k * 2 + 1] * 0.25f;
-        float sunDot = Clamp(n2.x * (-SUN_DIR.x) + n2.y * (-SUN_DIR.y) +
-                                 n2.z * (-SUN_DIR.z),
-                             0, 1);
+        float sunDot = Clamp(nrm2[k].x * (-SUN_DIR.x) + nrm2[k].y * (-SUN_DIR.y) +
+                             nrm2[k].z * (-SUN_DIR.z), 0, 1);
         float light = 0.55f + 0.45f * sunDot;
         float yNorm = (pts2[k].y - minH) / (maxH - minH + 1e-5f);
-        float ao = 0.82f + (1.12f - 0.82f) * yNorm;
-        light *= ao;
-        mesh.colors[vi * 4 + 0] = (unsigned char)(210 * light);
-        mesh.colors[vi * 4 + 1] = (unsigned char)(185 * light);
-        mesh.colors[vi * 4 + 2] = (unsigned char)(140 * light);
+        light *= 0.82f + 0.30f * yNorm;
+        mesh.colors[vi * 4 + 0] = (unsigned char)Clamp(210 * light, 0, 255);
+        mesh.colors[vi * 4 + 1] = (unsigned char)Clamp(185 * light, 0, 255);
+        mesh.colors[vi * 4 + 2] = (unsigned char)Clamp(140 * light, 0, 255);
         mesh.colors[vi * 4 + 3] = 255;
         vi++;
       }
@@ -6130,6 +8605,67 @@ static void GenerateTerrainMesh() {
 // §7  OVERWORLD — Init / Update / Draw
 // ═══════════════════════════════════════════════════════════════════════════════
 
+
+// ─── InitNorthernWastes — organic cactus/tree clusters in z < 14 ─────────────
+static void InitNorthernWastes() {
+  g_numVeg = 0;
+  // Cluster centres: (cx, cz, radius, count, preferred type)
+  struct Cluster { float cx, cz, rad; int count; VegType pref; };
+  static constexpr Cluster clusters[] = {
+    // ── Northern Wastes (z < 65) ────────────────────────────────────
+    { 50.0f, 12.5f, 14.0f, 7, VEG_SAGUARO},      // NW saguaro grove
+    {150.0f, 10.0f, 15.0f, 6, VEG_DRY_TREE},      // NE dead-tree cluster
+    {100.0f, 27.5f, 12.5f, 8, VEG_AGAVE},         // central agave field
+    { 30.0f, 45.0f, 11.0f, 6, VEG_PRICKLY_PEAR},  // western prickly pear
+    {170.0f, 47.5f, 11.0f, 6, VEG_PRICKLY_PEAR},  // eastern prickly pear
+    { 75.0f, 60.0f, 12.5f, 5, VEG_SAGUARO},       // approach sentinels L
+    {125.0f, 60.0f, 12.5f, 5, VEG_DRY_TREE},      // approach sentinels R
+    // ── Southern Desert (z > 95) — sandstorm-scoured ────────────────
+    {100.0f,105.0f, 14.0f, 7, VEG_DRY_TREE},      // south centre dead grove
+    { 45.0f,115.0f, 12.0f, 6, VEG_AGAVE},         // SW agave
+    {155.0f,115.0f, 12.0f, 6, VEG_PRICKLY_PEAR},  // SE prickly pear
+    { 75.0f,130.0f, 10.0f, 5, VEG_DRY_TREE},      // deep south trees L
+    {130.0f,130.0f, 10.0f, 5, VEG_DRY_TREE},      // deep south trees R
+  };
+  static constexpr int NUM_CLUSTERS =
+      (int)(sizeof(clusters) / sizeof(clusters[0]));
+  for (int ci = 0; ci < NUM_CLUSTERS && g_numVeg < MAX_VEGETATION; ci++) {
+    const Cluster &cl = clusters[ci];
+    for (int k = 0; k < cl.count && g_numVeg < MAX_VEGETATION; k++) {
+      float angle  = (float)GetRandomValue(0, 628) * 0.01f;
+      float dist   = (float)GetRandomValue(0, (int)(cl.rad * 100)) * 0.01f;
+      float px = cl.cx + cosf(angle) * dist;
+      float pz = cl.cz + sinf(angle) * dist;
+      // Clamp to map + clear of tents
+      px = Clamp(px, 1.5f, (float)(MAP_W - 2));
+      // Clamp to valid terrain + keep clusters in their respective zones
+      pz = Clamp(pz, 1.0f, (float)(MAP_H - 2));
+      // Skip if too close to a tent center
+      bool nearTent = false;
+      for (int ti = 0; ti < g_numTents; ti++) {
+        float dx = px - g_tentInstances[ti].worldX;
+        float dz = pz - g_tentInstances[ti].worldZ;
+        if (dx*dx + dz*dz < 9.0f) { nearTent = true; break; }
+      }
+      if (nearTent) continue;
+      VegetationInstance &vi = g_vegInstances[g_numVeg++];
+      vi.x = px;
+      vi.z = pz;
+      vi.rotY = (float)GetRandomValue(0, 360);
+      // Mix: 70% preferred type, 30% random
+      if (GetRandomValue(0, 9) < 7)
+        vi.type = cl.pref;
+      else
+        vi.type = (VegType)GetRandomValue(0, 3);
+      // Scale varies by type
+      float baseScale = (vi.type == VEG_SAGUARO || vi.type == VEG_DRY_TREE)
+                        ? 0.65f : 0.50f;
+      vi.scale = baseScale + (float)GetRandomValue(0, 30) * 0.01f;
+      vi.colliderRadius = vi.scale * 0.45f;
+    }
+  }
+}
+
 static void InitOverworld() {
   memset(g_collision, 0, sizeof(g_collision));
 
@@ -6149,67 +8685,328 @@ static void InitOverworld() {
   g_player.lastOverworldPos = {g_player.posX, 0.0f, g_player.posZ};
   g_player.interiorPos = {(float)(SCREEN_W / 2), (float)(SCREEN_H / 2)};
 
-  // Place tents (4×4 AABB cubes with 1×1 doors, colored trim)
-  PlaceTent(5, 3, {180, 140, 90, 255}, {160, 40, 40, 255}, "Fatima's Tent",
-            SCENE_TENT1); // Crimson roof
-  PlaceTent(28, 3, {160, 150, 120, 255}, {50, 80, 170, 255}, "Scholar's Study",
-            SCENE_TENT2); // Azure roof
-  PlaceTent(5, 20, {170, 120, 80, 255}, {190, 160, 40, 255}, "Yara's Bazaar",
-            SCENE_TENT3); // Gold roof
-  PlaceTent(28, 20, {150, 135, 100, 255}, {80, 140, 80, 255}, "Kai's Workshop",
-            SCENE_TENT4); // Forest roof
+  // ── Village cluster (5 tents) near player spawn at (100, 75) ────────────
+  PlaceTent(84,  54, {190, 170, 130, 255}, {160, 80, 40, 255},  "Elder's Tent",   SCENE_TENT1);
+  PlaceTent(94,  52, {175, 155, 110, 255}, {200, 160, 30, 255}, "Market Tent",    SCENE_TENT2);
+  PlaceTent(104, 54, {180, 160, 120, 255}, {80, 160, 100, 255}, "Healer's Tent",  SCENE_TENT3);
+  PlaceTent(84,  64, {165, 145, 105, 255}, {130, 80, 160, 255}, "Rest House",     SCENE_TENT4);
+  PlaceTent(104, 64, {175, 150, 100, 255}, {50, 100, 180, 255}, "Armory",         SCENE_TENT1);
 
-  // NPC placement (near their tents, facing south toward player approach)
-  g_npcs[0].gx = 8;  g_npcs[0].gy = 8;
-  g_npcs[0].worldX = 8.0f;  g_npcs[0].worldZ = 8.0f;
-  g_npcs[0].name = "Fatima";
-  g_npcs[0].shirtCol = {180, 140, 60, 255};
-  g_npcs[0].pantsCol = {90, 70, 50, 255};
-  g_npcs[0].hatCol = {180, 140, 60, 255};
-  g_npcs[0].dir = DIR_DOWN;
-  g_npcs[0].facingAngle = g_npcs[0].targetAngle = DirToAngle(DIR_DOWN);
-  g_npcs[0].colors = MakeChibiColors(
-      {180, 140, 100, 255}, {60, 40, 25, 255}, {180, 140, 60, 255},
-      {140, 100, 50, 255}, {90, 70, 50, 255}, {160, 120, 60, 255});
+  // ── Distant explorer tents at map corners ───────────────────────────────
+  PlaceTent(25,  15, {180, 140, 90, 255},  {160, 40,  40, 255}, "Fatima's Tent",   SCENE_TENT1);
+  PlaceTent(140, 15, {160, 150, 120, 255}, {50,  80, 170, 255}, "Scholar's Study", SCENE_TENT2);
+  PlaceTent(25, 100, {170, 120, 80, 255},  {190, 160, 40, 255}, "Yara's Bazaar",   SCENE_TENT3);
+  PlaceTent(140,100, {150, 135, 100, 255}, {80, 140,  80, 255}, "Kai's Workshop",  SCENE_TENT4);
 
-  g_npcs[1].gx = 31; g_npcs[1].gy = 8;
-  g_npcs[1].worldX = 31.0f; g_npcs[1].worldZ = 8.0f;
-  g_npcs[1].name = "Scholar";
-  g_npcs[1].shirtCol = {60, 160, 160, 255};
-  g_npcs[1].pantsCol = {180, 180, 170, 255};
-  g_npcs[1].hatCol = {60, 160, 160, 255};
-  g_npcs[1].dir = DIR_DOWN;
-  g_npcs[1].facingAngle = g_npcs[1].targetAngle = DirToAngle(DIR_DOWN);
-  g_npcs[1].colors = MakeChibiColors(
-      {140, 100, 70, 255}, {30, 25, 20, 255}, {60, 160, 160, 255},
-      {200, 220, 220, 255}, {180, 180, 170, 255}, {100, 80, 60, 255});
+  // ── Scattered tents (exploration) ───────────────────────────────────────
+  PlaceTent(48,  46, {160, 135, 95, 255},  {180, 60, 60, 255},  "Dune Shelter",  SCENE_TENT1);
+  PlaceTent(138, 48, {155, 140, 105, 255}, {60, 140, 60, 255},  "East Outpost",  SCENE_TENT2);
+  PlaceTent(76, 112, {165, 130, 85, 255},  {160, 120, 40, 255}, "South Camp",    SCENE_TENT3);
 
-  g_npcs[2].gx = 8;  g_npcs[2].gy = 25;
-  g_npcs[2].worldX = 8.0f;  g_npcs[2].worldZ = 25.0f;
-  g_npcs[2].name = "Yara";
-  g_npcs[2].shirtCol = {80, 30, 30, 255};
-  g_npcs[2].pantsCol = {50, 45, 40, 255};
-  g_npcs[2].hatCol = {100, 30, 30, 255};
-  g_npcs[2].dir = DIR_DOWN;
-  g_npcs[2].facingAngle = g_npcs[2].targetAngle = DirToAngle(DIR_DOWN);
-  g_npcs[2].colors = MakeChibiColors(
-      {160, 120, 80, 255}, {40, 30, 20, 255}, {100, 30, 30, 255},
-      {80, 30, 30, 255}, {50, 45, 40, 255}, {60, 50, 40, 255});
+  // ── NPC placement ────────────────────────────────────────────────────────
+  g_numNpcs = 0;
 
-  g_npcs[3].gx = 31; g_npcs[3].gy = 25;
-  g_npcs[3].worldX = 31.0f; g_npcs[3].worldZ = 25.0f;
-  g_npcs[3].name = "Kai";
-  g_npcs[3].shirtCol = {80, 140, 60, 255};
-  g_npcs[3].pantsCol = {120, 110, 80, 255};
-  g_npcs[3].hatCol = {80, 140, 60, 255};
-  g_npcs[3].dir = DIR_LEFT;
-  g_npcs[3].facingAngle = g_npcs[3].targetAngle = DirToAngle(DIR_LEFT);
-  g_npcs[3].colors = MakeChibiColors(
-      {200, 160, 120, 255}, {50, 35, 20, 255}, {80, 140, 60, 255},
-      {140, 160, 100, 255}, {120, 110, 80, 255}, {140, 100, 50, 255});
+  // --- Village NPCs ---
+  // Elder Aziz (outside Elder's Tent)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=88; n.gy=67; n.worldX=88.f; n.worldZ=67.f; n.name="Elder Aziz";
+    n.shirtCol={160,130,70,255}; n.pantsCol={80,70,50,255}; n.hatCol={160,130,70,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({190,155,110,255},{50,40,25,255},{160,130,70,255},
+                              {200,180,100,255},{80,70,50,255},{100,80,45,255}); }
 
-  for (int i = 0; i < 4; i++)
-    g_collision[g_npcs[i].gy][g_npcs[i].gx] = 1;
+  // Merchant (near Market Tent)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=99; n.gy=62; n.worldX=99.f; n.worldZ=62.f; n.name="Merchant";
+    n.shirtCol={200,80,40,255}; n.pantsCol={100,80,50,255}; n.hatCol={200,80,40,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({175,140,95,255},{35,28,18,255},{200,80,40,255},
+                              {240,180,50,255},{100,80,50,255},{80,60,35,255}); }
+
+  // Healer (near Healer's Tent)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=110; n.gy=65; n.worldX=110.f; n.worldZ=65.f; n.name="Healer";
+    n.shirtCol={60,160,120,255}; n.pantsCol={180,175,165,255}; n.hatCol={60,160,120,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({160,125,85,255},{40,30,20,255},{60,160,120,255},
+                              {200,230,210,255},{180,175,165,255},{90,70,50,255}); }
+
+  // Guard (village entrance)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=100; n.gy=73; n.worldX=100.f; n.worldZ=73.f; n.name="Guard";
+    n.shirtCol={60,70,140,255}; n.pantsCol={50,50,60,255}; n.hatCol={80,90,160,255};
+    n.dir=DIR_UP; n.facingAngle=n.targetAngle=DirToAngle(DIR_UP);
+    n.colors=MakeChibiColors({175,140,100,255},{30,25,18,255},{60,70,140,255},
+                              {200,200,220,255},{50,50,60,255},{60,55,45,255}); }
+
+  // Water Keeper (near well at 98,62)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=95; n.gy=64; n.worldX=95.f; n.worldZ=64.f; n.name="Water Keeper";
+    n.shirtCol={80,130,170,255}; n.pantsCol={110,100,80,255}; n.hatCol={70,110,150,255};
+    n.dir=DIR_RIGHT; n.facingAngle=n.targetAngle=DirToAngle(DIR_RIGHT);
+    n.colors=MakeChibiColors({170,135,95,255},{40,32,20,255},{80,130,170,255},
+                              {120,180,220,255},{110,100,80,255},{85,70,50,255}); }
+
+  // Wanderer (near Rest House)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=90; n.gy=71; n.worldX=90.f; n.worldZ=71.f; n.name="Wanderer";
+    n.shirtCol={140,100,60,255}; n.pantsCol={90,80,60,255}; n.hatCol={120,90,50,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({180,145,100,255},{55,42,28,255},{140,100,60,255},
+                              {180,150,90,255},{90,80,60,255},{100,80,50,255}); }
+
+  // --- Distant corner NPCs (original 4) ---
+  // Fatima (Crimson Tent area)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=30; n.gy=22; n.worldX=30.f; n.worldZ=22.f; n.name="Fatima";
+    n.shirtCol={180,140,60,255}; n.pantsCol={90,70,50,255}; n.hatCol={180,140,60,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({180,140,100,255},{60,40,25,255},{180,140,60,255},
+                              {140,100,50,255},{90,70,50,255},{160,120,60,255}); }
+
+  // Scholar
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=155; n.gy=22; n.worldX=155.f; n.worldZ=22.f; n.name="Scholar";
+    n.shirtCol={60,160,160,255}; n.pantsCol={180,180,170,255}; n.hatCol={60,160,160,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({140,100,70,255},{30,25,20,255},{60,160,160,255},
+                              {200,220,220,255},{180,180,170,255},{100,80,60,255}); }
+
+  // Yara
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=30; n.gy=107; n.worldX=30.f; n.worldZ=107.f; n.name="Yara";
+    n.shirtCol={80,30,30,255}; n.pantsCol={50,45,40,255}; n.hatCol={100,30,30,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({160,120,80,255},{40,30,20,255},{100,30,30,255},
+                              {80,30,30,255},{50,45,40,255},{60,50,40,255}); }
+
+  // Kai
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=155; n.gy=107; n.worldX=155.f; n.worldZ=107.f; n.name="Kai";
+    n.shirtCol={80,140,60,255}; n.pantsCol={120,110,80,255}; n.hatCol={80,140,60,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({200,160,120,255},{50,35,20,255},{80,140,60,255},
+                              {140,160,100,255},{120,110,80,255},{140,100,50,255}); }
+
+  // --- Scattered NPCs across the map ---
+  // Dune Walker (mid-west)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=55; n.gy=50; n.worldX=55.f; n.worldZ=50.f; n.name="Dune Walker";
+    n.shirtCol={150,120,70,255}; n.pantsCol={100,90,65,255}; n.hatCol={170,140,80,255};
+    n.dir=DIR_RIGHT; n.facingAngle=n.targetAngle=DirToAngle(DIR_RIGHT);
+    n.colors=MakeChibiColors({185,150,105,255},{45,35,22,255},{150,120,70,255},
+                              {200,170,90,255},{100,90,65,255},{110,85,55,255}); }
+
+  // Desert Sage (mid-east)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=145; n.gy=50; n.worldX=145.f; n.worldZ=50.f; n.name="Desert Sage";
+    n.shirtCol={120,80,160,255}; n.pantsCol={160,150,130,255}; n.hatCol={100,60,140,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({165,130,90,255},{35,28,18,255},{120,80,160,255},
+                              {210,190,240,255},{160,150,130,255},{90,75,55,255}); }
+
+  // Sand Poet (south-west)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=52; n.gy=112; n.worldX=52.f; n.worldZ=112.f; n.name="Sand Poet";
+    n.shirtCol={180,160,60,255}; n.pantsCol={80,75,55,255}; n.hatCol={160,140,45,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({170,135,95,255},{40,32,20,255},{180,160,60,255},
+                              {230,210,80,255},{80,75,55,255},{95,75,50,255}); }
+
+  // Horizon Scout (south-east)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=148; n.gy=90; n.worldX=148.f; n.worldZ=90.f; n.name="Horizon Scout";
+    n.shirtCol={40,120,80,255}; n.pantsCol={70,60,40,255}; n.hatCol={30,100,60,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({175,140,100,255},{35,28,18,255},{40,120,80,255},
+                              {80,200,130,255},{70,60,40,255},{80,65,45,255}); }
+
+  // ── City 1: Zahav — tents + NPCs ─────────────────────────────────────────
+  PlaceTent(94,  6, {210, 195, 158, 255}, {200, 162, 30,  255}, "Throne Gatehouse", SCENE_TENT1);
+  PlaceTent(106, 6, {200, 185, 148, 255}, {175, 140, 25,  255}, "Priestly Lodge",   SCENE_TENT2);
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=98;  n.gy=14; n.worldX=98.f;  n.worldZ=14.f;  n.name="Vizier Davan";
+    n.shirtCol={200,165,30,255}; n.pantsCol={80,65,40,255}; n.hatCol={180,148,25,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({180,145,100,255},{45,35,22,255},{200,165,30,255},
+                              {240,210,80,255},{80,65,40,255},{100,80,48,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=102; n.gy=18; n.worldX=102.f; n.worldZ=18.f;  n.name="Temple Priest";
+    n.shirtCol={240,235,210,255}; n.pantsCol={220,215,195,255}; n.hatCol={200,160,30,255};
+    n.dir=DIR_UP; n.facingAngle=n.targetAngle=DirToAngle(DIR_UP);
+    n.colors=MakeChibiColors({175,140,98,255},{40,30,20,255},{240,235,210,255},
+                              {255,240,200,255},{220,215,195,255},{95,75,50,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=95;  n.gy=18; n.worldX=95.f;  n.worldZ=18.f;  n.name="Crown Guard";
+    n.shirtCol={50,60,140,255}; n.pantsCol={40,48,110,255}; n.hatCol={180,150,28,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({170,135,96,255},{32,25,18,255},{50,60,140,255},
+                              {200,165,35,255},{40,48,110,255},{55,50,45,255}); }
+
+  // ── City 2: Ma'ayan — tents + NPCs ───────────────────────────────────────
+  PlaceTent(16, 69, {195, 188, 170, 255}, {60, 130, 180, 255}, "Spring Lodge",    SCENE_TENT3);
+  PlaceTent(28, 69, {188, 182, 162, 255}, {180, 155, 55, 255}, "Oasis Inn",       SCENE_TENT4);
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=22;  n.gy=72; n.worldX=22.f;  n.worldZ=72.f;  n.name="Spring Guardian";
+    n.shirtCol={60,160,185,255}; n.pantsCol={80,120,150,255}; n.hatCol={40,140,165,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({165,130,90,255},{38,28,18,255},{60,160,185,255},
+                              {140,210,230,255},{80,120,150,255},{85,68,48,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=18;  n.gy=78; n.worldX=18.f;  n.worldZ=78.f;  n.name="Oasis Trader";
+    n.shirtCol={220,140,40,255}; n.pantsCol={160,120,70,255}; n.hatCol={200,100,30,255};
+    n.dir=DIR_RIGHT; n.facingAngle=n.targetAngle=DirToAngle(DIR_RIGHT);
+    n.colors=MakeChibiColors({178,142,100,255},{42,32,20,255},{220,140,40,255},
+                              {240,190,90,255},{160,120,70,255},{95,72,48,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=26;  n.gy=78; n.worldX=26.f;  n.worldZ=78.f;  n.name="Well Keeper";
+    n.shirtCol={130,160,140,255}; n.pantsCol={100,130,110,255}; n.hatCol={90,120,100,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({172,136,95,255},{38,28,18,255},{130,160,140,255},
+                              {200,220,205,255},{100,130,110,255},{88,68,48,255}); }
+
+  // ── City 3: Avak — tents + NPCs ──────────────────────────────────────────
+  PlaceTent(94, 127, {185, 175, 150, 255}, {140, 90, 50, 255}, "Ruin Shelter",    SCENE_TENT1);
+  PlaceTent(106,127, {178, 168, 142, 255}, {110, 70, 40, 255}, "Drifter's Rest",  SCENE_TENT2);
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=100; n.gy=131; n.worldX=100.f; n.worldZ=131.f; n.name="Ruin Keeper";
+    n.shirtCol={160,155,138,255}; n.pantsCol={120,112,94,255}; n.hatCol={145,138,120,255};
+    n.dir=DIR_UP; n.facingAngle=n.targetAngle=DirToAngle(DIR_UP);
+    n.colors=MakeChibiColors({168,132,92,255},{35,27,18,255},{160,155,138,255},
+                              {200,195,178,255},{120,112,94,255},{88,68,46,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=96;  n.gy=135; n.worldX=96.f;  n.worldZ=135.f; n.name="Dust Drifter";
+    n.shirtCol={148,130,98,255};  n.pantsCol={110,96,72,255};  n.hatCol={168,148,110,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({175,140,98,255},{40,30,20,255},{148,130,98,255},
+                              {195,178,138,255},{110,96,72,255},{90,70,48,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=104; n.gy=135; n.worldX=104.f; n.worldZ=135.f; n.name="Ancient Scribe";
+    n.shirtCol={200,192,170,255}; n.pantsCol={175,168,148,255}; n.hatCol={160,152,132,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({168,132,90,255},{38,28,18,255},{200,192,170,255},
+                              {230,225,205,255},{175,168,148,255},{90,70,48,255}); }
+
+  // ── City 4: Gan — tents + NPCs ───────────────────────────────────────────
+  PlaceTent(171, 69, {175, 158, 118, 255}, {80, 155, 65, 255},  "Gardener's Rest", SCENE_TENT3);
+  PlaceTent(183, 69, {170, 152, 112, 255}, {100, 175, 80, 255}, "Harvest Inn",     SCENE_TENT4);
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=177; n.gy=72; n.worldX=177.f; n.worldZ=72.f; n.name="Master Gardener";
+    n.shirtCol={80,148,55,255}; n.pantsCol={100,130,60,255}; n.hatCol={60,125,40,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({172,138,96,255},{40,30,20,255},{80,148,55,255},
+                              {140,200,100,255},{100,130,60,255},{85,65,45,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=173; n.gy=78; n.worldX=173.f; n.worldZ=78.f; n.name="Irrigation Eng.";
+    n.shirtCol={120,140,160,255}; n.pantsCol={90,110,120,255}; n.hatCol={100,120,140,255};
+    n.dir=DIR_RIGHT; n.facingAngle=n.targetAngle=DirToAngle(DIR_RIGHT);
+    n.colors=MakeChibiColors({170,135,95,255},{38,28,18,255},{120,140,160,255},
+                              {180,195,210,255},{90,110,120,255},{85,65,45,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=181; n.gy=78; n.worldX=181.f; n.worldZ=78.f; n.name="Orchard Keeper";
+    n.shirtCol={190,130,55,255}; n.pantsCol={140,100,48,255}; n.hatCol={170,115,42,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({175,140,98,255},{42,32,20,255},{190,130,55,255},
+                              {230,180,90,255},{140,100,48,255},{88,68,48,255}); }
+
+  // ── City 5: Sela — tents + NPCs ──────────────────────────────────────────
+  PlaceTent(29, 24, {155, 138, 108, 255}, {165, 110, 35, 255}, "Miner's Lodge",   SCENE_TENT1);
+  PlaceTent(41, 24, {148, 132, 102, 255}, {140,  95, 28, 255}, "Chain House",     SCENE_TENT2);
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=35;  n.gy=28; n.worldX=35.f;  n.worldZ=28.f; n.name="Chief Miner";
+    n.shirtCol={80,68,52,255}; n.pantsCol={62,52,40,255}; n.hatCol={165,110,35,255};
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.colors=MakeChibiColors({165,130,88,255},{35,28,18,255},{80,68,52,255},
+                              {165,110,35,255},{62,52,40,255},{82,62,42,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=31;  n.gy=32; n.worldX=31.f;  n.worldZ=32.f; n.name="Chain Keeper";
+    n.shirtCol={100,80,55,255}; n.pantsCol={75,60,42,255}; n.hatCol={155,102,30,255};
+    n.dir=DIR_RIGHT; n.facingAngle=n.targetAngle=DirToAngle(DIR_RIGHT);
+    n.colors=MakeChibiColors({168,132,92,255},{38,28,18,255},{100,80,55,255},
+                              {175,118,38,255},{75,60,42,255},{85,65,45,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=39;  n.gy=32; n.worldX=39.f;  n.worldZ=32.f; n.name="Brass Smith";
+    n.shirtCol={60,52,42,255}; n.pantsCol={50,42,32,255}; n.hatCol={175,112,38,255};
+    n.dir=DIR_LEFT; n.facingAngle=n.targetAngle=DirToAngle(DIR_LEFT);
+    n.colors=MakeChibiColors({170,135,94,255},{36,28,18,255},{60,52,42,255},
+                              {175,112,38,255},{50,42,32,255},{80,60,40,255}); }
+
+  // ── City NPCs: Bazaar Merchant + Tournament Master per city ─────────────────
+  // City 0: Zahav (100, 12)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=106; n.gy=15; n.worldX=106.f; n.worldZ=15.f; n.name="Zahav Merchant";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_SHOP; n.cityIndex=0;
+    n.shirtCol={200,160,40,255}; n.pantsCol={100,80,50,255}; n.hatCol={200,160,40,255};
+    n.colors=MakeChibiColors({185,150,105,255},{40,30,18,255},{200,160,40,255},
+                              {240,200,60,255},{100,80,50,255},{80,65,40,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=94; n.gy=15; n.worldX=94.f; n.worldZ=15.f; n.name="Zahav Tournament Master";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_TOURNAMENT; n.cityIndex=0;
+    n.shirtCol={60,80,160,255}; n.pantsCol={50,50,70,255}; n.hatCol={80,100,200,255};
+    n.colors=MakeChibiColors({175,140,100,255},{30,25,18,255},{60,80,160,255},
+                              {200,210,240,255},{50,50,70,255},{70,60,45,255}); }
+  // City 1: Ma'ayan (22, 75)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=28; n.gy=79; n.worldX=28.f; n.worldZ=79.f; n.name="Ma'ayan Merchant";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_SHOP; n.cityIndex=1;
+    n.shirtCol={40,150,120,255}; n.pantsCol={80,100,80,255}; n.hatCol={40,150,120,255};
+    n.colors=MakeChibiColors({170,135,95,255},{35,28,18,255},{40,150,120,255},
+                              {80,210,180,255},{80,100,80,255},{75,60,45,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=16; n.gy=79; n.worldX=16.f; n.worldZ=79.f; n.name="Ma'ayan Tournament Master";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_TOURNAMENT; n.cityIndex=1;
+    n.shirtCol={160,60,160,255}; n.pantsCol={60,40,60,255}; n.hatCol={200,80,200,255};
+    n.colors=MakeChibiColors({160,125,85,255},{30,25,18,255},{160,60,160,255},
+                              {220,160,220,255},{60,40,60,255},{70,55,40,255}); }
+  // City 2: Avak (100, 133)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=106; n.gy=137; n.worldX=106.f; n.worldZ=137.f; n.name="Avak Merchant";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_SHOP; n.cityIndex=2;
+    n.shirtCol={180,80,40,255}; n.pantsCol={90,70,50,255}; n.hatCol={200,100,50,255};
+    n.colors=MakeChibiColors({180,145,100,255},{40,32,20,255},{180,80,40,255},
+                              {230,130,70,255},{90,70,50,255},{95,75,50,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=94; n.gy=137; n.worldX=94.f; n.worldZ=137.f; n.name="Avak Tournament Master";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_TOURNAMENT; n.cityIndex=2;
+    n.shirtCol={120,120,40,255}; n.pantsCol={80,80,50,255}; n.hatCol={160,160,50,255};
+    n.colors=MakeChibiColors({175,140,100,255},{35,28,18,255},{120,120,40,255},
+                              {210,210,80,255},{80,80,50,255},{80,65,45,255}); }
+  // City 3: Gan (177, 75)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=183; n.gy=79; n.worldX=183.f; n.worldZ=79.f; n.name="Gan Merchant";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_SHOP; n.cityIndex=3;
+    n.shirtCol={60,160,60,255}; n.pantsCol={80,110,80,255}; n.hatCol={60,180,60,255};
+    n.colors=MakeChibiColors({165,130,90,255},{35,28,18,255},{60,160,60,255},
+                              {100,220,100,255},{80,110,80,255},{70,55,40,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=171; n.gy=79; n.worldX=171.f; n.worldZ=79.f; n.name="Gan Tournament Master";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_TOURNAMENT; n.cityIndex=3;
+    n.shirtCol={40,100,160,255}; n.pantsCol={40,60,80,255}; n.hatCol={50,130,200,255};
+    n.colors=MakeChibiColors({170,135,95,255},{35,28,18,255},{40,100,160,255},
+                              {80,180,240,255},{40,60,80,255},{70,55,40,255}); }
+  // City 4: Sela (35, 30)
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=41; n.gy=33; n.worldX=41.f; n.worldZ=33.f; n.name="Sela Merchant";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_SHOP; n.cityIndex=4;
+    n.shirtCol={160,100,60,255}; n.pantsCol={100,80,60,255}; n.hatCol={200,130,70,255};
+    n.colors=MakeChibiColors({180,145,100,255},{40,32,20,255},{160,100,60,255},
+                              {220,160,90,255},{100,80,60,255},{90,70,50,255}); }
+  { NPC &n = g_npcs[g_numNpcs++];
+    n.gx=29; n.gy=33; n.worldX=29.f; n.worldZ=33.f; n.name="Sela Tournament Master";
+    n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
+    n.role=NPC_ROLE_TOURNAMENT; n.cityIndex=4;
+    n.shirtCol={160,40,40,255}; n.pantsCol={80,30,30,255}; n.hatCol={200,60,60,255};
+    n.colors=MakeChibiColors({175,140,100,255},{35,28,18,255},{160,40,40,255},
+                              {240,100,100,255},{80,30,30,255},{75,60,45,255}); }
 
   // Procedural rocks
   InitProceduralRocks();
@@ -6217,9 +9014,13 @@ static void InitOverworld() {
   // Generate dune terrain mesh
   GenerateTerrainMesh();
 
+  // Northern Wastes vegetation clusters
+  InitNorthernWastes();
+
   // Camera (2.5D isometric-ish angle)
-  g_cam.position = {g_player.posX, 14.0f, g_player.posZ + 10.0f};
-  g_cam.target = {g_player.posX, GetDuneHeight(g_player.posX, g_player.posZ), g_player.posZ};
+  float initGroundY = GetDuneHeight(g_player.posX, g_player.posZ);
+  g_cam.position = {g_player.posX, initGroundY + 14.0f, g_player.posZ + 10.0f};
+  g_cam.target = {g_player.posX, initGroundY, g_player.posZ};
   g_cam.up = {0, 1, 0};
   g_cam.fovy = 40.0f;
   g_cam.projection = CAMERA_PERSPECTIVE;
@@ -6282,11 +9083,33 @@ static bool CircleCollidesWorld(float cx, float cz, float r) {
     }
   }
   // NPC sphere collision (each NPC is a cylinder of radius 0.4)
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < g_numNpcs; i++) {
     float dx = cx - g_npcs[i].worldX;
     float dz = cz - g_npcs[i].worldZ;
     float minDist = r + 0.4f;
     if (dx * dx + dz * dz < minDist * minDist) return true;
+  }
+  // Tent AABB collision (mesh-based, no tile marks required)
+  for (int i = 0; i < g_numTents; i++) {
+    const BoundingBox &bb = g_tentInstances[i].wallAABB;
+    float nearX = Clamp(cx, bb.min.x, bb.max.x);
+    float nearZ = Clamp(cz, bb.min.z, bb.max.z);
+    float dx = cx - nearX, dz = cz - nearZ;
+    if (dx * dx + dz * dz < r * r) return true;
+  }
+  // Rock sphere collision
+  for (int i = 0; i < g_numRocks; i++) {
+    float dx = cx - g_rockInstances[i].x;
+    float dz = cz - g_rockInstances[i].z;
+    float minD = r + g_rockInstances[i].scale * 0.9f;
+    if (dx * dx + dz * dz < minD * minD) return true;
+  }
+  // Vegetation sphere collision
+  for (int i = 0; i < g_numVeg; i++) {
+    float dx = cx - g_vegInstances[i].x;
+    float dz = cz - g_vegInstances[i].z;
+    float minD = r + g_vegInstances[i].colliderRadius;
+    if (dx * dx + dz * dz < minD * minD) return true;
   }
   return false;
 }
@@ -6325,7 +9148,7 @@ static void ResolveCircleCollision(float &cx, float &cz, float r) {
       }
     }
     // NPC push-out
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < g_numNpcs; i++) {
       float dx = cx - g_npcs[i].worldX;
       float dz = cz - g_npcs[i].worldZ;
       float minDist = r + 0.4f;
@@ -6333,6 +9156,66 @@ static void ResolveCircleCollision(float &cx, float &cz, float r) {
       if (dist2 < minDist * minDist && dist2 > 0.0001f) {
         float dist = sqrtf(dist2);
         float push = minDist - dist + 0.001f;
+        cx += (dx / dist) * push;
+        cz += (dz / dist) * push;
+        resolved = false;
+      }
+    }
+    // Tent AABB push-out — door corridor exempt so player can walk through
+    for (int i = 0; i < g_numTents; i++) {
+      const TentInstance &ti = g_tentInstances[i];
+      const BoundingBox &bb = ti.wallAABB;
+      float nearX = Clamp(cx, bb.min.x, bb.max.x);
+      float nearZ = Clamp(cz, bb.min.z, bb.max.z);
+      float dx = cx - nearX, dz = cz - nearZ;
+      float dist2 = dx * dx + dz * dz;
+      if (dist2 < r * r && dist2 > 0.0001f) {
+        // Check if player is in the door corridor — skip push-out if so
+        // Door spans columns doorGX-1 and doorGX (i.e. X from doorGX-1 to doorGX+1),
+        // so center = doorGX with ±1.1 tolerance
+        float doorCX = (float)ti.doorGX; // actual center of 2-tile-wide door
+        bool inDoor = (cx >= doorCX - 1.1f && cx <= doorCX + 1.1f &&
+                       cz >= bb.max.z - 1.0f); // south wall approach only
+        if (!inDoor) {
+          float dist = sqrtf(dist2);
+          float push = r - dist + 0.001f;
+          cx += (dx / dist) * push;
+          cz += (dz / dist) * push;
+          resolved = false;
+        }
+      } else if (dist2 < 0.0001f) {
+        // Exactly inside: push south out the door
+        float doorCX = (float)ti.doorGX;
+        bool inDoor = (cx >= doorCX - 1.1f && cx <= doorCX + 1.1f);
+        if (!inDoor) {
+          cz += r + 0.05f;
+          resolved = false;
+        }
+      }
+    }
+    // Rock sphere push-out
+    for (int i = 0; i < g_numRocks; i++) {
+      float dx = cx - g_rockInstances[i].x;
+      float dz = cz - g_rockInstances[i].z;
+      float minD = r + g_rockInstances[i].scale * 0.9f;
+      float dist2 = dx * dx + dz * dz;
+      if (dist2 < minD * minD && dist2 > 0.0001f) {
+        float dist = sqrtf(dist2);
+        float push = minD - dist + 0.001f;
+        cx += (dx / dist) * push;
+        cz += (dz / dist) * push;
+        resolved = false;
+      }
+    }
+    // Vegetation sphere push-out
+    for (int i = 0; i < g_numVeg; i++) {
+      float dx = cx - g_vegInstances[i].x;
+      float dz = cz - g_vegInstances[i].z;
+      float minD = r + g_vegInstances[i].colliderRadius;
+      float dist2 = dx * dx + dz * dz;
+      if (dist2 < minD * minD && dist2 > 0.0001f) {
+        float dist = sqrtf(dist2);
+        float push = minD - dist + 0.001f;
         cx += (dx / dist) * push;
         cz += (dz / dist) * push;
         resolved = false;
@@ -6388,7 +9271,7 @@ static bool CheckOverworldTileOccupancy(int gx, int gy) {
     return true;
   if (g_collision[gy][gx] != 0)
     return true;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < g_numNpcs; i++) {
     int nx = (int)roundf(g_npcs[i].worldX);
     int ny = (int)roundf(g_npcs[i].worldZ);
     if (nx == gx && ny == gy)
@@ -6437,7 +9320,8 @@ static void UpdateOverworld(float dt) {
     // During onboarding, skip normal movement but still update visuals
     UpdateVFX(dt);
     // Camera follow
-    g_cam.position = {g_player.posX, 14.0f, g_player.posZ + 10.0f};
+    float gY0 = GetDuneHeight(g_player.posX, g_player.posZ);
+    g_cam.position = {g_player.posX, gY0 + 14.0f, g_player.posZ + 10.0f};
     g_cam.target = {g_player.posX, GetDuneHeight(g_player.posX, g_player.posZ), g_player.posZ};
     return;
   }
@@ -6487,7 +9371,7 @@ static void UpdateOverworld(float dt) {
   UpdateFacingAngle(g_player.facingAngle, g_player.targetAngle, dt);
 
   // NPC rotation: smoothly turn toward player when close
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < g_numNpcs; i++) {
     Dir npcFaceDir = GetNPCPlayerDir({g_npcs[i].worldX, 0, g_npcs[i].worldZ});
     g_npcs[i].targetAngle = DirToAngle(npcFaceDir);
     UpdateFacingAngle(g_npcs[i].facingAngle, g_npcs[i].targetAngle, dt);
@@ -6501,7 +9385,7 @@ static void UpdateOverworld(float dt) {
     // Find nearest NPC within interaction radius
     float bestDist = 1.5f;
     int bestNPC = -1;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < g_numNpcs; i++) {
       float ddx = g_npcs[i].worldX - g_player.posX;
       float ddz = g_npcs[i].worldZ - g_player.posZ;
       float dist = sqrtf(ddx * ddx + ddz * ddz);
@@ -6529,12 +9413,12 @@ static void UpdateOverworld(float dt) {
 
   // Smooth camera follow
   float camLerp = Clamp(dt * 5.0f, 0, 1);
+  float groundY = GetDuneHeight(g_player.posX, g_player.posZ);
   g_cam.position.x = Lerp(g_cam.position.x, g_player.posX, camLerp);
   g_cam.position.z = Lerp(g_cam.position.z, g_player.posZ + 10.0f, camLerp);
-  g_cam.position.y = 14.0f;
+  g_cam.position.y = Lerp(g_cam.position.y, groundY + 14.0f, camLerp);
   g_cam.target.x = Lerp(g_cam.target.x, g_player.posX, camLerp);
   g_cam.target.z = Lerp(g_cam.target.z, g_player.posZ, camLerp);
-  float groundY = GetDuneHeight(g_player.posX, g_player.posZ);
   g_cam.target.y = Lerp(g_cam.target.y, groundY, camLerp);
 }
 
@@ -6557,10 +9441,379 @@ static Dir GetNPCPlayerDir(Vector3 npcPos) {
 
 static void DrawSpriteBlobShadow(Vector3 basePos, float radius) {
   float gy = GetDuneHeight(basePos.x, basePos.z) + 0.012f;
+  // Warm brownish-amber shadow — blends naturally with desert sand
   DrawCylinder({basePos.x, gy, basePos.z}, radius * 1.05f, radius * 1.05f, 0.008f,
-               14, {0, 0, 0, 102});
+               14, {45, 28, 8, 78});
   DrawCylinder({basePos.x, gy + 0.001f, basePos.z}, radius * 0.72f, radius * 0.72f,
-               0.008f, 14, {0, 0, 0, 58});
+               0.008f, 14, {35, 20, 5, 48});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §8  FIVE CITIES OF ERETZ
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helpers shared across city draw functions
+static void DrawGoldBuilding(Vector3 center, float sx, float sy, float sz) {
+  if (!g_cityModelsReady) return;
+  SetShaderValue(g_shGold, g_locGoldTime,   &g_time,          SHADER_UNIFORM_FLOAT);
+  Vector3 cp = g_cam.position;
+  SetShaderValue(g_shGold, g_locGoldCamPos, &cp,              SHADER_UNIFORM_VEC3);
+  Vector3 sd = SUN_DIR;
+  SetShaderValue(g_shGold, g_locGoldSunDir, &sd,              SHADER_UNIFORM_VEC3);
+  DrawModelEx(g_goldModel, center, {0,1,0}, 0.0f, {sx, sy, sz}, WHITE);
+}
+
+static void DrawWaterPlane(Vector3 center, float w, float d) {
+  if (!g_cityModelsReady) return;
+  SetShaderValue(g_shWater, g_locWaterTime, &g_time, SHADER_UNIFORM_FLOAT);
+  DrawModelEx(g_waterModel, center, {0,1,0}, 0.0f, {w, 1.0f, d}, WHITE);
+}
+
+// ─── 1. Zahav — The Golden Citadel (N, ~100,12) ──────────────────────────────
+static void DrawCityZahav() {
+  const float cx = CITY_ZAHAV_X, cz = CITY_ZAHAV_Z;
+  const float peakY = GetDuneHeight(cx, cz);
+  const Color limestone  = {220, 205, 170, 255};
+  const Color limeShadow = {175, 160, 130, 255};
+  const Color goldTrim   = {210, 168, 45,  255};
+  const Color brassRing  = {175, 130, 40,  255};
+
+  // Perimeter wall (12-sided polygon of blocks)
+  for (int i = 0; i < 12; i++) {
+    float a  = i * (2.0f * PI / 12.0f);
+    float wx = cx + cosf(a) * 11.5f;
+    float wz = cz + sinf(a) * 11.5f;
+    float wy = GetDuneHeight(wx, wz);
+    DrawCube({wx, wy + 1.2f, wz}, 2.2f, 2.4f, 2.2f, limestone);
+    DrawCubeWires({wx, wy + 1.2f, wz}, 2.2f, 2.4f, 2.2f, limeShadow);
+  }
+  // Outer ring: 8 pillar towers
+  for (int i = 0; i < 8; i++) {
+    float a  = i * (2.0f * PI / 8.0f);
+    float rx = cx + cosf(a) * 8.5f;
+    float rz = cz + sinf(a) * 8.5f;
+    float ry = GetDuneHeight(rx, rz);
+    DrawCube({rx, ry + 2.0f, rz}, 2.6f, 4.0f, 2.6f, limestone);
+    DrawCube({rx, ry + 4.2f, rz}, 2.8f, 0.4f, 2.8f, goldTrim);  // gold cornice
+  }
+  // Cedar colonnade pillars (4 cardinal)
+  for (int i = 0; i < 4; i++) {
+    float a  = i * (PI / 2.0f);
+    float px = cx + cosf(a) * 4.5f;
+    float pz = cz + sinf(a) * 4.5f;
+    float py = GetDuneHeight(px, pz);
+    DrawCylinder({px, py, pz}, 0.22f, 0.18f, 4.0f, 8, {190, 135, 60, 255});
+    DrawCube({px, py + 4.1f, pz}, 0.65f, 0.45f, 0.65f, limestone); // capital
+  }
+  // Inner fortress core (limestone cube + gold cladding)
+  DrawCube({cx, peakY + 4.0f, cz}, 5.2f, 8.0f, 5.2f, limestone);
+  DrawCube({cx, peakY + 4.0f, cz}, 5.4f, 0.5f, 5.4f, goldTrim);   // base skirt
+  DrawCube({cx, peakY + 8.2f, cz}, 5.4f, 0.5f, 5.4f, goldTrim);   // top cornice
+  // Three brass accent rings climbing the tower
+  for (int i = 0; i < 3; i++) {
+    float ry = peakY + 2.5f + i * 2.4f;
+    DrawCylinder({cx, ry, cz}, 3.2f - i * 0.2f, 3.2f - i * 0.2f,
+                 0.18f, 14, brassRing);
+  }
+  // Gold dome (the landmark)
+  DrawGoldBuilding({cx, peakY + 10.5f, cz}, 3.8f, 3.8f, 3.8f);
+  // Eternal Flame spire above dome
+  DrawCylinder({cx, peakY + 12.4f, cz}, 0.28f, 0.09f, 5.5f, 6, goldTrim);
+  // Animated beacon orb
+  float pulse = 0.32f + 0.08f * sinf(g_time * 2.2f);
+  Color flameCol = {255, (unsigned char)(160 + 50*sinf(g_time*3.0f)), 20, 255};
+  DrawSphere({cx, peakY + 18.2f, cz}, pulse, flameCol);
+  DrawSphere({cx, peakY + 18.2f, cz}, pulse * 1.7f,
+             {255, 200, 60, (unsigned char)(40 + 20*sinf(g_time*2.8f))});
+}
+
+// ─── 2. Ma'ayan — The Oasis (W, ~22,75) ──────────────────────────────────────
+static void DrawCityMaayan() {
+  const float cx = CITY_MAAYAN_X, cz = CITY_MAAYAN_Z;
+  const float poolY = GetDuneHeight(cx, cz);
+  const Color limestone = {215, 208, 188, 255};
+  const Color cedar     = {165, 108, 48,  255};
+  const Color waterRim  = {200, 192, 172, 255};
+
+  // Pool rim (4 stone slabs)
+  DrawCube({cx,        poolY + 0.2f, cz - 3.3f}, 7.0f, 0.4f, 0.6f, waterRim);
+  DrawCube({cx,        poolY + 0.2f, cz + 3.3f}, 7.0f, 0.4f, 0.6f, waterRim);
+  DrawCube({cx - 3.3f, poolY + 0.2f, cz},        0.6f, 0.4f, 7.0f, waterRim);
+  DrawCube({cx + 3.3f, poolY + 0.2f, cz},        0.6f, 0.4f, 7.0f, waterRim);
+  // Water surface (shader-driven)
+  DrawWaterPlane({cx, poolY + 0.1f, cz}, 6.0f, 6.0f);
+  // Fallback solid pool for when shader is loading
+  DrawCylinder({cx, poolY + 0.08f, cz}, 2.9f, 2.9f, 0.04f, 16,
+               {60, 140, 200, 180});
+  // 8-pillar colonnade ring
+  for (int i = 0; i < 8; i++) {
+    float a  = i * (2.0f * PI / 8.0f);
+    float px = cx + cosf(a) * 6.8f;
+    float pz = cz + sinf(a) * 6.8f;
+    float py = GetDuneHeight(px, pz);
+    DrawCylinder({px, py, pz}, 0.26f, 0.22f, 4.2f, 10, limestone);
+    DrawCube({px, py + 4.3f, pz}, 0.65f, 0.48f, 0.65f, limestone); // capital
+  }
+  // Aqueduct arches: N-S span
+  {
+    float aqY = GetDuneHeight(cx, cz) + 5.5f;
+    DrawCube({cx, aqY, cz},        0.45f, 0.45f, 18.0f, {185, 172, 145, 255});
+    DrawCylinder({cx, GetDuneHeight(cx, cz - 9.0f), cz - 9.0f},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz - 9.0f),
+                 6, {180, 168, 140, 255});
+    DrawCylinder({cx, GetDuneHeight(cx, cz + 9.0f), cz + 9.0f},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz + 9.0f),
+                 6, {180, 168, 140, 255});
+  }
+  // Aqueduct arches: E-W span
+  {
+    float aqY = GetDuneHeight(cx, cz) + 5.5f;
+    DrawCube({cx, aqY, cz},        18.0f, 0.45f, 0.45f, {185, 172, 145, 255});
+    DrawCylinder({cx - 9.0f, GetDuneHeight(cx - 9.0f, cz), cz},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx - 9.0f, cz),
+                 6, {180, 168, 140, 255});
+    DrawCylinder({cx + 9.0f, GetDuneHeight(cx + 9.0f, cz), cz},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx + 9.0f, cz),
+                 6, {180, 168, 140, 255});
+  }
+  // 4 courtyard houses with cedar pergola
+  static const float hdx[] = {-5.5f,  5.5f, 0.0f,  0.0f};
+  static const float hdz[] = {  0.0f,  0.0f,-5.5f,  5.5f};
+  for (int i = 0; i < 4; i++) {
+    float hx = cx + hdx[i], hz = cz + hdz[i];
+    float hy = GetDuneHeight(hx, hz);
+    DrawCube({hx, hy + 1.5f, hz}, 2.8f, 3.0f, 2.8f, {222, 216, 196, 255});
+    DrawCube({hx, hy + 3.2f, hz}, 3.1f, 0.32f, 3.1f, cedar); // cedar roof
+  }
+}
+
+// ─── 3. Avak — The Dust Town (S, ~100,133) ───────────────────────────────────
+static void DrawCityAvak() {
+  const float cx = CITY_AVAK_X, cz = CITY_AVAK_Z;
+  const Color eroded  = {192, 182, 155, 255};
+  const Color bleach  = {205, 197, 172, 255};
+  const Color rubbleC = {172, 162, 136, 255};
+
+  // Crumbling wall segments (partial, jagged heights)
+  struct WallSeg { float dx, dz, w, h, d; };
+  static const WallSeg walls[] = {
+    {-6.0f, -5.5f,  8.5f, 2.6f, 0.75f},
+    { 5.5f, -2.5f,  0.7f, 3.0f, 5.5f },
+    {-5.5f,  4.5f,  5.0f, 1.8f, 0.7f },
+    { 1.0f,  5.8f,  4.5f, 2.2f, 0.65f},
+    {-1.5f, -7.0f,  3.5f, 1.4f, 0.6f },
+  };
+  for (auto &w : walls) {
+    float wx = cx + w.dx, wz = cz + w.dz;
+    float wy = GetDuneHeight(wx, wz);
+    DrawCube({wx, wy + w.h*0.5f, wz}, w.w, w.h, w.d, eroded);
+    DrawCubeWires({wx, wy + w.h*0.5f, wz}, w.w, w.h, w.d, {140, 130, 108, 200});
+  }
+  // Rubble piles
+  struct Rubble { float dx, dz, sc; };
+  static const Rubble rubble[] = {
+    {-4.0f, -7.0f, 1.3f}, { 3.8f, -6.2f, 0.9f},
+    {-7.0f,  2.5f, 1.1f}, { 4.5f,  4.0f, 1.4f},
+    { 1.5f,  5.5f, 0.9f}, {-2.0f,  1.5f, 0.7f},
+  };
+  for (auto &r : rubble) {
+    float rx = cx + r.dx, rz = cz + r.dz;
+    float ry = GetDuneHeight(rx, rz);
+    DrawSphere({rx,            ry + r.sc*0.30f, rz},            r.sc*0.55f, rubbleC);
+    DrawSphere({rx + r.sc*0.3f, ry + r.sc*0.15f, rz + r.sc*0.2f}, r.sc*0.42f, bleach);
+  }
+  // ── Broken Clock Tower (navigation landmark) ──────────────────────────────
+  float ty = GetDuneHeight(cx + 1.5f, cz - 2.5f);
+  // Main shaft
+  DrawCylinder({cx+1.5f, ty, cz-2.5f}, 1.25f, 1.25f, 5.8f, 10, eroded);
+  // Sheared top (diagonal suggestion: taper to one side)
+  DrawCylinder({cx+1.5f, ty+5.8f, cz-2.5f}, 1.25f, 0.45f, 1.4f, 8, bleach);
+  // Clock face inlay
+  DrawCylinder({cx+2.75f, ty+4.2f, cz-2.5f}, 0.7f, 0.7f, 0.08f, 14,
+               {148, 138, 115, 255});
+  // Crack line (thin dark cube along tower face)
+  DrawCube({cx+2.6f, ty+3.5f, cz-2.5f}, 0.07f, 4.5f, 0.07f, {85, 75, 60, 255});
+  // Narrow alley walls
+  DrawCube({cx-2.0f, GetDuneHeight(cx-2.0f,cz+1.5f)+1.3f, cz+1.5f},
+           0.6f, 2.6f, 5.5f, {186, 176, 150, 255});
+  DrawCube({cx+3.0f, GetDuneHeight(cx+3.0f,cz+1.5f)+1.1f, cz+1.5f},
+           0.6f, 2.2f, 5.5f, {180, 170, 144, 255});
+}
+
+// ─── 4. Gan — The Blooming Town (E, ~177,75) ─────────────────────────────────
+static void DrawCityGan() {
+  const float cx = CITY_GAN_X, cz = CITY_GAN_Z;
+  const Color fittedStone = {180, 162, 122, 255};
+  const Color cedar       = {162, 108, 46,  255};
+  const Color channel     = {80,  130, 175, 180};
+
+  // 5 terrace retaining walls (concentric)
+  for (int tier = 0; tier < 5; tier++) {
+    float radius  = (float)(tier + 1) * 3.2f;
+    float wallH   = 0.9f + tier * 0.1f;
+    int   sides   = 8 + tier * 2;
+    float segLen  = 2.0f * PI * radius / sides;
+    for (int i = 0; i < sides; i++) {
+      float a  = i * (2.0f * PI / sides);
+      float wx = cx + cosf(a) * radius;
+      float wz = cz + sinf(a) * radius;
+      float wy = GetDuneHeight(wx, wz);
+      DrawCube({wx, wy + wallH*0.5f, wz}, segLen * 0.88f, wallH, 0.55f, fittedStone);
+    }
+  }
+  // Cedar-framed residential houses (5 positions)
+  static const float hdx[] = {-5.0f,  5.0f, 0.0f, -8.0f,  8.0f};
+  static const float hdz[] = {-4.0f, -4.0f,-8.0f,  0.5f,  0.5f};
+  for (int i = 0; i < 5; i++) {
+    float hx = cx + hdx[i], hz = cz + hdz[i];
+    float hy = GetDuneHeight(hx, hz);
+    DrawCube({hx, hy + 1.25f, hz}, 2.5f, 2.5f, 2.5f, {215, 205, 178, 255});
+    DrawCube({hx, hy + 2.65f, hz}, 2.75f, 0.35f, 2.75f, cedar);
+  }
+  // Irrigation channels (N-S lines, thin water-blue slabs)
+  for (int i = -2; i <= 2; i++) {
+    float lx = cx + i * 3.1f;
+    float ly = GetDuneHeight(lx, cz);
+    DrawCube({lx, ly + 0.025f, cz}, 0.28f, 0.05f, 28.0f, channel);
+  }
+  // Water tower (summit landmark)
+  float wy = GetDuneHeight(cx, cz);
+  DrawCylinder({cx, wy,       cz}, 1.05f, 1.25f, 6.2f, 10, {192, 178, 142, 255});
+  DrawCylinder({cx, wy + 6.2f, cz}, 1.9f, 1.7f,  1.3f, 10, {200, 185, 150, 255});
+  for (int i = 0; i < 4; i++) {
+    float sa = i * (PI / 2.0f) + PI / 4.0f;
+    float sx = cx + cosf(sa) * 1.6f, sz = cz + sinf(sa) * 1.6f;
+    float sy = GetDuneHeight(sx, sz);
+    DrawCylinder({sx, sy + 0.5f, sz}, 0.12f, 0.08f, 5.8f, 5, cedar);
+  }
+  // Dense vegetation patches between terraces
+  for (int v = 0; v < 12; v++) {
+    float va = v * (2.0f * PI / 12.0f);
+    float vr = 2.0f + (v % 3) * 1.8f;
+    float vx = cx + cosf(va) * vr, vz = cz + sinf(va) * vr;
+    float vy = GetDuneHeight(vx, vz);
+    // Stylised plant: small green sphere on thin stem
+    DrawCylinder({vx, vy, vz}, 0.06f, 0.06f, 0.55f, 4, {90, 65, 35, 255});
+    Color leaf = {(unsigned char)(60 + v*8%60), (unsigned char)(140 + v*5%60),
+                  (unsigned char)(50 + v*3%40), 255};
+    DrawSphere({vx, vy + 0.75f, vz}, 0.38f + 0.1f*(v%3), leaf);
+  }
+}
+
+// ─── 5. Sela — The Canyon Town (NW, ~35,30) ──────────────────────────────────
+static void DrawCitySela() {
+  const float cx = CITY_SELA_X, cz = CITY_SELA_Z;
+  const float floorY = GetDuneHeight(cx, cz);
+  const Color rawStone  = {118, 104,  84, 255};
+  const Color stoneFace = {135, 120,  98, 255};
+  const Color brass     = {175, 112,  40, 255};
+  const Color brassDark = {122,  76,  24, 255};
+
+  // ── Canyon wall faces (N and S cliff faces) ──────────────────────────────
+  for (int side = 0; side < 2; side++) {
+    float wallZ    = cz + (side == 0 ? -7.5f : 7.5f);
+    int   numSegs  = 10;
+    for (int i = -4; i <= 4; i++) {
+      float wx    = cx + i * 2.5f;
+      float wrimY = GetDuneHeight(wx, wallZ + (side==0 ? -2.0f : 2.0f));
+      float wflrY = GetDuneHeight(wx, cz);
+      float wallH = wrimY - wflrY;
+      if (wallH < 0.5f) wallH = 0.5f;
+      DrawCube({wx, wflrY + wallH*0.5f, wallZ}, 2.3f, wallH, 1.1f, rawStone);
+    }
+  }
+  // ── Rock-cut dwellings (N wall) ──────────────────────────────────────────
+  for (int i = 0; i < 6; i++) {
+    float dx    = (i - 2.5f) * 3.5f;
+    float tier  = (float)(i % 2);
+    float dwx   = cx + dx;
+    float dwz   = cz - 6.0f;
+    float dwy   = floorY + 1.8f + tier * 2.8f;
+    DrawCube({dwx, dwy + 0.9f, dwz}, 1.9f, 2.0f, 0.9f, {78, 68, 54, 255});
+    DrawCubeWires({dwx, dwy + 0.9f, dwz}, 2.2f, 2.3f, 1.0f, stoneFace);
+  }
+  // ── Rock-cut dwellings (S wall) ──────────────────────────────────────────
+  for (int i = 0; i < 5; i++) {
+    float dx  = (i - 2.0f) * 3.8f;
+    float dwx = cx + dx;
+    float dwz = cz + 6.5f;
+    float dwy = floorY + 1.4f + (i % 3) * 2.4f;
+    DrawCube({dwx, dwy + 0.8f, dwz}, 2.0f, 1.8f, 0.9f, {73, 63, 50, 255});
+    DrawCubeWires({dwx, dwy + 0.8f, dwz}, 2.3f, 2.1f, 1.0f, stoneFace);
+  }
+  // ── 3-level brass scaffolding (both faces) ───────────────────────────────
+  for (int level = 0; level < 3; level++) {
+    float scaffY = floorY + 1.0f + level * 3.0f;
+    DrawCube({cx, scaffY, cz - 5.5f}, 20.0f, 0.12f, 0.12f, brass);
+    DrawCube({cx, scaffY, cz + 5.5f}, 20.0f, 0.12f, 0.12f, brass);
+    for (int p = -4; p <= 4; p++) {
+      float px = cx + p * 2.3f;
+      float postH = scaffY - floorY + 0.15f;
+      DrawCylinder({px, floorY, cz - 5.5f}, 0.09f, 0.09f, postH, 5, brassDark);
+      DrawCylinder({px, floorY, cz + 5.5f}, 0.09f, 0.09f, postH, 5, brassDark);
+    }
+  }
+  // ── Great Chain Lift (navigation landmark) ────────────────────────────────
+  float rimY    = GetDuneHeight(cx + 2.0f, cz - 10.0f);
+  float chainY0 = floorY;
+  int   nLinks  = (int)((rimY - chainY0) / 1.5f) + 2;
+  for (int lk = 0; lk < nLinks; lk++) {
+    float ly = chainY0 + lk * 1.5f;
+    if (lk % 2 == 0)
+      DrawCube({cx + 2.0f, ly, cz}, 0.5f, 0.18f, 0.12f, brass);
+    else
+      DrawCube({cx + 2.0f, ly, cz}, 0.12f, 0.18f, 0.5f, brass);
+    // Ore cart mid-chain
+    if (lk == nLinks / 2) {
+      float ct = g_time * 0.3f;
+      float cartY = chainY0 + ct - floorf(ct) * (rimY - chainY0);
+      DrawCube({cx+2.0f, cartY - 0.6f, cz}, 1.2f, 0.7f, 0.8f, {88, 78, 62, 255});
+    }
+  }
+  // ── Brass lanterns along scaffold rails ──────────────────────────────────
+  struct Lantern { float dx, dz, dy; };
+  static const Lantern lanterns[] = {
+    {-7.5f, -5.5f, 2.5f}, {-3.8f, -5.5f, 3.8f}, {0.0f, -5.5f, 2.5f},
+    { 3.8f, -5.5f, 3.8f}, { 7.5f, -5.5f, 2.5f},
+    {-5.0f,  5.5f, 2.0f}, { 0.0f,  5.5f, 3.4f}, { 5.0f,  5.5f, 2.0f},
+  };
+  for (auto &l : lanterns) {
+    float lx = cx + l.dx, lz = cz + l.dz, ly = floorY + l.dy;
+    float glow = 0.5f + 0.5f * sinf(g_time * 2.1f + l.dx * 0.7f);
+    unsigned char cr = 255;
+    unsigned char cg = (unsigned char)(130 + glow * 85);
+    DrawSphere({lx, ly,       lz}, 0.22f,        {cr, cg, 22, 255});
+    DrawSphere({lx, ly,       lz}, 0.40f,        {255, 185, 50, (unsigned char)(32 + glow*28)});
+    DrawCube  ({lx, ly - 0.1f, lz}, 0.42f, 0.5f, 0.42f, {115, 76, 22, 140});
+  }
+  // ── Rope bridges ─────────────────────────────────────────────────────────
+  for (int b = 0; b < 2; b++) {
+    float by  = floorY + 3.2f + b * 4.0f;
+    float bxc = cx + (b == 0 ? -2.5f : 1.5f);
+    DrawCube({bxc, by,        cz}, 1.1f, 0.09f, 14.0f, {175, 150, 88, 255});
+    DrawCylinder({bxc, by+0.9f, cz - 7.0f}, 0.06f, 0.06f, 8.0f, 4, {140, 110, 60, 255});
+    DrawCylinder({bxc, by+0.9f, cz + 7.0f}, 0.06f, 0.06f, 8.0f, 4, {140, 110, 60, 255});
+  }
+}
+
+// ── Village Well at (98, 62) ─────────────────────────────────────────────────
+static void DrawVillageWell() {
+  float wx = 98.0f, wz = 62.0f;
+  float wy = GetDuneHeight(wx, wz);
+  // Stone base ring
+  DrawCylinder({wx, wy, wz}, 0.9f, 0.85f, 0.6f, 12, {130, 120, 105, 255});
+  DrawCylinder({wx, wy, wz}, 0.92f, 0.92f, 0.62f, 12, {90, 80, 65, 160}); // rim shadow
+  // Water surface inside
+  DrawCylinder({wx, wy + 0.55f, wz}, 0.72f, 0.72f, 0.02f, 12, {60, 120, 180, 200});
+  // Two vertical posts
+  DrawCylinder({wx - 0.6f, wy + 0.6f, wz}, 0.06f, 0.06f, 1.2f, 6, {100, 75, 45, 255});
+  DrawCylinder({wx + 0.6f, wy + 0.6f, wz}, 0.06f, 0.06f, 1.2f, 6, {100, 75, 45, 255});
+  // Crossbeam
+  DrawCube({wx, wy + 1.85f, wz}, 1.35f, 0.1f, 0.1f, {100, 75, 45, 255});
+  // Rope (thin cylinder)
+  DrawCylinder({wx, wy + 0.6f, wz}, 0.025f, 0.025f, 1.25f, 5, {160, 130, 80, 255});
+  // Bucket at bottom of rope
+  DrawCylinder({wx, wy + 0.55f, wz}, 0.12f, 0.10f, 0.18f, 8, {110, 80, 45, 255});
 }
 
 static void DrawOverworld() {
@@ -6579,6 +9832,8 @@ static void DrawOverworld() {
 
   BeginMode3D(g_cam);
   {
+    UpdateFrustumPlanes(); // Gribb-Hartmann frustum extraction for culling
+
     // Update triplanar shader view-dependent uniforms (rim light needs camera)
     Vector3 camPos = g_cam.position;
     SetShaderValue(g_shTriplanar, g_locTripCameraPos, &camPos, SHADER_UNIFORM_VEC3);
@@ -6588,41 +9843,88 @@ static void DrawOverworld() {
     }
 
     // ── PASS 2: Opaque environment (tents, rocks) ───────────────────────
-    // Tent shadows (PCF soft)
-    for (int i = 0; i < g_numTents; i++)
-      DrawTentShadow(g_tentInstances[i]);
+    // Tent shadows (PCF soft) — cull beyond 50 units
+    for (int i = 0; i < g_numTents; i++) {
+      const TentInstance &ti = g_tentInstances[i];
+      if (DistSqToPlayer(ti.worldX, ti.worldZ) > 2500.0f) continue;
+      DrawTentShadow(ti);
+    }
 
     // Character shadows
     float playerY = GetDuneHeight(g_player.posX, g_player.posZ);
     DrawSpriteBlobShadow({g_player.posX, playerY, g_player.posZ}, 0.5f);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < g_numNpcs; i++) {
+      if (DistSqToPlayer(g_npcs[i].worldX, g_npcs[i].worldZ) > 3600.0f) continue; // 60u
       float ny = GetDuneHeight(g_npcs[i].worldX, g_npcs[i].worldZ);
       DrawSpriteBlobShadow({g_npcs[i].worldX, ny, g_npcs[i].worldZ}, 0.42f);
     }
 
-    // Rock shadows
+    // Rock shadows — cull beyond 40 units
     for (int i = 0; i < g_numRocks; i++) {
       RockInstance &ri = g_rockInstances[i];
+      if (DistSqToPlayer(ri.x, ri.z) > 1600.0f) continue;
       float ry = GetDuneHeight(ri.x, ri.z);
       DrawSoftShadow({ri.x, ry, ri.z}, ri.scale * 1.5f, ri.scale * 2.0f);
     }
 
-    // Draw tents (poles, roof, walls, sign all inside DrawTent now)
-    for (int i = 0; i < g_numTents; i++)
-      DrawTent(g_tentInstances[i]);
+    // Draw tents — cull beyond 50 units
+    for (int i = 0; i < g_numTents; i++) {
+      const TentInstance &ti = g_tentInstances[i];
+      if (DistSqToPlayer(ti.worldX, ti.worldZ) > 2500.0f) continue;
+      DrawTent(ti);
+    }
 
-    // Draw procedural rocks (placed on dune surface)
+    // Village well
+    DrawVillageWell();
+
+    // ── Five Cities of Eretz (frustum + distance culled) ─────────────────
+    // Bounding spheres: (cx, midY, cz, radius)
+    if (SphereInFrustum(100.0f, 18.0f,  12.0f, 22.0f)) DrawCityZahav();
+    if (SphereInFrustum( 22.0f,  3.0f,  75.0f, 14.0f)) DrawCityMaayan();
+    if (SphereInFrustum(100.0f,  1.0f, 133.0f, 12.0f)) DrawCityAvak();
+    if (SphereInFrustum(177.0f,  4.0f,  75.0f, 16.0f)) DrawCityGan();
+    if (SphereInFrustum( 35.0f, -1.0f,  30.0f, 13.0f)) DrawCitySela();
+
+    // Draw procedural rocks — cull beyond 40 units + frustum
     for (int i = 0; i < g_numRocks; i++) {
       RockInstance &ri = g_rockInstances[i];
+      if (DistSqToPlayer(ri.x, ri.z) > 1600.0f) continue;
       float ry = GetDuneHeight(ri.x, ri.z);
+      if (!SphereInFrustum(ri.x, ry, ri.z, ri.scale * 1.5f)) continue;
       DrawModelEx(ri.model, {ri.x, ry, ri.z}, {0, 1, 0}, ri.rotY,
                   {ri.scale, ri.scale, ri.scale}, WHITE);
     }
 
+
+    // ── PASS 2b: Northern Wastes vegetation & obelisk ─────────────────────
+    // Vegetation shadows — cull beyond 40 units
+    for (int i = 0; i < g_numVeg; i++) {
+      const VegetationInstance &vi = g_vegInstances[i];
+      if (DistSqToPlayer(vi.x, vi.z) > 1600.0f) continue;
+      float vy = GetDuneHeight(vi.x, vi.z);
+      float shadowH = (vi.type == VEG_SAGUARO || vi.type == VEG_DRY_TREE)
+                      ? 3.0f * vi.scale : 1.2f * vi.scale;
+      DrawSoftShadow({vi.x, vy, vi.z}, vi.scale * 0.8f, shadowH);
+    }
+    // Obelisk shadow
+    DrawSoftShadow({OBELISK_X, GetDuneHeight(OBELISK_X, OBELISK_Z), OBELISK_Z}, 0.6f, 2.5f);
+
+    // Vegetation models — cull beyond 40 units + frustum
+    for (int i = 0; i < g_numVeg; i++) {
+      const VegetationInstance &vi = g_vegInstances[i];
+      if (DistSqToPlayer(vi.x, vi.z) > 1600.0f) continue;
+      if (!SphereInFrustum(vi.x, GetDuneHeight(vi.x, vi.z), vi.z, vi.scale * 2.5f)) continue;
+      DrawVegetationInstance(vi);
+    }
+
+    // Ancient obelisk (northern point of interest)
+    DrawNorthernObelisk();
+
     // ── PASS 3: 3D Chibi Characters (BDSP vinyl figure style) ─────────────
-    // NPCs — 3D models with smooth rotation toward player
-    for (int i = 0; i < 4; i++) {
-      float npcY = GetDuneHeight(g_npcs[i].worldX, g_npcs[i].worldZ);
+    // NPCs — distance cull only (60 units), no frustum cull (NPCs are few)
+    for (int i = 0; i < g_numNpcs; i++) {
+      if (DistSqToPlayer(g_npcs[i].worldX, g_npcs[i].worldZ) > 3600.0f) continue; // 60u
+      float npcY = GetTerrainBilinear(g_npcs[i].worldX, g_npcs[i].worldZ);
       Vector3 npcPos = {g_npcs[i].worldX, npcY, g_npcs[i].worldZ};
       DrawChibiModel3D(npcPos, g_npcs[i].facingAngle, g_npcs[i].colors,
                        g_time + i * 0.22f, false, 0.6f);
@@ -6630,7 +9932,7 @@ static void DrawOverworld() {
 
     // Player — 3D model with walk animation
     {
-      float py = GetDuneHeight(g_player.posX, g_player.posZ);
+      float py = GetTerrainBilinear(g_player.posX, g_player.posZ) + 0.04f;
       Vector3 playerPos = {g_player.posX, py, g_player.posZ};
       DrawChibiModel3D(playerPos, g_player.facingAngle, g_playerColors,
                        g_player.animTimer, g_player.moving, 0.8f);
@@ -6641,6 +9943,25 @@ static void DrawOverworld() {
 
   // ── Full post-processing (composite renders into g_pixelFBO) ───────────
   ApplyFullPostProcess(g_time);
+
+  // ── Southern sandstorm overlay (amber screen tint) ─────────────────────
+  {
+    float halfH = (float)(MAP_H / 2);
+    float southP = Clamp((g_player.posZ - halfH) / (halfH * 0.8f), 0.0f, 1.0f);
+    if (southP > 0.0f) {
+      // Base amber tint
+      Color sand = {210, 150, 60, (unsigned char)(southP * 100)};
+      DrawRectangle(0, 0, SCREEN_W, SCREEN_H, sand);
+      // Scanline effect: horizontal dust streaks
+      float streak = sinf(g_time * 4.2f) * 0.5f + 0.5f;
+      Color streak1 = {240, 180, 80, (unsigned char)(southP * streak * 40)};
+      Color streak2 = {0, 0, 0, 0};
+      DrawRectangleGradientV(0, SCREEN_H / 3, SCREEN_W, SCREEN_H / 6,
+                             streak2, streak1);
+      DrawRectangleGradientV(0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 4,
+                             streak1, streak2);
+    }
+  }
 
   // ── Screen-space wind lines (rendering into g_pixelFBO) ──────────────────
   DrawVFX();
@@ -6679,11 +10000,52 @@ static void DrawOverworld() {
   snprintf(hudBuf, 128, "%s", g_worldClock.GetName());
   DrawText(hudBuf, 10, 28, 12, {200, 180, 140, 200});
 
-  // Tournament progress
-  snprintf(hudBuf, 128, "%s - %s League (%d/%d)", g_tournament.GetCityName(),
-           g_tournament.GetLeagueName(), g_tournament.roundsWon,
-           g_tournament.roundsPerLeague);
-  DrawText(hudBuf, 10, 44, 10, {180, 170, 140, 180});
+  // ── City proximity banner ─────────────────────────────────────────────────
+  {
+    float nearDist = CITY_RADIUS * 1.5f;
+    int   nearCity = -1;
+    float bestD2   = nearDist * nearDist;
+    for (int ci = 0; ci < 5; ci++) {
+      float dx = g_player.posX - CITY_POS[ci][0];
+      float dz = g_player.posZ - CITY_POS[ci][1];
+      float d2 = dx*dx + dz*dz;
+      if (d2 < bestD2) { bestD2 = d2; nearCity = ci; }
+    }
+    if (nearCity >= 0) {
+      float fade = 1.0f - sqrtf(bestD2) / nearDist;
+      unsigned char alpha = (unsigned char)(Clamp(fade * 340.0f, 0, 220));
+      // City name banner (centered, top of screen)
+      const char *cn = CITY_NAMES[nearCity];
+      int tw = MeasureText(cn, 18);
+      DrawRectangle((SCREEN_W - tw - 24) / 2, 68, tw + 24, 28,
+                    {15, 10, 5, (unsigned char)(alpha * 3 / 5)});
+      DrawText(cn, (SCREEN_W - tw) / 2, 75, 18, {255, 220, 120, alpha});
+    }
+  }
+  // City badges row — small colored circles per city, filled if badge earned
+  {
+    const char *cityInitials[] = {"Z","M","A","G","S"};
+    const Color cityColors[]   = {{220,180,60,255},{60,200,160,255},{200,120,60,255},
+                                   {80,200,80,255},{200,80,80,255}};
+    int bx = 10, by = 44;
+    DrawText("Badges:", bx, by, 10, {180,170,140,180});
+    bx += 52;
+    for (int i = 0; i < 5; i++) {
+      bool earned = g_tournament.cityChampionDefeated[i];
+      Color bg  = earned ? cityColors[i] : Color{40,30,20,120};
+      Color rim = earned ? Color{255,240,160,220} : Color{120,100,60,120};
+      DrawCircle(bx + 8, by + 5, 8.0f, bg);
+      DrawCircleLines(bx + 8, by + 5, 8.0f, rim);
+      DrawText(cityInitials[i], bx + 4, by + 0, 10,
+               earned ? Color{30,20,10,255} : Color{120,100,60,160});
+      bx += 22;
+    }
+    // If currently in a tournament, show round progress
+    if (g_tournamentMode || g_tournament.roundsWon > 0) {
+      snprintf(hudBuf, 128, "  Round %d/3", g_tournament.roundsWon);
+      DrawText(hudBuf, bx + 4, by, 10, {220,200,100,200});
+    }
+  }
 
   // Onboarding dialog overlay
   if (g_onboardingActive && !g_onboardingDone &&
@@ -6723,6 +10085,7 @@ int main() {
   // Init systems
   InitPostProcessing();
   GenerateAllCardTextures();
+  InitCardShaders();
   InitOverworld();
   InitCharacterColors(); // 3D chibi color palettes (no more sprite textures)
   g_market.Init();
@@ -6783,6 +10146,7 @@ int main() {
   for (int i = 0; i < g_numRocks; i++)
     UnloadModel(g_rockInstances[i].model);
   CleanupPostProcessing();
+  UnloadCardShaders();
   CloseWindow();
   return 0;
 }
