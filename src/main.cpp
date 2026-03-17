@@ -1990,11 +1990,26 @@ static void AnimPlay(int cardId, int handIdx, int handSize,
   a->duration  = 0.50f;
   a->startDelay = AnimQueueEnd(); // chain after current anim
   a->glowColor = glowCol;
-  Rectangle hr = GetHandCardRect(handIdx, handSize);
-  a->p0 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
-  Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
-  a->p2 = GetWorldToScreen(fp, g_matchCam);
-  a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y - 90.f};
+  if (playerIdx == 1) {
+    // AI hand: mirror of player hand layout along top of screen
+    const float cardW = 88.f, cardH = 126.f, gap = 6.f;
+    float totalW = handSize * (cardW + gap) - gap;
+    float startX = (SCREEN_W - totalW) * 0.5f;
+    float center = (handSize - 1) * 0.5f;
+    float dist   = fabsf((float)handIdx - center);
+    float fanDip = dist * dist * 3.8f;
+    float y = cardH + 10.f - fanDip; // mirrored: near top, edges dip upward
+    a->p0 = {startX + handIdx * (cardW + gap) + cardW * 0.5f, y};
+    Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
+    a->p2 = GetWorldToScreen(fp, g_matchCam);
+    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y + 90.f}; // arc downward
+  } else {
+    Rectangle hr = GetHandCardRect(handIdx, handSize);
+    a->p0 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
+    Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
+    a->p2 = GetWorldToScreen(fp, g_matchCam);
+    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y - 90.f};
+  }
 }
 
 static void AnimDestroy(int cardId, int playerIdx, int fieldIdx, int fieldSize) {
@@ -2299,19 +2314,32 @@ struct MarketController {
     }
   }
 
-  void OnTournamentEnd(const int *winDeckIds, int winCount,
+  void OnTournamentEnd(int league, const int *winDeckIds, int winCount,
                        const int *loseDeckIds, int loseCount) {
-    // Winners: +5% price increase
+    // Per-rarity win multipliers by league (Bronze → Diamond)
+    static const float winCommon[]  = {1.10f, 1.20f, 1.30f, 1.40f, 1.50f};
+    static const float winRare[]    = {1.05f, 1.08f, 1.12f, 1.18f, 1.20f};
+    static const float winEpic[]    = {1.01f, 1.01f, 1.02f, 1.06f, 1.08f};
+    // Per-rarity loss multipliers by league
+    static const float loseCommon[] = {1.00f, 0.99f, 0.95f, 0.90f, 0.80f};
+    static const float loseRare[]   = {1.00f, 0.99f, 0.98f, 0.95f, 0.90f};
+    static const float loseEpic[]   = {1.00f, 0.99f, 0.99f, 0.98f, 0.95f};
+    int li = (league >= 0 && league < 5) ? league : 0;
     for (int i = 0; i < winCount; i++) {
       int cid = winDeckIds[i];
-      if (cid >= 1 && cid <= NUM_ALL_CARDS)
-        volatility[cid] *= 1.05f;
+      if (cid < 1 || cid > NUM_ALL_CARDS) continue;
+      CardRarity r = GetCardRarity(cid);
+      if      (r == RARITY_RARE) volatility[cid] *= winRare[li];
+      else if (r == RARITY_EPIC) volatility[cid] *= winEpic[li];
+      else                       volatility[cid] *= winCommon[li];
     }
-    // Losers: -3% price decrease
     for (int i = 0; i < loseCount; i++) {
       int cid = loseDeckIds[i];
-      if (cid >= 1 && cid <= NUM_ALL_CARDS)
-        volatility[cid] *= 0.97f;
+      if (cid < 1 || cid > NUM_ALL_CARDS) continue;
+      CardRarity r = GetCardRarity(cid);
+      if      (r == RARITY_RARE) volatility[cid] *= loseRare[li];
+      else if (r == RARITY_EPIC) volatility[cid] *= loseEpic[li];
+      else                       volatility[cid] *= loseCommon[li];
     }
     RecalcPrices();
   }
@@ -2334,7 +2362,7 @@ struct MarketController {
                    float sellerCertMult = 1.0f) {
     if (cardId < 1 || cardId > NUM_ALL_CARDS)
       return 0;
-    return (int)(currentPrice[cardId] * 0.5f * dayMod * sellerCertMult + 0.5f);
+    return (int)(currentPrice[cardId] * 0.9f * dayMod * sellerCertMult + 0.5f);
   }
 };
 static MarketController g_market;
@@ -2379,9 +2407,15 @@ struct TournamentManager {
   }
 
   int GetPrizeCoins() {
-    // Bronze=20, Silver=50, Gold=100, Platinum=250, Diamond=500
-    const int prizes[] = {20, 50, 100, 250, 500};
+    // Bronze=100, Silver=200, Gold=1000, Platinum=2000, Diamond=8000
+    const int prizes[] = {100, 200, 1000, 2000, 8000};
     return prizes[currentLeague];
+  }
+
+  int GetEntryFee() {
+    // Bronze=10, Silver=20, Gold=50, Platinum=100, Diamond=200
+    const int fees[] = {10, 20, 50, 100, 200};
+    return fees[currentLeague];
   }
 
   float GetDifficultyMult() {
@@ -2393,9 +2427,9 @@ struct TournamentManager {
                     int loseCount) {
     if (won) {
       roundsWon++;
-      g_playerCoins += GetPrizeCoins();
-      // Apply tournament price changes
-      g_market.OnTournamentEnd(winDeck, winCount, loseDeck, loseCount);
+      g_playerCoins += GetPrizeCoins(); // sponsorship mult applied at call site
+      // Apply tournament price changes (per-rarity, per-league)
+      g_market.OnTournamentEnd(currentLeague, winDeck, winCount, loseDeck, loseCount);
 
       if (roundsWon >= roundsPerLeague) {
         roundsWon = 0;
@@ -2442,18 +2476,16 @@ struct WorldClock {
 
   void Init() {
     elapsed = 0;
-    cycleLength = 240.0f;
+    cycleLength = 1080.0f; // 18 min (3 × 6 min: Morning / Evening / Night)
     current = TIME_MORNING;
-  } // 4 min cycle
+  }
 
   void Update(float dt) {
     elapsed += dt;
     float phase = fmodf(elapsed, cycleLength) / cycleLength;
-    if (phase < 0.25f)
+    if (phase < 0.333f)
       current = TIME_MORNING;
-    else if (phase < 0.5f)
-      current = TIME_DAY;
-    else if (phase < 0.75f)
+    else if (phase < 0.667f)
       current = TIME_EVENING;
     else
       current = TIME_NIGHT;
@@ -2462,13 +2494,13 @@ struct WorldClock {
   float GetShopMod() {
     switch (current) {
     case TIME_MORNING:
-      return 1.07f; // +7%
+      return 1.03f; // +3% per GDD
     case TIME_DAY:
       return 1.00f;
     case TIME_EVENING:
-      return 1.03f; // +3%
+      return 1.00f;
     case TIME_NIGHT:
-      return 1.05f; // +5%
+      return 1.00f;
     }
     return 1.0f;
   }
@@ -2501,8 +2533,13 @@ enum ItemId {
   ITEM_KINGDOM_MAP = 0,
   ITEM_FAIR_SCALE,
   ITEM_SELLERS_CERT,
-  ITEM_LUCKY_CHARM,
+  ITEM_BLESSED_AMULET,       // +50% coins from defeating NPCs
   ITEM_TRADERS_BADGE,
+  ITEM_SWIFT_BOOTS,          // run in overworld
+  ITEM_SPONSORSHIP_CONTRACT, // 2x tournament prize
+  ITEM_SPECIAL_COUPON,       // -10% single pack price
+  ITEM_SPECIAL_PROMOTION,    // -10% box price
+  ITEM_MAGNIFYING_GLASS,     // -up to 20% single card price
   ITEM_COUNT
 };
 struct InventoryItem {
@@ -2521,18 +2558,33 @@ struct InventorySystem {
                               "Doubles rarity roll in pack opening.", false};
     items[ITEM_SELLERS_CERT] = {ITEM_SELLERS_CERT, "Seller's Certificate",
                                 "1.2x sell price multiplier.", false};
-    items[ITEM_LUCKY_CHARM] = {ITEM_LUCKY_CHARM, "Lucky Charm",
-                               "+10% coin bonus from wins.", false};
+    items[ITEM_BLESSED_AMULET] = {ITEM_BLESSED_AMULET, "Blessed Amulet",
+                                   "+50% coins from defeating random NPCs.", false};
     items[ITEM_TRADERS_BADGE] = {ITEM_TRADERS_BADGE, "Trader's Badge",
                                  "Unlock rare cards in shops.", false};
+    items[ITEM_SWIFT_BOOTS] = {ITEM_SWIFT_BOOTS, "Swift Boots",
+                                "Press B to run in the overworld.", false};
+    items[ITEM_SPONSORSHIP_CONTRACT] = {ITEM_SPONSORSHIP_CONTRACT, "Sponsorship Contract",
+                                        "Receive double money from winning tournaments.", false};
+    items[ITEM_SPECIAL_COUPON] = {ITEM_SPECIAL_COUPON, "Special Coupon",
+                                   "Single packs cost 10% less.", false};
+    items[ITEM_SPECIAL_PROMOTION] = {ITEM_SPECIAL_PROMOTION, "Special Promotion",
+                                      "Boxes cost 10% less.", false};
+    items[ITEM_MAGNIFYING_GLASS] = {ITEM_MAGNIFYING_GLASS, "Magnifying Glass",
+                                     "Single cards cost up to 20% less.", false};
   }
 
   bool Has(ItemId id) { return items[id].owned; }
   void Give(ItemId id) { items[id].owned = true; }
 
-  float GetSellMult() { return Has(ITEM_SELLERS_CERT) ? 1.2f : 1.0f; }
-  float GetWinCoinMult() { return Has(ITEM_LUCKY_CHARM) ? 1.1f : 1.0f; }
-  bool HasFairScale() { return Has(ITEM_FAIR_SCALE); }
+  float GetSellMult()       { return Has(ITEM_SELLERS_CERT)          ? 1.2f  : 1.0f; }
+  float GetWinCoinMult()    { return Has(ITEM_BLESSED_AMULET)         ? 1.5f  : 1.0f; }
+  float GetTournamentMult() { return Has(ITEM_SPONSORSHIP_CONTRACT)   ? 2.0f  : 1.0f; }
+  float GetPackMod()        { return Has(ITEM_SPECIAL_COUPON)         ? 0.9f  : 1.0f; }
+  float GetCardBuyMod()     { return Has(ITEM_MAGNIFYING_GLASS)
+                                ? (1.0f - (float)(rand() % 20) / 100.f) : 1.0f; }
+  bool HasFairScale()       { return Has(ITEM_FAIR_SCALE); }
+  bool HasSwiftBoots()      { return Has(ITEM_SWIFT_BOOTS); }
 };
 static InventorySystem g_inventory;
 
@@ -4161,6 +4213,10 @@ static void UpdateMatch(float dt) {
             loseDeck[i] = m.players[1].deck[i];
           bool cityDone = g_tournament.AdvanceRound(true, winDeck, winCount, loseDeck, loseCount);
           (void)cityDone;
+          // Sponsorship Contract: double the tournament prize
+          float sponsorBonus = g_inventory.GetTournamentMult() - 1.0f;
+          if (sponsorBonus > 0.f)
+            g_playerCoins += (int)(g_tournament.GetPrizeCoins() * sponsorBonus + 0.5f);
         }
       } else {
         if (g_tournamentMode) {
@@ -4172,7 +4228,7 @@ static void UpdateMatch(float dt) {
           for (int i = 0; i < loseCount; i++)
             loseDeck[i] = m.players[0].deck[i];
           g_tournament.roundsWon = 0; // reset round on loss
-          g_market.OnTournamentEnd(winDeck, winCount, loseDeck, loseCount);
+          g_market.OnTournamentEnd(g_tournament.currentLeague, winDeck, winCount, loseDeck, loseCount);
         }
       }
       g_tournamentMode = false;
@@ -5751,7 +5807,7 @@ static void UpdateShop(float dt) {
   }
 
   // Buy pack button — price scales with day/night cycle
-  int packPrice = (int)(10 * g_worldClock.GetShopMod() + 0.5f);
+  int packPrice = (int)(10 * g_worldClock.GetShopMod() * g_inventory.GetPackMod() + 0.5f);
   Rectangle packBtn = {SCREEN_W / 2 - 100, 260, 200, 40};
   if (CheckCollisionPointRec(mouse, packBtn) &&
       IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -5818,7 +5874,7 @@ static void DrawShopScene() {
   }
 
   // Pack button with dynamic price
-  int packPrice = (int)(10 * g_worldClock.GetShopMod() + 0.5f);
+  int packPrice = (int)(10 * g_worldClock.GetShopMod() * g_inventory.GetPackMod() + 0.5f);
   Color packCol = (g_playerCoins >= packPrice) ? Color{80, 80, 140, 255}
                                                : Color{50, 50, 60, 255};
   DrawRectangleRounded({(float)SCREEN_W / 2 - 100, 260, 200, 40}, 0.3f, 4,
@@ -6239,6 +6295,8 @@ static void UpdateNPCDialog() {
         int cityIdx = g_npcs[g_targetNPC].cityIndex;
         g_tournament.currentCity = cityIdx;
         g_tournamentMode = true;
+        g_playerCoins -= g_tournament.GetEntryFee(); // deduct entry fee
+        if (g_playerCoins < 0) g_playerCoins = 0;
         StartMatch(g_targetNPC);
         g_scene = SCENE_MATCH;
         g_npcDialogOpen = false;
