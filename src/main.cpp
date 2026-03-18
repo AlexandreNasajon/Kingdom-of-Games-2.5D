@@ -88,15 +88,7 @@ uniform vec4 colDiffuse;
 out vec4 finalColor;
 void main(){
     vec2 uv=fragTexCoord;
-    // ── Heat haze: only distorts background desert, NOT player/UI area
-    // Attenuate in the vertical focus band (0.40–0.70) where sprites live
-    float haze=sin(uv.y*25.0+time*1.5)*0.0018+sin(uv.y*40.0+time*2.3)*0.0010;
-    haze+=sin(uv.x*18.0+time*0.9)*0.0006;
-    haze*=(1.0-uv.y)*2.0;  // stronger near ground (low uv.y = top)
-    // Suppress haze in the center sprite band to preserve pixel-art clarity
-    float spriteBand=1.0-smoothstep(0.08,0.18,abs(uv.y-0.55));
-    haze*=(1.0-spriteBand*0.85);
-    uv.x+=haze;
+    // Heat haze removed for cleaner visuals
     // ── Depth of Field: 8-tap circular blur, strength from distance to focus band
     float focusY=0.55;
     float dofDist=abs(uv.y-focusY);
@@ -274,58 +266,189 @@ static const char *FS_TRIPLANAR = R"(
 in vec3 fragWorldPos;
 in vec3 fragNormal;
 in vec4 fragColor;
-uniform sampler2D texture0; // sand albedo
-uniform sampler2D texture1; // ripples normal map
-uniform sampler2D texture2; // pixel-grit overlay
-uniform float sandScale;    // tiling scale
-uniform vec3 sunDir;       // directional light (world)
-uniform vec3 cameraPos;    // rim light view vector
+uniform float sandScale;
+uniform vec3 sunDir;
+uniform vec3 cameraPos;
 uniform vec4 colDiffuse;
+uniform vec4 cityA;
+uniform vec4 cityB;
+uniform vec4 cityC;
+uniform vec4 cityD;
 out vec4 finalColor;
 
-vec4 sampleTriPlanar(sampler2D tex, vec3 pos, vec3 n, float scale){
-    vec3 an = abs(n);
-    an = pow(an, vec3(4.0)); // sharpen weights to reduce seams
-    an /= (an.x + an.y + an.z + 1e-5);
-    vec2 uvX = pos.zy * scale;
-    vec2 uvY = pos.xz * scale;
-    vec2 uvZ = pos.xy * scale;
-    vec4 tx = texture(tex, uvX);
-    vec4 ty = texture(tex, uvY);
-    vec4 tz = texture(tex, uvZ);
-    return tx * an.x + ty * an.y + tz * an.z;
+// Hash for procedural noise
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float hash2(vec2 p) {
+    return fract(sin(dot(p, vec2(269.5, 183.3))) * 43758.5453);
+}
+// Value noise
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 4; i++) {
+        v += a * vnoise(p);
+        p *= 2.0; a *= 0.5;
+    }
+    return v;
+}
+
+// Procedural sand with bold wind ripples and dune shadows
+vec3 sandColor(vec3 pos) {
+    vec2 uv = pos.xz * 0.3;
+    // Large dune ripples — very visible
+    float dune = sin(uv.x * 4.0 + uv.y * 1.5 + sin(uv.y * 2.0) * 2.0) * 0.5 + 0.5;
+    // Smaller detail ripples
+    float rip = sin(uv.x * 12.0 + uv.y * 4.0 + sin(uv.y * 6.0) * 1.0) * 0.5 + 0.5;
+    float n = fbm(uv * 1.5);
+    float v = dune * 0.5 + rip * 0.2 + n * 0.3;
+    // Wider color range for visible variation
+    vec3 dark = vec3(0.62, 0.50, 0.30);  // shadow in dune valleys
+    vec3 bright = vec3(0.95, 0.85, 0.60); // sun-lit dune crests
+    return mix(dark, bright, v);
+}
+// Procedural stone blocks
+vec3 stoneColor(vec3 pos) {
+    vec2 uv = pos.xz * 0.6;
+    vec2 cell = floor(uv * 2.0);
+    vec2 f = fract(uv * 2.0);
+    float edge = step(0.05, f.x) * step(0.05, f.y);
+    float n = hash(cell) * 0.3;
+    vec3 block = mix(vec3(0.52, 0.50, 0.46), vec3(0.68, 0.65, 0.60), n);
+    vec3 mortar = vec3(0.38, 0.36, 0.32);
+    return mix(mortar, block, edge);
+}
+// Procedural grass
+vec3 grassColor(vec3 pos) {
+    vec2 uv = pos.xz * 0.8;
+    float n = fbm(uv * 3.0);
+    float blade = sin(uv.x * 20.0 + n * 5.0) * 0.5 + 0.5;
+    float v = n * 0.6 + blade * 0.4;
+    return mix(vec3(0.22, 0.45, 0.15), vec3(0.42, 0.65, 0.28), v);
+}
+// Procedural brick
+vec3 brickColor(vec3 pos) {
+    vec2 uv = pos.xz * 0.7;
+    float row = uv.y * 4.0;
+    int rowI = int(floor(row));
+    float col = uv.x * 2.0 + float(rowI & 1) * 0.5;
+    float bU = fract(col);
+    float bV = fract(row);
+    bool mortar = (bU < 0.05 || bV < 0.07);
+    if (mortar) return vec3(0.52, 0.48, 0.42);
+    float n = hash(floor(vec2(col, row)));
+    return mix(vec3(0.62, 0.28, 0.18), vec3(0.75, 0.38, 0.25), n);
+}
+// Procedural marble
+vec3 marbleColor(vec3 pos) {
+    vec2 uv = pos.xz * 0.4;
+    float n = sin(uv.x * 3.0 + sin(uv.y * 4.0 + uv.x * 1.5) * 2.0) * 0.5 + 0.5;
+    float n2 = sin(uv.y * 5.0 + sin(uv.x * 3.0) * 1.5) * 0.5 + 0.5;
+    float v = n * 0.6 + n2 * 0.4;
+    vec3 base = mix(vec3(0.85, 0.83, 0.78), vec3(0.96, 0.94, 0.91), v);
+    if (v > 0.85) base = mix(base, vec3(0.92, 0.82, 0.52), 0.5);
+    return base;
 }
 
 void main(){
     vec3 n = normalize(fragNormal);
-    vec4 albedo = sampleTriPlanar(texture0, fragWorldPos, n, sandScale);
-    vec4 nm = sampleTriPlanar(texture1, fragWorldPos, n, sandScale * 2.0);
-    vec4 grit = sampleTriPlanar(texture2, fragWorldPos, n, sandScale * 0.5);
-    float ripple = nm.r * 0.5 + nm.g * 0.5;
-    float micro = mix(0.92, 1.08, ripple);
-    vec3 base = albedo.rgb * micro;
-    // Smooth sun/shadow gradient — warm sandy shadow, never black
+
+    // All-procedural biome colors
+    vec3 sandCol  = sandColor(fragWorldPos);
+    vec3 stoneCol = stoneColor(fragWorldPos);
+    vec3 grassCol = grassColor(fragWorldPos);
+    vec3 brickCol = brickColor(fragWorldPos);
+    vec3 marbCol  = marbleColor(fragWorldPos);
+
+    // Biome weights from distance to city centers
+    vec2 wp = fragWorldPos.xz;
+    float dA = length(wp - cityA.xy) / cityA.z;
+    float dB = length(wp - cityB.xy) / cityB.z;
+    float dC = length(wp - cityC.xy) / cityC.z;
+    float dD = length(wp - cityD.xy) / cityD.z;
+
+    float wStone  = clamp(1.0 - dA, 0.0, 1.0); wStone  *= wStone;
+    float wGrass  = clamp(1.0 - dB, 0.0, 1.0); wGrass  *= wGrass;
+    float wBrick  = clamp(1.0 - dC, 0.0, 1.0); wBrick  *= wBrick;
+    float wMarble = clamp(1.0 - dD, 0.0, 1.0); wMarble *= wMarble;
+    float wTotal  = wStone + wGrass + wBrick + wMarble;
+
+    // Blend: sand base + city biome overlays
+    vec3 base = sandCol;
+    if (wTotal > 0.001) {
+        float cityW = wTotal * 3.0 / (1.0 + wTotal * 3.0);
+        vec3 cityBlend = (stoneCol * wStone + grassCol * wGrass +
+                          brickCol * wBrick + marbCol * wMarble) / max(wTotal, 0.001);
+        base = mix(sandCol, cityBlend, cityW);
+    }
+
+    base *= fragColor.rgb * 1.1;
+
+    // Sun lighting
     float L = max(dot(n, -sunDir), 0.0);
-    float sunLit    = mix(0.60, 1.0, smoothstep(0.10, 0.75, L));
-    vec3 sunCol     = vec3(1.0, 0.820, 0.643);    // #FFD1A4 warm golden-orange
-    vec3 shadowCol  = vec3(0.58, 0.40, 0.22);     // warm sandy shadow tint
-    vec3 lighting   = mix(shadowCol, sunCol, sunLit);
-    // Rim highlight on crests (view-dependent)
+    float sunLit = mix(0.55, 1.0, smoothstep(0.05, 0.65, L));
+    vec3 sunCol  = vec3(1.05, 0.88, 0.68);
+    vec3 shadCol = vec3(0.45, 0.35, 0.22);
+    vec3 lighting = mix(shadCol, sunCol, sunLit);
+
+    // Rim highlight
     vec3 V = normalize(cameraPos - fragWorldPos);
-    float rim = pow(clamp(1.0 - max(dot(n, V), 0.0), 0.0, 1.0), 3.0);
-    rim *= smoothstep(0.6, 0.95, L); // only on lit side near crest
-    vec3 rimCol = vec3(1.15, 1.05, 0.85);
-    // Pixel-grit overlay (two-tone), low frequency to avoid moiré
-    float gritMask = grit.r;
-    vec3 gritCol = mix(vec3(0.92, 0.80, 0.60), vec3(0.70, 0.55, 0.40), step(0.5, gritMask));
+    float rim = pow(clamp(1.0 - max(dot(n, V), 0.0), 0.0, 1.0), 2.5);
+    rim *= smoothstep(0.5, 0.9, L);
+
     vec3 color = base * lighting;
-    color = mix(color, color * rimCol, rim * 0.35);
-    color = mix(color, gritCol, 0.08);
-    // colDiffuse tint only — vertex-color AO removed (was darkening shadows to black)
+    color += color * vec3(1.15, 1.05, 0.88) * rim * 0.35;
     color *= colDiffuse.rgb;
     finalColor = vec4(color, 1.0);
 }
 )";
+// ── Rock shader (vertex-color + directional sun lighting) ────────────────────
+static const char *VS_ROCK = R"(
+#version 330
+layout(location=0) in vec3 vertexPosition;
+layout(location=1) in vec2 vertexTexCoord;
+layout(location=2) in vec3 vertexNormal;
+layout(location=3) in vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+out vec3 fragPos;
+out vec3 fragNormal;
+out vec4 fragColor;
+void main(){
+    fragPos    = vec3(matModel * vec4(vertexPosition, 1.0));
+    fragNormal = normalize(vec3(matModel * vec4(vertexNormal, 0.0)));
+    fragColor  = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)";
+
+static const char *FS_ROCK = R"(
+#version 330
+in vec3 fragPos;
+in vec3 fragNormal;
+in vec4 fragColor;
+uniform vec4 colDiffuse;
+uniform vec3 sunDir;
+out vec4 finalColor;
+void main(){
+    vec3 n = normalize(fragNormal);
+    float NdotL = max(dot(n, -sunDir), 0.0);
+    float light = 0.55 + 0.45 * NdotL;
+    vec3 col = fragColor.rgb * light * colDiffuse.rgb;
+    finalColor = vec4(col, 1.0);
+}
+)";
+
 // ── City shaders ─────────────────────────────────────────────────────────────
 static const char *VS_GOLD = R"(
 #version 330
@@ -416,6 +539,9 @@ static int g_locCompTime, g_locCompExposure, g_locCompRes;
 static bool g_highFidelityMode = true;
 static Shader g_shTriplanar;
 static int g_locSandScale;
+static int g_locCityA, g_locCityB, g_locCityC, g_locCityD;
+static Shader g_shRock;
+static int g_locRockSunDir;
 static int g_locTripSunDir, g_locTripCameraPos;
 // ── Frustum culling ───────────────────────────────────────────────────────────
 static float g_frustum[6][4]; // [plane][a,b,c,d]  (normals pointing inward)
@@ -477,8 +603,10 @@ static bool   g_cityModelsReady = false;
 
 // ── Constants
 // ─────────────────────────────────────────────────────────────────
-static constexpr int SCREEN_W = 960;
-static constexpr int SCREEN_H = 640;
+static int SCREEN_W = 960;
+static int SCREEN_H = 640;
+static constexpr int UI_SAFE = 40; // safe-area inset (px) so UI isn't cut off in borderless/fullscreen
+static Font g_fontUI = {0};        // Professional UI font (loaded at init)
 static constexpr int MAP_W = 200;
 static constexpr int MAP_H = 150;
 static constexpr int INT_W = 10;
@@ -512,10 +640,10 @@ static const float CITY_POS[5][2] = {
 };
 static const char *CITY_NAMES[] = {
   "",  // Zahav removed
-  "Ma'ayan - The Oasis",
-  "Avak - The Dust Town",
-  "Gan - The Blooming Town",
-  "Sela - The Canyon Town"
+  "Ma'ayan - The Verdant Oasis",
+  "Avak - The Crimson District",
+  "Gan - The Ivory Spire",
+  "Sela - The Iron Quarter"
 };
 
 enum Dir { DIR_DOWN = 0, DIR_UP, DIR_LEFT, DIR_RIGHT, DIR_COUNT };
@@ -557,9 +685,32 @@ static void InitPostProcessing() {
   g_locPixelRes = GetShaderLocation(g_shPixelate, "resolution");
   // ── Triplanar terrain shader ───────────────────────────────────────────────
   g_shTriplanar = LoadShaderFromMemory(VS_TRIPLANAR, FS_TRIPLANAR);
+  TraceLog(LOG_INFO, "TERRAIN SHADER: id=%d", g_shTriplanar.id);
   g_locSandScale = GetShaderLocation(g_shTriplanar, "sandScale");
   g_locTripSunDir = GetShaderLocation(g_shTriplanar, "sunDir");
   g_locTripCameraPos = GetShaderLocation(g_shTriplanar, "cameraPos");
+  g_locCityA = GetShaderLocation(g_shTriplanar, "cityA");
+  g_locCityB = GetShaderLocation(g_shTriplanar, "cityB");
+  g_locCityC = GetShaderLocation(g_shTriplanar, "cityC");
+  g_locCityD = GetShaderLocation(g_shTriplanar, "cityD");
+  TraceLog(LOG_INFO, "TERRAIN UNIFORMS: sun=%d cam=%d cityA=%d cityB=%d cityC=%d cityD=%d",
+           g_locTripSunDir, g_locTripCameraPos, g_locCityA, g_locCityB, g_locCityC, g_locCityD);
+  // Set city positions for biome blending (x, z, radius, unused)
+  {
+    float cA[] = {CITY_SELA_X, CITY_SELA_Z, 35.0f, 0.0f};      // stone — larger radius
+    float cB[] = {CITY_MAAYAN_X, CITY_MAAYAN_Z, 38.0f, 0.0f};   // grass
+    float cC[] = {CITY_AVAK_X, CITY_AVAK_Z, 35.0f, 0.0f};       // brick
+    float cD[] = {CITY_GAN_X, CITY_GAN_Z, 35.0f, 0.0f};         // marble
+    SetShaderValue(g_shTriplanar, g_locCityA, cA, SHADER_UNIFORM_VEC4);
+    SetShaderValue(g_shTriplanar, g_locCityB, cB, SHADER_UNIFORM_VEC4);
+    SetShaderValue(g_shTriplanar, g_locCityC, cC, SHADER_UNIFORM_VEC4);
+    SetShaderValue(g_shTriplanar, g_locCityD, cD, SHADER_UNIFORM_VEC4);
+    float scale = 0.15f;
+    SetShaderValue(g_shTriplanar, g_locSandScale, &scale, SHADER_UNIFORM_FLOAT);
+  }
+  // ── Rock shader ──────────────────────────────────────────────────────────
+  g_shRock = LoadShaderFromMemory(VS_ROCK, FS_ROCK);
+  g_locRockSunDir = GetShaderLocation(g_shRock, "sunDir");
   // ── City shaders ──────────────────────────────────────────────────────────
   g_shGold = LoadShaderFromMemory(VS_GOLD, FS_GOLD);
   g_locGoldTime   = GetShaderLocation(g_shGold, "time");
@@ -592,6 +743,7 @@ static void CleanupPostProcessing() {
   UnloadShader(g_shSpriteLit);
   UnloadShader(g_shPixelate);
   UnloadShader(g_shTriplanar);
+  UnloadShader(g_shRock);
 }
 static void DrawFBOQuad(RenderTexture2D fbo) {
   DrawTextureRec(fbo.texture,
@@ -646,7 +798,7 @@ struct ChibiColors {
   Color outline;                // Edge tint (used for eyelashes etc.)
 };
 
-enum NpcRole { NPC_ROLE_NORMAL=0, NPC_ROLE_SHOP, NPC_ROLE_TOURNAMENT };
+enum NpcRole { NPC_ROLE_NORMAL=0, NPC_ROLE_SHOP, NPC_ROLE_TOURNAMENT, NPC_ROLE_GUIDE };
 struct NPC {
   int gx, gy;
   float worldX, worldZ;
@@ -707,6 +859,21 @@ static ChibiColors g_playerColors; // 3D chibi palette (initialized in InitOverw
 static inline float DistSqToPlayer(float wx, float wz) {
   float dx = wx - g_player.posX, dz = wz - g_player.posZ;
   return dx*dx + dz*dz;
+}
+
+// ── UI font helpers ──────────────────────────────────────────────────────────
+static void DrawUI(const char *text, int x, int y, int fontSize, Color color) {
+  if (g_fontUI.baseSize > 0) {
+    DrawTextEx(g_fontUI, text, {(float)x, (float)y}, (float)fontSize, 1.0f, color);
+  } else {
+    DrawText(text, x, y, fontSize, color);
+  }
+}
+static int MeasureUI(const char *text, int fontSize) {
+  if (g_fontUI.baseSize > 0) {
+    return (int)MeasureTextEx(g_fontUI, text, (float)fontSize, 1.0f).x;
+  }
+  return MeasureText(text, fontSize);
 }
 static Texture2D g_sandTex, g_stormTex, g_torchGlow, g_signTextures[4];
 static std::vector<Tent> g_tents;
@@ -862,7 +1029,7 @@ static void UpdateController(float dt) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SOVEREIGN HORIZONS — Card Game System
+// CARDS&COINS — Card Game System
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── Card Definitions ────────────────────────────────────────────────────────
@@ -1388,6 +1555,8 @@ struct FieldUnit {
   bool alive;
   int goldCounters; // for Golden Golem's gold counter ability
   bool pendingDeath; // true = death anim playing, waiting to be removed
+  bool cracked;      // true = took damage this turn, red pulsing overlay
+  bool deploying;    // true = CA_PLAY anim in progress, hide from 3D field
 };
 
 struct MatchPlayer {
@@ -1505,6 +1674,11 @@ static ArenaBurst    g_arenaBursts[ARENA_BURST_MAX];
 static bool    g_arrowActive = false;
 static Vector2 g_arrowSrc   = {};
 static Vector2 g_arrowDst   = {};
+static bool    g_arrowValid = true; // false = red/invalid (e.g., must attack Defender first)
+
+// Fast mode: 2× animation speed, toggled by F key
+static bool g_fastMode = false;
+static float AnimSpeed() { return g_fastMode ? 2.0f : 1.0f; }
 
 // AI "Thinking..." indicator
 static float g_aiThinkTimer  = 0.0f;
@@ -1735,6 +1909,195 @@ static int     g_enterFxCardId = -1;
 static float g_hspringOff[MAX_HAND] = {};
 static float g_hspringVel[MAX_HAND] = {};
 
+// ── Dig Wisp VFX Pool ──────────────────────────────────────────────────────
+struct DigWisp {
+  bool   active;
+  Vector2 p0, p1, p2;   // Bezier: deck → arc → graveyard
+  float  elapsed, duration, startDelay;
+  Color  col;
+};
+static constexpr int DIG_WISP_MAX = 12;
+static DigWisp g_digWisps[DIG_WISP_MAX];
+
+static void SpawnDigWisps(int playerIdx, int count) {
+  float deckX = 10.5f, graveX = -10.5f;
+  float zRow = (playerIdx == 0) ? 5.5f : -6.5f;
+  Vector2 deckScreen  = GetWorldToScreen({deckX,  0.5f, zRow}, g_matchCam);
+  Vector2 graveScreen = GetWorldToScreen({graveX, 0.5f, zRow}, g_matchCam);
+  for (int i = 0; i < count && i < DIG_WISP_MAX; i++) {
+    for (int k = 0; k < DIG_WISP_MAX; k++) {
+      if (!g_digWisps[k].active) {
+        float midX = (deckScreen.x + graveScreen.x) * 0.5f + (float)(rand() % 40 - 20);
+        float midY = fminf(deckScreen.y, graveScreen.y) - 80.0f - (float)(rand() % 40);
+        g_digWisps[k] = {true, deckScreen, {midX, midY}, graveScreen,
+                         0.0f, 0.5f, i * 0.12f, {160, 80, 220, 230}};
+        break;
+      }
+    }
+  }
+}
+
+static void UpdateDigWisps(float dt) {
+  for (int i = 0; i < DIG_WISP_MAX; i++) {
+    DigWisp &w = g_digWisps[i];
+    if (!w.active) continue;
+    if (w.startDelay > 0.0f) { w.startDelay -= dt; continue; }
+    w.elapsed += dt;
+    if (w.elapsed >= w.duration) w.active = false;
+  }
+}
+
+static void DrawDigWisps() {
+  for (int i = 0; i < DIG_WISP_MAX; i++) {
+    DigWisp &w = g_digWisps[i];
+    if (!w.active || w.startDelay > 0.0f) continue;
+    float t = Clamp(w.elapsed / w.duration, 0.0f, 1.0f);
+    float u = 1.0f - t;
+    Vector2 pos = {u*u*w.p0.x + 2*u*t*w.p1.x + t*t*w.p2.x,
+                   u*u*w.p0.y + 2*u*t*w.p1.y + t*t*w.p2.y};
+    // Color shifts from white → purple as it travels
+    unsigned char r = (unsigned char)(255 - t * 95);
+    unsigned char g = (unsigned char)(255 - t * 175);
+    unsigned char b = (unsigned char)(255);
+    unsigned char a = (unsigned char)((1.0f - t * 0.3f) * 230);
+    float sz = 6.0f + t * 3.0f;
+    DrawRectangle((int)(pos.x - sz), (int)(pos.y - sz * 1.4f),
+                  (int)(sz * 2), (int)(sz * 2.8f), {r, g, b, (unsigned char)(a * 0.3f)});
+    DrawCircle((int)pos.x, (int)pos.y, sz * 0.6f, {r, g, b, a});
+    // Trail particles
+    for (int j = 1; j <= 3; j++) {
+      float tt = Clamp(t - j * 0.04f, 0.0f, 1.0f);
+      float uu = 1.0f - tt;
+      Vector2 tp = {uu*uu*w.p0.x + 2*uu*tt*w.p1.x + tt*tt*w.p2.x,
+                    uu*uu*w.p0.y + 2*uu*tt*w.p1.y + tt*tt*w.p2.y};
+      float fa = (1.0f - j * 0.3f) * a * 0.5f;
+      DrawCircle((int)tp.x, (int)tp.y, sz * 0.3f, {160, 80, 220, (unsigned char)fa});
+    }
+  }
+}
+
+// ── Token +1/-1 Floating Number VFX ────────────────────────────────────────
+struct TokenFX {
+  bool  active;
+  float x, y;
+  char  text[8];
+  Color col;
+  float life, maxLife, scale;
+};
+static constexpr int TOKEN_FX_MAX = 16;
+static TokenFX g_tokenFX[TOKEN_FX_MAX];
+
+static void SpawnTokenFX(float x, float y, int delta, bool isPower) {
+  for (int i = 0; i < TOKEN_FX_MAX; i++) {
+    if (!g_tokenFX[i].active) {
+      TokenFX &fx = g_tokenFX[i];
+      fx.active = true;
+      fx.x = x; fx.y = y;
+      snprintf(fx.text, sizeof(fx.text), "%s%d", delta > 0 ? "+" : "", delta);
+      fx.col = isPower ? Color{50, 255, 80, 255} : Color{255, 60, 50, 255};
+      fx.life = 1.0f; fx.maxLife = 1.0f;
+      fx.scale = 2.0f;
+      break;
+    }
+  }
+}
+
+static void UpdateTokenFX(float dt) {
+  for (int i = 0; i < TOKEN_FX_MAX; i++) {
+    TokenFX &fx = g_tokenFX[i];
+    if (!fx.active) continue;
+    fx.life -= dt;
+    if (fx.life <= 0.0f) { fx.active = false; continue; }
+    float t = 1.0f - fx.life / fx.maxLife;
+    // EaseOutBack scale: 2.0 → 1.0
+    float bt = Clamp(t * 3.0f, 0.0f, 1.0f);
+    float s = bt * bt * (2.7f * bt - 1.7f);
+    fx.scale = 2.0f - s * 1.0f;
+    fx.y -= dt * 30.0f; // float upward
+  }
+}
+
+static void DrawTokenFX() {
+  for (int i = 0; i < TOKEN_FX_MAX; i++) {
+    TokenFX &fx = g_tokenFX[i];
+    if (!fx.active) continue;
+    float alpha = Clamp(fx.life / fx.maxLife, 0.0f, 1.0f);
+    int fontSize = (int)(24.0f * fx.scale);
+    int tw = MeasureText(fx.text, fontSize);
+    // Glow halo
+    DrawCircle((int)fx.x, (int)fx.y, fontSize * 0.8f,
+               {fx.col.r, fx.col.g, fx.col.b, (unsigned char)(alpha * 60)});
+    // Text with shadow
+    DrawUI(fx.text, (int)(fx.x - tw/2 + 2), (int)(fx.y - fontSize/2 + 2),
+             fontSize, {0, 0, 0, (unsigned char)(alpha * 180)});
+    DrawUI(fx.text, (int)(fx.x - tw/2), (int)(fx.y - fontSize/2),
+             fontSize, {fx.col.r, fx.col.g, fx.col.b, (unsigned char)(alpha * 255)});
+  }
+}
+
+// ── Coin Fly VFX Pool ──────────────────────────────────────────────────────
+struct CoinFly {
+  bool   active;
+  Vector2 src, dst, ctrl;
+  float  elapsed, duration;
+};
+static constexpr int COIN_FLY_MAX = 8;
+static CoinFly g_coinFlys[COIN_FLY_MAX];
+
+static void SpawnCoinFly(Vector2 src, Vector2 dst) {
+  for (int i = 0; i < COIN_FLY_MAX; i++) {
+    if (!g_coinFlys[i].active) {
+      Vector2 ctrl = {(src.x + dst.x) * 0.5f, fminf(src.y, dst.y) - 40.0f};
+      g_coinFlys[i] = {true, src, dst, ctrl, 0.0f, 0.4f};
+      break;
+    }
+  }
+}
+
+static void UpdateCoinFlys(float dt) {
+  for (int i = 0; i < COIN_FLY_MAX; i++) {
+    CoinFly &c = g_coinFlys[i];
+    if (!c.active) continue;
+    c.elapsed += dt;
+    if (c.elapsed >= c.duration) c.active = false;
+  }
+}
+
+static void DrawCoinFlys() {
+  for (int i = 0; i < COIN_FLY_MAX; i++) {
+    CoinFly &c = g_coinFlys[i];
+    if (!c.active) continue;
+    float t = Clamp(c.elapsed / c.duration, 0.0f, 1.0f);
+    float u = 1.0f - t;
+    Vector2 pos = {u*u*c.src.x + 2*u*t*c.ctrl.x + t*t*c.dst.x,
+                   u*u*c.src.y + 2*u*t*c.ctrl.y + t*t*c.dst.y};
+    float sz = 8.0f + sinf(t * 6.28f) * 2.0f;
+    // Gold coin
+    DrawCircle((int)pos.x, (int)pos.y, sz + 3, {255, 220, 60, 80});  // glow
+    DrawCircle((int)pos.x, (int)pos.y, sz, {255, 200, 40, 240});
+    DrawCircle((int)pos.x, (int)pos.y, sz * 0.5f, {255, 240, 120, 200});
+    // Trail
+    for (int j = 1; j <= 2; j++) {
+      float tt = Clamp(t - j * 0.06f, 0.0f, 1.0f);
+      float uu = 1.0f - tt;
+      Vector2 tp = {uu*uu*c.src.x + 2*uu*tt*c.ctrl.x + tt*tt*c.dst.x,
+                    uu*uu*c.src.y + 2*uu*tt*c.ctrl.y + tt*tt*c.dst.y};
+      DrawCircle((int)tp.x, (int)tp.y, sz * (0.6f - j * 0.15f),
+                 {255, 200, 40, (unsigned char)(120 - j * 40)});
+    }
+  }
+}
+
+// ── Life Damage/Heal VFX ────────────────────────────────────────────────────
+static float g_lifeDmgTimer[2]  = {};  // per-player damage jitter timer
+static float g_lifeHealTimer[2] = {};  // per-player heal glow timer
+static int   g_lifePrev[2]      = {-1, -1}; // track life changes
+
+// ── Phase Transition Banner ─────────────────────────────────────────────────
+static float g_phaseBannerTimer = 0.0f;
+static char  g_phaseBannerText[32] = {};
+static int   g_prevPhaseForBanner = -1;
+
 // ── Allocate ──────────────────────────────────────────────────────────────────
 static CardAnim* AllocCA() {
   for (int i = 0; i < CA_POOL; i++) {
@@ -1769,6 +2132,7 @@ static bool g_prevAnimLocked = false;   // for pending-draw flush edge detection
 // Pending draw buffer: human player cards waiting for CA_DRAW to finish
 static int  g_pendingDrawCards[32];
 static int  g_pendingDrawCount = 0;
+
 
 static bool AnyCA_Active() {
   for (int i = 0; i < CA_POOL; i++)
@@ -1820,7 +2184,7 @@ static void FireAnimCmd(const AnimCmd &cmd) {
     a->duration     = cmd.duration > 0.f ? cmd.duration : 0.28f;
     // Wind-up: pull back 20px away from target direction
     a->windupStart    = cmd.from;
-    a->windupDuration = 0.13f;
+    a->windupDuration = 0.18f; // smoother wind-up
     a->windupElapsed  = 0.f;
     a->windingUp      = true;
     a->impactFired    = false;
@@ -1916,15 +2280,24 @@ static void UpdateCardAnims(float dt) {
         g_shockwave = {true, a.p2, 0.f, 0.48f};
         PlaySfx(SFX_SHOCKWAVE);
       }
-      if (t >= 1.f) a.active = false;
+      if (t >= 1.f) {
+        a.active = false;
+        // Reveal deployed unit now that play animation is complete
+        for (int p = 0; p < 2; p++)
+          for (int fi = 0; fi < g_match.players[p].fieldSize; fi++)
+            if (g_match.players[p].field[fi].deploying &&
+                g_match.players[p].field[fi].cardId == a.cardId)
+              g_match.players[p].field[fi].deploying = false;
+      }
       break;
     }
     case CA_DESTROY:
-      if (t < 0.25f) {                    // shake phase
-        a.rot  = sinf(t * 160.f) * 9.f;
+      if (t < 0.20f) {                    // shake phase (shorter)
+        float st = t / 0.20f;
+        a.rot  = sinf(st * 100.f) * 7.f * (1.f - st); // damped shake
         a.scale = 1.f;  a.alpha = 1.f;  a.grayscale = false;
       } else {                            // dissolve phase
-        float d = (t - 0.25f) / 0.75f;
+        float d = (t - 0.20f) / 0.80f;
         a.rot       = 0.f;
         a.grayscale = true;
         a.dissolve  = d;
@@ -1949,7 +2322,16 @@ static void UpdateCardAnims(float dt) {
       a.scale = 1.f - EaseInCubic(t);
       a.rot   = t * 720.f;
       a.alpha = 1.f - t;
-      if (t >= 1.f) a.active = false;
+      a.dissolve = EaseInCubic(t);
+      // Purple burst at 10% dissolve
+      if (!a.landedFx && t >= 0.10f) {
+        a.landedFx = true;
+        SpawnArenaBurst(a.p0.x, a.p0.y, 20, {160, 60, 220, 200});
+      }
+      if (t >= 1.f) {
+        SpawnArenaBurst(a.p0.x, a.p0.y, 12, {120, 40, 180, 180});
+        a.active = false;
+      }
       break;
 
     case CA_ATTACK:
@@ -2060,7 +2442,7 @@ static void DrawCardAnims() {
     } else if (a.showBack) {
       DrawRectangleRounded(dr, 0.12f, 4, {48, 36, 68, (unsigned char)(a.alpha * 215)});
       DrawRectangleRoundedLinesEx(dr, 0.12f, 4, 2.f, {160, 130, 210, 180});
-      DrawText("?", (int)(pos.x - 6), (int)(pos.y - 9), 20,
+      DrawUI("?", (int)(pos.x - 6), (int)(pos.y - 9), 20,
                {180, 150, 255, (unsigned char)(a.alpha * 255)});
     } else {
       DrawRectangleRounded(dr, 0.12f, 4, {40, 28, 12, 250});
@@ -2086,6 +2468,21 @@ static void DrawCardAnims() {
       DrawCircle((int)a.soulPos.x, (int)a.soulPos.y,
                  (int)(3*sa + 1), {255, 245, 255, (unsigned char)(sa*255)});
     }
+
+    // Void glow ring (ERASE) — expanding purple halo during dissolve
+    if (a.type == CA_ERASE && a.dissolve > 0.05f) {
+      float vr = a.dissolve * 80.0f;
+      float vThick = 4.0f * (1.0f - a.dissolve);
+      unsigned char vA = (unsigned char)((1.0f - a.dissolve) * 140);
+      if (vr > vThick)
+        DrawRing(pos, vr - vThick, vr, 0.f, 360.f, 32, {160, 60, 220, vA});
+      // Inner purple flash
+      if (a.dissolve < 0.4f) {
+        float cf = 1.0f - a.dissolve / 0.4f;
+        DrawCircle((int)pos.x, (int)pos.y, (int)(vr * 0.3f),
+                   {120, 40, 180, (unsigned char)(cf * 80)});
+      }
+    }
   }
 
   // Enter-trigger gold pulse border
@@ -2098,7 +2495,7 @@ static void DrawCardAnims() {
       {(unsigned char)(255*alpha), (unsigned char)((180 + (int)(pulse*75))*alpha),
        (unsigned char)(30*alpha),  (unsigned char)(230*alpha)});
     int tw = MeasureText("ENTER!", 11);
-    DrawText("ENTER!", (int)(g_enterFxPos.x - tw/2), (int)(g_enterFxPos.y - eh*0.5f - 18),
+    DrawUI("ENTER!", (int)(g_enterFxPos.x - tw/2), (int)(g_enterFxPos.y - eh*0.5f - 18),
              11, {255, 220, 80, (unsigned char)(200*alpha)});
   }
 
@@ -2141,7 +2538,7 @@ static void AnimDraw(int cardId, int nextHandIdx, int handSize, float delay) {
   CardAnim *a = AllocCA(); if (!a) return;
   a->type      = CA_DRAW;
   a->cardId    = cardId;
-  a->duration  = 0.50f;
+  a->duration  = 0.65f; // smoother draw arc
   a->startDelay = AnimQueueEnd() + delay; // chain after current anim
   a->showBack  = true;
   a->isReveal  = true; // player draw always reveals
@@ -2150,7 +2547,7 @@ static void AnimDraw(int cardId, int nextHandIdx, int handSize, float delay) {
   a->p0 = GetWorldToScreen(dk3, g_matchCam);
   Rectangle hr = GetHandCardRect(nextHandIdx, handSize + 1);
   a->p2 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
-  a->p1 = {(a->p0.x + a->p2.x)*0.5f, fminf(a->p0.y, a->p2.y) - 195.f};
+  a->p1 = {(a->p0.x + a->p2.x)*0.5f, fminf(a->p0.y, a->p2.y) - 230.f}; // higher arc
 }
 
 static void AnimPlay(int cardId, int handIdx, int handSize,
@@ -2160,7 +2557,7 @@ static void AnimPlay(int cardId, int handIdx, int handSize,
   CardAnim *a = AllocCA(); if (!a) return;
   a->type      = CA_PLAY;
   a->cardId    = cardId;
-  a->duration  = 0.50f;
+  a->duration  = 0.60f; // smoother play arc
   a->startDelay = AnimQueueEnd(); // chain after current anim
   a->glowColor = glowCol;
   if (playerIdx == 1) {
@@ -2175,13 +2572,13 @@ static void AnimPlay(int cardId, int handIdx, int handSize,
     a->p0 = {startX + handIdx * (cardW + gap) + cardW * 0.5f, y};
     Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
     a->p2 = GetWorldToScreen(fp, g_matchCam);
-    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y + 90.f}; // arc downward
+    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y + 110.f}; // wider arc downward
   } else {
     Rectangle hr = GetHandCardRect(handIdx, handSize);
     a->p0 = {hr.x + hr.width*0.5f, hr.y + hr.height*0.5f};
     Vector3 fp = GetFieldSlotPos(playerIdx, fieldIdx, newFieldSize);
     a->p2 = GetWorldToScreen(fp, g_matchCam);
-    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y - 90.f};
+    a->p1 = {(a->p0.x + a->p2.x)*0.5f, a->p0.y - 120.f}; // wider arc upward
   }
 }
 
@@ -2190,7 +2587,7 @@ static void AnimDestroy(int cardId, int playerIdx, int fieldIdx, int fieldSize) 
   CardAnim *a = AllocCA(); if (!a) return;
   a->type       = CA_DESTROY;
   a->cardId     = cardId;
-  a->duration   = 0.50f;
+  a->duration   = 0.70f; // longer dissolve for dramatic effect
   a->startDelay = AnimQueueEnd();
   Vector3 fp  = GetFieldSlotPos(playerIdx, fieldIdx, fieldSize);
   a->p0       = GetWorldToScreen(fp, g_matchCam);
@@ -2203,7 +2600,7 @@ static void AnimErase(int cardId, int playerIdx, int fieldIdx, int fieldSize) {
   CardAnim *a = AllocCA(); if (!a) return;
   a->type       = CA_ERASE;
   a->cardId     = cardId;
-  a->duration   = 0.50f;
+  a->duration   = 0.65f; // smoother dissolve
   a->startDelay = AnimQueueEnd();
   Vector3 fp  = GetFieldSlotPos(playerIdx, fieldIdx, fieldSize);
   a->p0       = GetWorldToScreen(fp, g_matchCam);
@@ -2215,8 +2612,8 @@ static void AnimAttack(int atkPl, int atkIdx, int atkTotal,
   CardAnim *a = AllocCA(); if (!a) return;
   a->type       = CA_ATTACK;
   a->cardId     = g_match.players[atkPl].field[atkIdx].cardId;
-  a->duration   = 0.25f;
-  a->rbDuration = 0.25f;
+  a->duration   = 0.30f;  // smoother lunge
+  a->rbDuration = 0.35f;  // smoother rebound
   a->startDelay = AnimQueueEnd();
   Vector3 ap = GetFieldSlotPos(atkPl, atkIdx, atkTotal);
   a->p0 = GetWorldToScreen(ap, g_matchCam);
@@ -2284,7 +2681,7 @@ static void DrawFloatTexts() {
           (unsigned char)(255 * fminf(g_floatTexts[i].life, 1.0f));
       Color c = g_floatTexts[i].color;
       c.a = alpha;
-      DrawText(g_floatTexts[i].text, (int)g_floatTexts[i].x,
+      DrawUI(g_floatTexts[i].text, (int)g_floatTexts[i].x,
                (int)g_floatTexts[i].y, 22, c);
     }
   }
@@ -2356,6 +2753,7 @@ static bool g_shopCityVisited[5] = {};     // first-visit free packs tracker per
 static bool g_menuOpen = false;
 static bool g_menuShowHub = true;  // true = show hub pop-up, false = show tab content
 static bool g_npcDialogOpen = false;
+static bool g_npcDialogJustOpened = false; // skip input on the frame dialog opens
 static int g_targetNPC = -1;
 static int g_dialogSelection = 0;
 
@@ -2831,6 +3229,36 @@ static int g_onboardingStep =
     0; // 0=intro, 1=grandpa dialog, 2=tutorial battle, 3=done
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TUTORIAL STATE — Post-onboarding guided walkthrough
+// ═══════════════════════════════════════════════════════════════════════════════
+enum TutorialState {
+  TUT_INACTIVE = 0,
+  TUT_AWAITING_NPC_TALK,     // after onboarding, wait for player to talk to NPC
+  TUT_PRE_MATCH_DIALOG,      // NPC intro dialog before tutorial match starts
+  TUT_NPC_WALK_TO_SHOP,      // NPC walking player to card shop
+  TUT_ENTERING_SHOP,         // transition to shop scene
+  TUT_IN_SHOP,               // player is in shop, gift packs given
+  TUT_AWAITING_MATCH_NPC,    // after shop, wait for player to talk to NPC again
+  TUT_NPC_WALK_TO_HOG,       // NPC walking player to House of Glory
+  TUT_ENTERING_HOG,          // transition to match scene
+  TUT_MATCH_INTRO,           // tutorial match intro overlay
+  TUT_MATCH_PLAYING,         // tutorial match in progress with guidance text
+  TUT_MATCH_COMPLETE,        // tutorial match finished
+  TUT_DONE                   // tutorial fully complete
+};
+static TutorialState g_tutState = TUT_INACTIVE;
+static int g_tutNpcIdx = -1;           // which NPC is guiding the player
+static float g_tutTimer = 0.0f;        // general-purpose tutorial timer
+static int g_tutTextStep = 0;          // current text step within a state
+static const char *g_tutText = nullptr;// current tutorial overlay text
+static bool g_tutAutoWalk = false;     // player auto-follows NPC
+static int g_tutPacksGiven = 0;        // packs given in shop gift sequence
+static bool g_tutFirstShopDone = false;// first shop visit tutorial done
+// Target positions: Card Shop door at ~(95, 51), House of Glory door at ~(103, 73)
+static constexpr float TUT_SHOP_X = 95.0f, TUT_SHOP_Z = 51.0f;
+static constexpr float TUT_HOG_X = 103.0f, TUT_HOG_Z = 73.0f;
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SAVE/LOAD SYSTEM — Binary serialization to savegame.dat
 // ═══════════════════════════════════════════════════════════════════════════════
 static const unsigned int SAVE_MAGIC = 0x534F5647; // "SOVG"
@@ -2865,6 +3293,9 @@ struct SaveData {
   bool grandpaTutorialDone;
   // Shop first-visit tracking
   bool shopCityVisited[5];
+  // Tutorial
+  int tutorialState;
+  bool tutFirstShopDone;
 };
 
 static bool SaveGame() {
@@ -2900,6 +3331,8 @@ static bool SaveGame() {
   sd.onboardingDone = g_onboardingDone;
   sd.grandpaTutorialDone = g_grandpaTutorialDone;
   for (int i = 0; i < 5; i++) sd.shopCityVisited[i] = g_shopCityVisited[i];
+  sd.tutorialState = (int)g_tutState;
+  sd.tutFirstShopDone = g_tutFirstShopDone;
 
   FILE *f = fopen("savegame.dat", "wb");
   if (!f)
@@ -2953,6 +3386,11 @@ static bool LoadGame() {
   g_onboardingDone = sd.onboardingDone;
   g_grandpaTutorialDone = sd.grandpaTutorialDone;
   for (int i = 0; i < 5; i++) g_shopCityVisited[i] = sd.shopCityVisited[i];
+  g_tutState = (TutorialState)sd.tutorialState;
+  g_tutFirstShopDone = sd.tutFirstShopDone;
+  // Fix-up: if player has no deck, ensure tutorial state allows the intro duel
+  if (!g_hasStarterDeck && g_tutState == TUT_DONE)
+    g_tutState = TUT_AWAITING_NPC_TALK;
   g_scene = SCENE_OVERWORLD;
   return true;
 }
@@ -2979,6 +3417,95 @@ static void GiveStarterDeck() {
       g_collection[g_collectionSize++] = starterIds[i];
   }
   g_hasStarterDeck = true;
+}
+
+static void ShuffleDeck(int *arr, int n); // fwd decl for tutorial match
+static void UpdateTutMatchStep(float dt); // fwd decl for tutorial match
+static void DrawTutMatchOverlay();        // fwd decl for tutorial match
+// ── Tutorial rental deck (basic low-cost cards for the scripted intro match) ──
+static void BuildTutorialDeck(int *deck, int &deckSize) {
+  // Simple 20-card deck: cheap units + basic supports for teaching mechanics
+  const int ids[] = {
+    1, 2, 3, 4, 5, 6, 7, 9, 10, 11,        // 10 cost-1 units
+    12, 13, 14, 15, 16, 17, 18, 20,         // 8 more units
+    108, 116                                  // 2 supports
+  };
+  deckSize = 20;
+  for (int i = 0; i < 20; i++) deck[i] = ids[i];
+}
+static bool g_isTutorialMatch = false; // true during the scripted intro duel
+
+// ── Scripted tutorial match: step-by-step guided walkthrough ─────────────────
+enum TutMatchStep {
+  TSTEP_WELCOME = 0,       // "Welcome to your first duel!"
+  TSTEP_EXPLAIN_HP,        // Explain HP and coins panels
+  TSTEP_COLLECT_EXPLAIN,   // "This is the COLLECT phase — you draw a card and gain coins"
+  TSTEP_HAND_EXPLAIN,      // "These are your cards. Hover to inspect them."
+  TSTEP_DEVELOP_EXPLAIN,   // "DEVELOP phase — drag a card from your hand onto the field"
+  TSTEP_WAIT_PLAY_CARD,    // Wait for player to play at least 1 card
+  TSTEP_CARD_PLAYED,       // "Great! Your unit is on the field."
+  TSTEP_ACTIVATE_EXPLAIN,  // "ACTIVATE phase — click your unit, then click an enemy to attack"
+  TSTEP_WAIT_ATTACK,       // Wait for player to attack (or explain direct attack)
+  TSTEP_ATTACK_DONE,       // "Nice hit! Combat resolved."
+  TSTEP_ENDTURN_EXPLAIN,   // "Click END TURN to finish. You can right-click units to set defenders."
+  TSTEP_WAIT_ENDTURN,      // Wait for player to end turn
+  TSTEP_OPPONENT_TURN,     // "Now it's your opponent's turn. Watch what they do..."
+  TSTEP_FREE_PLAY,         // "You're on your own now! Keep playing until someone wins."
+  TSTEP_COUNT
+};
+static int g_tutMatchStep = TSTEP_WELCOME;
+static bool g_tutMatchPaused = false;    // true = overlay blocks input, waiting for Enter
+static float g_tutMatchTimer = 0.0f;     // auto-advance timer for some steps
+static int g_tutMatchCardsBefore = 0;    // track field size to detect card plays
+static bool g_tutMatchFirstTurn = true;  // first player turn (show all guidance)
+static int g_tutMatchTurnCount = 0;      // count turns to know when to stop guiding
+
+// Starts a tutorial match with rental decks (no permanent cards needed)
+static void StartTutorialMatch(int npcIdx) {
+  g_isTutorialMatch = true;
+  srand((unsigned)time(nullptr));
+  memset(&g_match, 0, sizeof(g_match));
+  memset(g_floatTexts, 0, sizeof(g_floatTexts));
+  g_match.active = true;
+  g_match.challengedNPC = npcIdx;
+  g_match.turn = 0;
+  g_match.turnNumber = 1;
+  g_match.phase = PHASE_COLLECT;
+  g_match.selectedHandIdx = -1;
+  g_match.selectedFieldIdx = -1;
+  g_match.targetFieldIdx = -1;
+  g_match.pendingAction = ACT_NONE;
+  g_match.pendingSupportCard = -1;
+  g_match.needsTarget = false;
+  snprintf(g_match.message, 128, "Tutorial Duel — learn the basics!");
+  g_match.messageTimer = 3.0f;
+  g_aiStep = AI_IDLE;
+  g_aiStepTimer = 0.f;
+  g_aiThinkTimer = 0.f;
+
+  // Initialize scripted tutorial step state
+  g_tutMatchStep = TSTEP_WELCOME;
+  g_tutMatchPaused = false;
+  g_tutMatchTimer = 0.0f;
+  g_tutMatchCardsBefore = 0;
+  g_tutMatchFirstTurn = true;
+  g_tutMatchTurnCount = 0;
+
+  for (int p = 0; p < 2; p++) {
+    MatchPlayer &mp = g_match.players[p];
+    mp.life = 20;
+    mp.coins = 0;
+    mp.handSize = 0;
+    mp.fieldSize = 0;
+    mp.graveSize = 0;
+    mp.oblivionSize = 0;
+    mp.isAI = (p == 1);
+    // Both players use rental tutorial decks
+    BuildTutorialDeck(mp.deck, mp.deckSize);
+    ShuffleDeck(mp.deck, mp.deckSize);
+    for (int i = 0; i < 5 && mp.deckSize > 0; i++)
+      mp.hand[mp.handSize++] = mp.deck[--mp.deckSize];
+  }
 }
 
 // ── Deck Building for NPC ───────────────────────────────────────────────────
@@ -3151,6 +3678,7 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
   fu.alive = true;
   fu.goldCounters = 0;
   fu.pendingDeath = false;
+  fu.deploying = true; // hidden until CA_PLAY animation finishes
 
   // Remove from hand
   for (int i = handIdx; i < mp.handSize - 1; i++)
@@ -3218,8 +3746,11 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
       int val = atoi(p + 4);
       if (strstr(cd.effect, "each other ally")) {
         for (int i = 0; i < mp.fieldSize; i++)
-          if (i != mp.fieldSize - 1)
+          if (i != mp.fieldSize - 1) {
             mp.field[i].powerCounters += val;
+            Vector2 sp = GetWorldToScreen(GetFieldSlotPos(playerIdx, i, mp.fieldSize), g_matchCam);
+            SpawnTokenFX(sp.x, sp.y, val, true);
+          }
       } else if (strstr(cd.effect, "another ally")) {
         // Buff strongest other ally
         if (mp.fieldSize > 1) {
@@ -3234,6 +3765,8 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
               best = i;
           }
           mp.field[best].powerCounters += val;
+          Vector2 sp = GetWorldToScreen(GetFieldSlotPos(playerIdx, best, mp.fieldSize), g_matchCam);
+          SpawnTokenFX(sp.x, sp.y, val, true);
         }
       }
     }
@@ -3243,8 +3776,11 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
     if (p) {
       int val = atoi(p + 4);
       if (strstr(cd.effect, "each enemy")) {
-        for (int i = 0; i < opp.fieldSize; i++)
+        for (int i = 0; i < opp.fieldSize; i++) {
           opp.field[i].weakCounters += val;
+          Vector2 sp = GetWorldToScreen(GetFieldSlotPos(1 - playerIdx, i, opp.fieldSize), g_matchCam);
+          SpawnTokenFX(sp.x, sp.y, -val, false);
+        }
       } else if (strstr(cd.effect, "an enemy") && opp.fieldSize > 0) {
         // Weakest enemy
         int weakest = 0;
@@ -3252,6 +3788,8 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
           if (opp.field[i].curDef < opp.field[weakest].curDef)
             weakest = i;
         opp.field[weakest].weakCounters += val;
+        Vector2 sp = GetWorldToScreen(GetFieldSlotPos(1 - playerIdx, weakest, opp.fieldSize), g_matchCam);
+        SpawnTokenFX(sp.x, sp.y, -val, false);
       }
     }
   }
@@ -3429,6 +3967,7 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
     MatchDrawCard(mp);
     MatchDrawCard(mp);
     mp.life -= 5;
+    SpawnDigWisps(playerIdx, 5);
   }
   // ID 172 Apex Predator: Enter - Make a 6/6 beast token
   if (cardId == 172 && mp.fieldSize < MAX_FIELD) {
@@ -3659,6 +4198,7 @@ static void PlaySupportCard(GameMatch &m, int playerIdx, int handIdx) {
   } else if (cardId == 109) { // Scrying Shovel: Dig 5 (draw 2 simplified)
     MatchDrawCard(mp);
     MatchDrawCard(mp);
+    SpawnDigWisps(playerIdx, 5);
   } else if (cardId == 110) { // Ember Wave: 1 damage to each enemy
     for (int i = 0; i < opp.fieldSize; i++) {
       opp.field[i].curDef -= 1;
@@ -4175,12 +4715,23 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
     AnimDestroy(defender.cardId, defPlayer, defIdx, dp.fieldSize);
     SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f - 30,
                    "DESTROYED", {255, 80, 80, 255});
+    // Shatter burst on kill (large, fire-colored)
+    {
+      Vector3 dp3 = GetFieldSlotPos(defPlayer, defIdx, dp.fieldSize);
+      Vector2 dsp = GetWorldToScreen(dp3, g_matchCam);
+      SpawnArenaBurst(dsp.x, dsp.y, 30, {255, 120, 40, 220});
+      SpawnArenaBurst(dsp.x, dsp.y, 10, {255, 200, 80, 180});
+    }
     if (atkOverrun) {
       dp.life -= (aAtk - dDef);
       char ob[16];
       snprintf(ob, 16, "-%d OVR", aAtk - dDef);
-      SpawnFloatText(SCREEN_W / 2.0f, (defPlayer == 1) ? 50.0f : SCREEN_H - 190.0f,
-                     ob, {255, 120, 60, 255});
+      float ovrY = (defPlayer == 1) ? 50.0f : SCREEN_H - 190.0f;
+      SpawnFloatText(SCREEN_W / 2.0f, ovrY, ob, {255, 120, 60, 255});
+      // Overrun particles toward opponent portrait
+      Vector3 dp3 = GetFieldSlotPos(defPlayer, defIdx, dp.fieldSize);
+      Vector2 dsp = GetWorldToScreen(dp3, g_matchCam);
+      SpawnArenaBurst(dsp.x, ovrY, 15, {255, 160, 40, 200});
     }
   } else if (aAtk == dDef) {
     // Tie: both destroyed unless Tenacity
@@ -4205,6 +4756,7 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
     SpawnFloatText(SCREEN_W / 2.0f - 60, SCREEN_H / 2.0f + 10,
                    "REPELLED!", {255, 80, 80, 255});
     defender.bonusDef -= aAtk;  // temporary — reset at turn end
+    defender.cracked = true;    // red pulsing wireframe until end of turn
     char db[16];
     snprintf(db, 16, "-%d DEF", aAtk);
     SpawnFloatText(SCREEN_W / 2.0f + 40, SCREEN_H / 2.0f - 20,
@@ -4321,6 +4873,7 @@ static void ResolveCombat(GameMatch &m, int atkPlayer, int atkIdx,
     attacker.powerCounters += graveUnits;
     ap.life += graveUnits;
     MatchDrawCard(ap); // simplified dig
+    SpawnDigWisps(atkPlayer, 3);
   }
   // ID 165 Infernal Broodlord: Attack - Make 3/1 demon token with dash
   if (attacker.cardId == 165 && ap.fieldSize < MAX_FIELD) {
@@ -4480,6 +5033,7 @@ static void ResetTempModifiers(GameMatch &m) {
     for (int i = 0; i < m.players[p].fieldSize; i++) {
       m.players[p].field[i].bonusDef = 0;  // DEF reductions expire
       m.players[p].field[i].bonusAtk = 0;
+      m.players[p].field[i].cracked = false;
     }
 }
 
@@ -4926,17 +5480,39 @@ static void UpdateAISteps(float dt) {
 // ── Update Match (human turn logic) ─────────────────────────────────────────
 
 static void UpdateMatch(float dt) {
-  UpdateFloatTexts(dt);
-  UpdateArenaVFX(dt);
-  UpdateCardAnims(dt);
+  // Phase transition banner detection
+  if ((int)g_match.phase != g_prevPhaseForBanner && g_match.phase != PHASE_GAME_OVER) {
+    g_prevPhaseForBanner = (int)g_match.phase;
+    const char *names[] = {"COLLECT PHASE", "DEVELOP PHASE", "ACTIVATION PHASE", "END PHASE"};
+    if ((int)g_match.phase < 4)
+      snprintf(g_phaseBannerText, 32, "%s", names[(int)g_match.phase]);
+    g_phaseBannerTimer = 1.2f;
+  }
+  if (g_phaseBannerTimer > 0) g_phaseBannerTimer -= dt;
+
+  // Fast mode toggle
+  if (IsKeyPressed(KEY_F)) g_fastMode = !g_fastMode;
+  float adt = dt * AnimSpeed(); // animation-scaled dt
+
+  UpdateFloatTexts(adt);
+  UpdateArenaVFX(adt);
+  UpdateCardAnims(adt);
   UpdateAnimQueue();
-  UpdateAISteps(dt); // AI step machine: process one action per cooldown
+  UpdateDigWisps(adt);
+  UpdateTokenFX(adt);
+  UpdateCoinFlys(adt);
+  UpdateAISteps(adt); // AI step machine: process one action per cooldown
   // Flush dead units from field once their destroy animations complete
   if (!AnyDestroyActive()) {
     FlushDeadUnits(g_match.players[0]);
     FlushDeadUnits(g_match.players[1]);
   }
   if (g_turnBannerTimer > 0.f) g_turnBannerTimer -= dt;
+
+  // Scripted tutorial match step update
+  UpdateTutMatchStep(dt);
+  // Block all player input while tutorial overlay is paused
+  if (g_tutMatchPaused) return;
 
   // Block all human input while AI step machine is running
   if (g_aiStep != AI_IDLE) return;
@@ -4958,7 +5534,7 @@ static void UpdateMatch(float dt) {
     Vector2 gravScreenP = GetWorldToScreen({-10.5f, 0.5f, 5.5f}, g_matchCam);
     // AI graveyard at world (-10.5, 0.5, -6.5)
     Vector2 gravScreenAI = GetWorldToScreen({-10.5f, 0.5f, -6.5f}, g_matchCam);
-    const float hitR = 38.f; // hit radius in screen pixels
+    const float hitR = 52.f; // hit radius in screen pixels (enlarged for clickability)
     if (gm2.players[0].graveSize > 0 &&
         CheckCollisionPointCircle(mouse2, gravScreenP, hitR)) {
       g_graveModalOpen   = true;
@@ -5021,6 +5597,28 @@ static void UpdateMatch(float dt) {
       ClearAnimQueue();
       g_aiStep = AI_IDLE;
       g_scene = SCENE_OVERWORLD;
+      // Tutorial match exit: show quest dialogue, don't keep rental cards
+      if (g_isTutorialMatch) {
+        g_isTutorialMatch = false;
+        g_tutState = TUT_DONE;
+        g_tutAutoWalk = false;
+        g_tutText = nullptr;
+        // Show quest dialogue from Guide NPC
+        g_npcDialogOpen = true;
+        g_targetNPC = g_tutNpcIdx >= 0 ? g_tutNpcIdx : 0;
+        g_dialogSelection = 0;
+        g_dialogPhase = DIALOG_TALK;
+        g_dialogText = "You have potential! Visit the Card Shop to\n"
+                       "purchase your first deck and packs.\n"
+                       "Once you're ready, prove your worth at the\n"
+                       "House of Glory.";
+      }
+      // Normal tutorial exit
+      else if (g_tutState == TUT_MATCH_PLAYING || g_tutState == TUT_MATCH_COMPLETE) {
+        g_tutState = TUT_DONE;
+        g_tutAutoWalk = false;
+        g_tutText = nullptr;
+      }
     }
     return;
   }
@@ -5040,6 +5638,9 @@ static void UpdateMatch(float dt) {
         return;
       }
       human.coins += 2;
+      // Coin fly VFX: from phase bar area to coin counter
+      SpawnCoinFly({SCREEN_W / 2.0f, SCREEN_H / 2.0f - 60}, {72.f, (float)(SCREEN_H - 155)});
+      SpawnCoinFly({SCREEN_W / 2.0f + 20, SCREEN_H / 2.0f - 50}, {72.f, (float)(SCREEN_H - 155)});
       TriggerHarvest(human, m);  // Harvest effects fire on collect
       TriggerGrudge(human, m.players[1]);  // Grudge effects from graveyard
       m.phase = PHASE_DEVELOP;
@@ -5358,40 +5959,76 @@ static void DrawArenaTorches() {
 
 // Desert arena sky gradient background (drawn as 2D before 3D scene)
 static void DrawArenaBackground() {
-  // Deep warm dark background
+  // Deep dark stone dungeon background
   DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H,
-                         {12, 8, 4, 255}, {32, 20, 10, 255});
+                         {8, 6, 10, 255}, {22, 18, 28, 255});
 
   // Stone column silhouettes (left and right flanks)
-  int colW = SCREEN_W / 12;
+  int colW = SCREEN_W / 10;
   DrawRectangleGradientH(0, 0, colW, SCREEN_H,
-                         {6, 4, 2, 255}, {0, 0, 0, 0});
+                         {12, 10, 16, 255}, {0, 0, 0, 0});
   DrawRectangleGradientH(SCREEN_W - colW, 0, colW, SCREEN_H,
-                         {0, 0, 0, 0}, {6, 4, 2, 255});
+                         {0, 0, 0, 0}, {12, 10, 16, 255});
+  // Stone pillar details (3 per side)
+  for (int i = 0; i < 3; i++) {
+    int py = SCREEN_H / 5 + i * (SCREEN_H / 4);
+    DrawRectangle(2, py - 20, colW / 2, 40, {18, 15, 22, 180});
+    DrawRectangle(SCREEN_W - colW / 2 - 2, py - 20, colW / 2, 40, {18, 15, 22, 180});
+  }
 
-  // Wall sconce glows (left and right, mid-height)
+  // Wall torch glows (left and right, mid-height) — flickering fire
   float scY = (float)(SCREEN_H / 3);
   float scFlk1 = sinf(g_time * 6.1f) * 0.5f + 0.5f;
   float scFlk2 = sinf(g_time * 5.7f + 1.2f) * 0.5f + 0.5f;
-  // Left sconce
+  // Left torch
   DrawCircleGradient(colW / 2 + 2, (int)scY,
-                     colW * (1.8f + scFlk1 * 0.4f), {255, 155, 45, (unsigned char)(55 + scFlk1 * 35)}, {0, 0, 0, 0});
-  DrawCircle(colW / 2 + 2, (int)scY, 6 + scFlk1 * 3, {255, 210, 110, (unsigned char)(200 + scFlk1 * 50)});
-  // Right sconce
+                     colW * (2.0f + scFlk1 * 0.5f), {255, 120, 30, (unsigned char)(40 + scFlk1 * 30)}, {0, 0, 0, 0});
+  DrawCircle(colW / 2 + 2, (int)scY, 5 + scFlk1 * 3, {255, 200, 80, (unsigned char)(200 + scFlk1 * 55)});
+  // Right torch
   DrawCircleGradient(SCREEN_W - colW / 2 - 2, (int)scY,
-                     colW * (1.8f + scFlk2 * 0.4f), {255, 155, 45, (unsigned char)(55 + scFlk2 * 35)}, {0, 0, 0, 0});
-  DrawCircle(SCREEN_W - colW / 2 - 2, (int)scY, 6 + scFlk2 * 3, {255, 210, 110, (unsigned char)(200 + scFlk2 * 50)});
+                     colW * (2.0f + scFlk2 * 0.5f), {255, 120, 30, (unsigned char)(40 + scFlk2 * 30)}, {0, 0, 0, 0});
+  DrawCircle(SCREEN_W - colW / 2 - 2, (int)scY, 5 + scFlk2 * 3, {255, 200, 80, (unsigned char)(200 + scFlk2 * 55)});
+  // Second pair higher up
+  float scY2 = (float)(SCREEN_H * 2 / 3);
+  float scFlk3 = sinf(g_time * 5.3f + 2.5f) * 0.5f + 0.5f;
+  float scFlk4 = sinf(g_time * 6.4f + 0.7f) * 0.5f + 0.5f;
+  DrawCircleGradient(colW / 2 + 2, (int)scY2,
+                     colW * (1.6f + scFlk3 * 0.3f), {255, 100, 20, (unsigned char)(30 + scFlk3 * 25)}, {0, 0, 0, 0});
+  DrawCircleGradient(SCREEN_W - colW / 2 - 2, (int)scY2,
+                     colW * (1.6f + scFlk4 * 0.3f), {255, 100, 20, (unsigned char)(30 + scFlk4 * 25)}, {0, 0, 0, 0});
 
-  // Amber horizon haze band
-  DrawRectangleGradientV(0, SCREEN_H / 2 - 50, SCREEN_W, 80,
-                         {0, 0, 0, 0}, {190, 105, 40, 18});
-  // Distant dune silhouette (procedural wave)
-  for (int x = 0; x < SCREEN_W; x += 2) {
-    int h = (int)(16.0f + sinf(x * 0.017f) * 9.0f + sinf(x * 0.044f + 1.1f) * 5.0f);
-    DrawRectangle(x, SCREEN_H / 2 - h, 2, h, {45, 28, 10, 50});
+  // Dim overhead glow (brazier bloom on ceiling)
+  DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H / 5, {80, 50, 15, 16}, {0, 0, 0, 0});
+}
+
+// ── Arena rune strip between player/opponent fields ────────────────────────
+static void DrawArenaRunes(MatchPhase phase) {
+  // Rune color: Teal for resource phases, Amber for activation
+  bool isActivate = (phase == PHASE_ACTIVATE);
+  Color runeBase = isActivate ? Color{255, 180, 50, 255} : Color{60, 220, 200, 255};
+
+  const int NUM_RUNES = 10;
+  float spacing = 2.4f;
+  float startX = -(NUM_RUNES - 1) * spacing / 2.0f;
+  float z = 0.5f; // center divider
+
+  for (int i = 0; i < NUM_RUNES; i++) {
+    float pulse = sinf(g_time * 3.0f + i * 0.8f) * 0.5f + 0.5f;
+    float x = startX + i * spacing;
+    unsigned char a = (unsigned char)(60 + pulse * 140);
+    Color rc = {runeBase.r, runeBase.g, runeBase.b, a};
+    // Rune glow disc on table surface
+    DrawCylinder({x, -0.08f, z}, 0.25f + pulse * 0.08f, 0.25f + pulse * 0.08f,
+                 0.02f, 8, rc);
+    // Outer glow ring
+    Color dim = {runeBase.r, runeBase.g, runeBase.b, (unsigned char)(20 + pulse * 40)};
+    DrawCylinder({x, -0.09f, z}, 0.5f + pulse * 0.15f, 0.5f + pulse * 0.15f,
+                 0.01f, 10, dim);
   }
-  // Warm overhead glow (chandelier bloom on ceiling)
-  DrawRectangleGradientV(0, 0, SCREEN_W, SCREEN_H / 4, {110, 75, 20, 22}, {0, 0, 0, 0});
+  // Center dividing line glow
+  unsigned char lineA = (unsigned char)(80 + sinf(g_time * 2.0f) * 40);
+  Color lineCol = {runeBase.r, runeBase.g, runeBase.b, lineA};
+  DrawCube({0, -0.09f, z}, 24.0f, 0.01f, 0.06f, lineCol);
 }
 
 // Draw a card texture flat on the 3D table surface using rlgl quads.
@@ -5420,12 +6057,12 @@ static void DrawSlotDepressions(int playerIdx, int numOccupied) {
   const float startX = -(5 - 1) * spacing / 2.0f;
   for (int i = 0; i < 5; i++) {
     float cx = startX + i * spacing;
-    // Recessed felt pad (slightly lower, darker)
-    DrawCube({cx, -0.17f, z}, 2.35f, 0.04f, 3.15f, {10, 34, 18, 200});
-    // Slot outline — gold glow for occupied, faint for empty
+    // Recessed stone pad (carved depression)
+    DrawCube({cx, -0.17f, z}, 2.35f, 0.04f, 3.15f, {28, 24, 32, 200});
+    // Slot outline — rune glow for occupied, faint carved line for empty
     Color bc = (i < numOccupied)
-                   ? Color{100, 85, 28, 110}
-                   : Color{50, 42, 14, 45};
+                   ? Color{100, 80, 160, 110}
+                   : Color{45, 40, 55, 50};
     DrawCubeWires({cx, -0.17f, z}, 2.40f, 0.05f, 3.20f, bc);
   }
 }
@@ -5436,24 +6073,36 @@ static void DrawSlotDepressions(int playerIdx, int numOccupied) {
 // highlight: pulsing gold selection ring
 static void DrawCard3DUnit(Vector3 pos, float cw, float dep, float thick,
                             int cardId, bool activated, bool highlight,
-                            bool hasFly, bool hasDash, Color frameCol) {
-  // Fly: card hovers 0.45 units higher
-  float yOff = hasFly ? 0.45f : 0.0f;
+                            bool hasFly, bool hasDash, Color frameCol,
+                            bool canActivate = false, bool cracked = false) {
+  // Fly: card hovers higher with gentle bobbing
+  float yOff = hasFly ? (0.45f + sinf(g_time * 2.0f + pos.x) * 0.08f) : 0.0f;
   Vector3 rpos = {pos.x, pos.y + yOff, pos.z};
 
   if (activated) {
-    // Tapped: rotate 90° around Y axis
+    // Tapped: rotate 90° + ghostly desaturation tint
+    Color ghostBody = {100, 95, 110, 200};
+    Color ghostFrame = {90, 85, 105, 160};
     rlPushMatrix();
     rlTranslatef(rpos.x, rpos.y, rpos.z);
     rlRotatef(90.0f, 0, 1, 0);
-    DrawCube({0, 0, 0}, dep, thick, cw, {45, 30, 18, 255});
-    DrawCubeWires({0, 0, 0}, dep, thick, cw, frameCol);
+    DrawCube({0, 0, 0}, dep, thick, cw, ghostBody);
+    DrawCubeWires({0, 0, 0}, dep, thick, cw, ghostFrame);
     rlPopMatrix();
   } else {
     // Card slab body + art on top face
     DrawCube(rpos, cw, thick, dep, {45, 30, 18, 255});
     DrawCubeWires(rpos, cw, thick, dep, frameCol);
     DrawCardFaceTexture(rpos, cw * 0.5f, dep * 0.5f, cardId, WHITE);
+  }
+
+  // Activatable radiant border (bright pulsing gold wireframe)
+  if (canActivate && !activated) {
+    float glow = sinf(g_time * 4.5f) * 0.5f + 0.5f;
+    DrawCubeWires(rpos, cw + 0.15f, thick + 0.06f, dep + 0.15f,
+                  {255, 230, 80, (unsigned char)(100 + glow * 120)});
+    DrawCubeWires(rpos, cw + 0.30f, thick + 0.10f, dep + 0.30f,
+                  {255, 240, 120, (unsigned char)(30 + glow * 50)});
   }
 
   // Dash keyword: double aura ring (orange spark)
@@ -5465,11 +6114,26 @@ static void DrawCard3DUnit(Vector3 pos, float cw, float dep, float thick,
                   {255, 210, 80, (unsigned char)(25 + pulse * 45)});
   }
 
-  // Fly keyword: blob shadow below the floating card
+  // Fly keyword: blob shadow below the floating card + wind-trail particles
   if (hasFly) {
     float shadowScale = 0.72f + sinf(g_time * 1.4f) * 0.04f;
     DrawCube({pos.x, -0.14f, pos.z},
              cw * shadowScale, 0.01f, dep * shadowScale, {0, 0, 0, 55});
+    // Wind-trail wisps — lightweight cubes instead of spheres
+    if (rand() % 4 == 0) {
+      float ex = rpos.x + ((rand() % 100) * 0.01f - 0.5f) * cw;
+      float ez = rpos.z + ((rand() % 100) * 0.01f - 0.5f) * dep;
+      DrawCube({ex, rpos.y + 0.05f, ez}, 0.08f, 0.03f, 0.08f, {180, 220, 255, 100});
+    }
+  }
+
+  // Cracked overlay (defender survived damage — red pulsing wireframe)
+  if (cracked) {
+    float crack = sinf(g_time * 6.0f) * 0.5f + 0.5f;
+    DrawCubeWires(rpos, cw * 0.95f, thick + 0.02f, dep * 0.95f,
+                  {255, 40, 40, (unsigned char)(80 + crack * 120)});
+    DrawCubeWires(rpos, cw * 0.7f, thick + 0.04f, dep * 0.5f,
+                  {255, 60, 30, (unsigned char)(40 + crack * 60)});
   }
 
   // Selection highlight: pulsing gold ring
@@ -5495,6 +6159,7 @@ static void DrawOblivionPortal3D(Vector3 pos) {
 }
 
 // Screen-space quadratic Bezier targeting arrow (Hearthstone style)
+// g_arrowValid controls color: orange=valid, red=invalid
 static void DrawCombatArrow() {
   if (!g_arrowActive) return;
   Vector2 src  = g_arrowSrc;
@@ -5502,6 +6167,16 @@ static void DrawCombatArrow() {
   Vector2 ctrl = {(src.x + dst.x) * 0.5f,
                   fminf(src.y, dst.y) - 55.0f};
   const int SEGS = 22;
+
+  // Color by validity
+  Color coreCol = g_arrowValid ? Color{255, 160, 40, 255}   // orange
+                               : Color{255, 50, 50, 255};   // red
+  Color glowCol = g_arrowValid ? Color{255, 200, 80, 255}
+                               : Color{255, 80, 60, 255};
+
+  float pulse = sinf((float)GetTime() * 4.0f) * 0.15f + 0.85f; // 0.70–1.0
+
+  // Glow pass (wide, low alpha)
   Vector2 prev = src;
   for (int i = 1; i <= SEGS; i++) {
     float t = (float)i / SEGS;
@@ -5510,19 +6185,51 @@ static void DrawCombatArrow() {
       u * u * src.x + 2 * u * t * ctrl.x + t * t * dst.x,
       u * u * src.y + 2 * u * t * ctrl.y + t * t * dst.y
     };
-    float alpha = 0.5f + 0.5f * t;
-    DrawLineEx(prev, pt, 3.2f, {255, 70, 60, (unsigned char)(alpha * 215)});
+    float alpha = (0.3f + 0.4f * t) * pulse;
+    DrawLineEx(prev, pt, 14.0f, {glowCol.r, glowCol.g, glowCol.b, (unsigned char)(alpha * 80)});
     prev = pt;
   }
-  // Arrow head
+
+  // Core pass (sharp, bright)
+  prev = src;
+  for (int i = 1; i <= SEGS; i++) {
+    float t = (float)i / SEGS;
+    float u = 1.0f - t;
+    Vector2 pt = {
+      u * u * src.x + 2 * u * t * ctrl.x + t * t * dst.x,
+      u * u * src.y + 2 * u * t * ctrl.y + t * t * dst.y
+    };
+    float alpha = (0.5f + 0.5f * t) * pulse;
+    DrawLineEx(prev, pt, 4.5f, {coreCol.r, coreCol.g, coreCol.b, (unsigned char)(alpha * 230)});
+    prev = pt;
+  }
+
+  // Arrow head (larger, glowing)
   Vector2 dir  = Vector2Normalize(Vector2Subtract(dst, ctrl));
   Vector2 perp = {-dir.y, dir.x};
+  unsigned char headA = (unsigned char)(pulse * 240);
+  // Glow head
   DrawTriangle(
-    {dst.x + dir.x * 13,  dst.y + dir.y * 13},
-    {dst.x - dir.x * 6 + perp.x * 8, dst.y - dir.y * 6 + perp.y * 8},
-    {dst.x - dir.x * 6 - perp.x * 8, dst.y - dir.y * 6 - perp.y * 8},
-    {255, 80, 80, 220}
+    {dst.x + dir.x * 18, dst.y + dir.y * 18},
+    {dst.x - dir.x * 8 + perp.x * 12, dst.y - dir.y * 8 + perp.y * 12},
+    {dst.x - dir.x * 8 - perp.x * 12, dst.y - dir.y * 8 - perp.y * 12},
+    {glowCol.r, glowCol.g, glowCol.b, (unsigned char)(headA * 0.35f)}
   );
+  // Core head
+  DrawTriangle(
+    {dst.x + dir.x * 15, dst.y + dir.y * 15},
+    {dst.x - dir.x * 7 + perp.x * 9, dst.y - dir.y * 7 + perp.y * 9},
+    {dst.x - dir.x * 7 - perp.x * 9, dst.y - dir.y * 7 - perp.y * 9},
+    {coreCol.r, coreCol.g, coreCol.b, headA}
+  );
+
+  // Invalid "X" marker at destination
+  if (!g_arrowValid) {
+    float xSz = 10.0f;
+    unsigned char xA = (unsigned char)(pulse * 220);
+    DrawLineEx({dst.x - xSz, dst.y - xSz}, {dst.x + xSz, dst.y + xSz}, 3.5f, {255, 50, 50, xA});
+    DrawLineEx({dst.x + xSz, dst.y - xSz}, {dst.x - xSz, dst.y + xSz}, 3.5f, {255, 50, 50, xA});
+  }
 }
 
 // Visual phase bar: 4 segments (COLLECT→DEVELOP→ACTIVATE→END), active glows
@@ -5562,7 +6269,7 @@ static void DrawPhaseBar(MatchPhase phase, bool isPlayerTurn) {
   float barW  = 290.0f;
   float barH  = 22.0f;
   float startX = SCREEN_W / 2.0f - barW / 2.0f;
-  float y      = 28.0f;  // shifted down to make room for flags above
+  float y      = (float)UI_SAFE;  // top of screen, safe area
   float segW   = barW / numPhases;
 
   DrawRectangleRounded({startX - 4, y - 2, barW + 8, barH + 4},
@@ -5578,13 +6285,14 @@ static void DrawPhaseBar(MatchPhase phase, bool isPlayerTurn) {
     DrawRectangleRounded({sx + 1, y + 1, segW - 2, barH - 2},
                           0.25f, 4, col);
     int tw = MeasureText(labels[i], 8);
-    DrawText(labels[i], (int)(sx + segW / 2 - tw / 2), (int)(y + 7), 8,
+    DrawUI(labels[i], (int)(sx + segW / 2 - tw / 2), (int)(y + 7), 8,
              active ? WHITE : Color{175, 165, 135, 150});
     if (i < numPhases - 1)
       DrawLine((int)(sx + segW), (int)y,
                (int)(sx + segW), (int)(y + barH), {75, 65, 45, 140});
-    // Small phase flag above the bar
-    DrawPhaseFlagIcon(sx + segW / 2.0f, y, phaseColors[i], active);
+    // Active phase indicator dot below text
+    if (active)
+      DrawCircle((int)(sx + segW / 2), (int)(y + barH - 3), 2, WHITE);
   }
 }
 
@@ -5657,14 +6365,45 @@ static void DrawTurnBanner(float timer, int who) {
   const char *label    = playerTurn ? "YOUR TURN"       : "OPPONENT'S TURN";
   int         fontSize = playerTurn ? 22                 : 17;
   int         lw       = MeasureText(label, fontSize);
-  DrawText(label, (int)(bX + bW / 2 - lw / 2), (int)(cy + 10), fontSize, txtCol);
+  DrawUI(label, (int)(bX + bW / 2 - lw / 2), (int)(cy + 10), fontSize, txtCol);
 
   // Sub-label
   const char *sub = playerTurn ? "Draw & Play"  : "Waiting...";
   int subSz = 9;
   int sw    = MeasureText(sub, subSz);
   Color subCol = {rimCol.r, rimCol.g, rimCol.b, (unsigned char)(alpha * 170)};
-  DrawText(sub, (int)(bX + bW / 2 - sw / 2), (int)(cy + 34), subSz, subCol);
+  DrawUI(sub, (int)(bX + bW / 2 - sw / 2), (int)(cy + 34), subSz, subCol);
+}
+
+// Phase transition banner — cinematic slide-in
+static void DrawPhaseBanner() {
+  if (g_phaseBannerTimer <= 0.0f) return;
+  const float totalDur = 1.2f;
+  float elapsed = totalDur - g_phaseBannerTimer;
+
+  // Slide-in (0.3s), hold (0.6s), fade-out (0.3s)
+  float slideT = Clamp(elapsed / 0.3f, 0.0f, 1.0f);
+  float eased = slideT * slideT * (3.0f - 2.0f * slideT);
+  float alpha = (g_phaseBannerTimer < 0.3f) ? g_phaseBannerTimer / 0.3f : 1.0f;
+  unsigned char a8 = (unsigned char)(alpha * 255);
+
+  // Dim scene overlay
+  DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, (unsigned char)(alpha * 60)});
+
+  // Banner bar
+  float bH = 44.0f;
+  float bY = SCREEN_H / 2.0f - bH / 2.0f;
+  float bX = -SCREEN_W + eased * SCREEN_W; // slide from left
+  DrawRectangle((int)bX, (int)bY, SCREEN_W, (int)bH, {12, 8, 5, (unsigned char)(alpha * 220)});
+  // Gold trim
+  DrawLine((int)bX, (int)bY, (int)bX + SCREEN_W, (int)bY, {200, 170, 60, a8});
+  DrawLine((int)bX, (int)(bY + bH), (int)bX + SCREEN_W, (int)(bY + bH), {200, 170, 60, a8});
+
+  // Phase text (centered, gold)
+  int fontSize = 26;
+  int tw = MeasureText(g_phaseBannerText, fontSize);
+  DrawUI(g_phaseBannerText, (int)(bX + SCREEN_W / 2 - tw / 2),
+           (int)(bY + bH / 2 - fontSize / 2), fontSize, {255, 230, 120, a8});
 }
 
 // Orbiting +/- counter orbs around a card (screen-space)
@@ -5680,7 +6419,7 @@ static void DrawCounterOrbs(float sx, float sy, int power, int weak) {
     float ox = cosf(a) * radius;
     float oy = sinf(a) * radius;
     DrawCircle((int)(sx + ox), (int)(sy + oy), 6.0f, {35, 155, 45, 210});
-    DrawText("+", (int)(sx + ox - 4), (int)(sy + oy - 5), 10,
+    DrawUI("+", (int)(sx + ox - 4), (int)(sy + oy - 5), 10,
              {190, 255, 190, 255});
   }
   for (int w = 0; w < weak && idx < 8; w++, idx++) {
@@ -5688,29 +6427,44 @@ static void DrawCounterOrbs(float sx, float sy, int power, int weak) {
     float ox = cosf(a) * radius;
     float oy = sinf(a) * radius;
     DrawCircle((int)(sx + ox), (int)(sy + oy), 6.0f, {155, 35, 45, 210});
-    DrawText("-", (int)(sx + ox - 3), (int)(sy + oy - 5), 10,
+    DrawUI("-", (int)(sx + ox - 3), (int)(sy + oy - 5), 10,
              {255, 190, 190, 255});
   }
 }
 
 // Keyword icon badges rendered below the card name label (screen-space)
 static void DrawKeywordBadges(float sx, float sy, const CardDef &cd) {
-  float bx = sx - 30.0f;
-  float by = sy + 20.0f;
-  auto badge = [&](const char *kw, Color col) {
-    int w = MeasureText(kw, 8);
-    Color bg = {(unsigned char)(col.r / 4), (unsigned char)(col.g / 4),
-                (unsigned char)(col.b / 4), 200};
-    DrawRectangleRounded({bx, by, (float)(w + 6), 13}, 0.5f, 4, bg);
-    DrawRectangleRoundedLinesEx({bx, by, (float)(w + 6), 13},
-                                 0.5f, 4, 1.0f, col);
-    DrawText(kw, (int)(bx + 3), (int)(by + 2), 8, col);
-    bx += (float)(w + 10);
+  // Small 14×14 square icons arranged horizontally above the card
+  const float ICON_SZ = 14.0f, GAP = 2.0f;
+  struct KwIcon { const char *kw; const char *glyph; Color col; };
+  KwIcon icons[] = {
+    {"fly",      "F", {140, 200, 255, 255}},
+    {"dash",     "D", {255, 178,  55, 255}},
+    {"tenacity", "T", { 80, 230,  80, 255}},
+    {"overrun",  "O", {255, 100,  60, 255}},
+    {"harvest",  "H", {200, 180,  60, 255}},
   };
-  if (CardHasKeyword(cd, "fly"))      badge("FLY",  {175, 218, 255, 255});
-  if (CardHasKeyword(cd, "dash"))     badge("DASH", {255, 178,  55, 255});
-  if (CardHasKeyword(cd, "tenacity")) badge("TEN",  { 95, 255,  95, 255});
-  if (CardHasKeyword(cd, "overrun"))  badge("OVR",  {255, 115,  75, 255});
+  int count = 0;
+  for (auto &ic : icons)
+    if (CardHasKeyword(cd, ic.kw)) count++;
+  if (count == 0) return;
+
+  float totalW = count * ICON_SZ + (count - 1) * GAP;
+  float bx = sx - totalW * 0.5f;
+  float by = sy - 28.0f; // above the card, clear of ATK/DEF
+
+  for (auto &ic : icons) {
+    if (!CardHasKeyword(cd, ic.kw)) continue;
+    Color bg = {(unsigned char)(ic.col.r / 5), (unsigned char)(ic.col.g / 5),
+                (unsigned char)(ic.col.b / 5), 210};
+    DrawRectangleRounded({bx, by, ICON_SZ, ICON_SZ}, 0.3f, 4, bg);
+    DrawRectangleRoundedLinesEx({bx, by, ICON_SZ, ICON_SZ}, 0.3f, 4, 1.0f, ic.col);
+    // Center the glyph letter
+    int gw = MeasureText(ic.glyph, 9);
+    DrawUI(ic.glyph, (int)(bx + ICON_SZ * 0.5f - gw * 0.5f),
+             (int)(by + 2), 9, ic.col);
+    bx += ICON_SZ + GAP;
+  }
 }
 
 // "Thinking..." pulsing indicator above AI portrait (shown while AI processes)
@@ -5727,7 +6481,7 @@ static void DrawAIThinkingIndicator() {
                         {22, 17, 12, 215});
   DrawRectangleRoundedLinesEx({bx, 76, (float)(tw + 24), 22}, 0.35f, 4,
                                1.0f, {175, 148, 75, 195});
-  DrawText(buf, (int)bx + 12, 80, 12, {200, 178, 118, 225});
+  DrawUI(buf, (int)bx + 12, 80, 12, {200, 178, 118, 225});
 }
 
 // Draw arena burst particles (2D overlay — called after EndMode3D)
@@ -5974,67 +6728,152 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
   float W = rect.width, H = rect.height;
   float X = rect.x,     Y = rect.y;
 
-  // ── Zone proportions ─────────────────────────────────────────────────────
-  float padX  = W * 0.055f;
-  float iX    = X + padX, iW = W - padX * 2.f;
-  float nameH = H * 0.135f;                      // 0%–13.5%  name band
-  float artT  = Y + nameH;                        // art top
-  float artH  = H * 0.415f;                       // art height (13.5%–55%)
-  float artB  = artT + artH;                       // art bottom
-  float typeH = H * 0.075f;                       // 55%–62.5% type strip
-  float typeB = artB + typeH;
-  float txtT  = typeB;                             // 62.5%–84% text box
-  float txtB  = Y + H * 0.840f;
-  float statT = txtB;                              // 84%–97%  stat band
+  // ══════════════════════════════════════════════════════════════════════════
+  // NORMALIZED LAYOUT — all coordinates relative to card W/H
+  // ══════════════════════════════════════════════════════════════════════════
+  float borderW  = W * 0.045f;           // outer black border thickness
+  float frameW   = W * 0.035f;           // gold frame thickness
+  float inX      = X + borderW + frameW; // inner content left
+  float inW      = W - (borderW + frameW) * 2.f;
+  float inY      = Y + borderW + frameW;
+  float inH      = H - (borderW + frameW) * 2.f;
+
+  // Vertical zones (normalized within inner area)
+  float nameBarH = inH * 0.085f;
+  float artTop   = inY + nameBarH;
+  float artH     = inH * 0.425f;
+  float artBot   = artTop + artH;
+  float typeBarH = inH * 0.060f;
+  float typeBot  = artBot + typeBarH;
+  float effTop   = typeBot;
+  float effH     = inH * 0.255f;
+  float effBot   = effTop + effH;
+  float statH    = inH - nameBarH - artH - typeBarH - effH; // remaining
 
   // Font sizes scaled by card height
   int fsName = Clamp((int)(H / 10.f),   7, 14);
-  int fsStat = Clamp((int)(H /  7.5f),  9, 17);
+  int fsStat = Clamp((int)(H /  6.5f), 10, 20);
   int fsType = Clamp((int)(H / 13.5f),  6, 10);
   int fsKw   = Clamp((int)(H / 12.5f),  6, 11);
   int fsEff  = Clamp((int)(H / 14.5f),  5,  9);
+  int fsRare = Clamp((int)(H / 16.f),   5,  8);
 
-  // ── Drop shadow ───────────────────────────────────────────────────────────
-  DrawRectangleRounded({X + 5, Y + 7, W, H}, 0.10f, 6, {0, 0, 0, 100});
+  // ── Layer 0: Drop shadow ──────────────────────────────────────────────────
+  DrawRectangle((int)(X + 4), (int)(Y + 6), (int)W, (int)H, {0, 0, 0, 110});
 
-  // ── Card body ─────────────────────────────────────────────────────────────
-  DrawRectangleRounded(rect, 0.09f, 8, {22, 14, 7, 255});
+  // ── Layer 1: BLACK OUTER BORDER ───────────────────────────────────────────
+  DrawRectangleRounded(rect, 0.06f, 6, {8, 6, 4, 255});
 
-  // ── Triple gold border (3 layers = depth illusion) ───────────────────────
-  DrawRectangleRoundedLinesEx(rect, 0.09f, 8, 3.5f, {60, 32, 6, 255});            // dark shadow rim
-  DrawRectangleRoundedLinesEx({X+1.5f,Y+1.5f,W-3,H-3}, 0.09f, 8, 2.0f, {215, 170, 45, 255}); // bright gold
-  DrawRectangleRoundedLinesEx({X+3.5f,Y+3.5f,W-7,H-7}, 0.09f, 8, 1.0f, {255, 235, 130, 160}); // pale highlight
-  DrawRectangleRoundedLinesEx({X+5.0f,Y+5.0f,W-10,H-10}, 0.09f, 8, 0.5f, {90, 55, 10, 120}); // inner dark
+  // ── Layer 2: GOLD ORNATE FRAME ────────────────────────────────────────────
+  Rectangle frameRect = {X + borderW, Y + borderW,
+                          W - borderW * 2.f, H - borderW * 2.f};
+  // Base gold fill (the ornate background visible between elements)
+  DrawRectangleRounded(frameRect, 0.04f, 6, {165, 120, 30, 255});
 
-  // ── Name band ────────────────────────────────────────────────────────────
-  // Gradient panel behind name
-  DrawRectangleGradientV((int)iX, (int)Y, (int)iW, (int)(nameH + 1),
-                          {40, 22, 6, 255}, {12, 6, 2, 255});
-  // Gold separator line under name band
-  DrawRectangle((int)iX, (int)(Y + nameH - 1), (int)iW, 2, {190, 148, 38, 220});
-  DrawRectangle((int)iX, (int)(Y + nameH + 1), (int)iW, 1, {80, 50, 8, 140});
-
-  // Card name (centered, gold, shadow beneath)
+  // Procedural ornate pattern — gold filigree tiled over the frame
   {
-    int nw = MeasureText(cd.name, fsName);
-    int nx = (int)(X + W * 0.5f) - nw / 2;
-    int ny = (int)(Y + nameH * 0.22f);
-    DrawText(cd.name, nx + 1, ny + 1, fsName, {0, 0, 0, 160});
-    DrawText(cd.name, nx,     ny,     fsName, {248, 218, 145, 255});
+    float fL = frameRect.x, fT = frameRect.y;
+    float fW = frameRect.width, fH = frameRect.height;
+    float tileS = fmaxf(W * 0.055f, 4.f); // tile size
+    int cols = (int)(fW / tileS) + 1;
+    int rows = (int)(fH / tileS) + 1;
+    for (int r = 0; r < rows; r++) {
+      for (int c = 0; c < cols; c++) {
+        float tx = fL + c * tileS;
+        float ty = fT + r * tileS;
+        // Diamond crosshatch pattern
+        float cx2 = tx + tileS * 0.5f, cy2 = ty + tileS * 0.5f;
+        float hs = tileS * 0.3f;
+        // Subtle dark diamond outlines
+        DrawRectangle((int)(cx2 - hs * 0.15f), (int)(cy2 - hs), (int)(hs * 0.3f), (int)(hs * 2.f), {130, 90, 18, 80});
+        DrawRectangle((int)(cx2 - hs), (int)(cy2 - hs * 0.15f), (int)(hs * 2.f), (int)(hs * 0.3f), {130, 90, 18, 80});
+        // Bright gold dot at center
+        float dotR = tileS * 0.08f;
+        DrawRectangle((int)(cx2 - dotR), (int)(cy2 - dotR), (int)(dotR * 2.f), (int)(dotR * 2.f), {210, 170, 50, 120});
+      }
+    }
+    // Subtle gradient darkening at edges for depth
+    DrawRectangleGradientH((int)fL, (int)fT, (int)(fW * 0.15f), (int)fH, {40, 25, 5, 100}, {40, 25, 5, 0});
+    DrawRectangleGradientH((int)(fL + fW * 0.85f), (int)fT, (int)(fW * 0.15f), (int)fH, {40, 25, 5, 0}, {40, 25, 5, 100});
   }
 
-  // ── Art window ───────────────────────────────────────────────────────────
-  Rectangle artRect = {iX, artT, iW, artH};
-  // Art backing
-  DrawRectangle((int)iX, (int)artT, (int)iW, (int)artH, {15, 10, 4, 255});
+  // Gold frame border lines (triple-layer depth illusion)
+  DrawRectangleRoundedLinesEx(frameRect, 0.04f, 6, 2.5f, {90, 60, 10, 255});
+  DrawRectangleRoundedLinesEx({frameRect.x + 1.5f, frameRect.y + 1.5f,
+                                frameRect.width - 3.f, frameRect.height - 3.f},
+                               0.04f, 6, 1.5f, {225, 185, 55, 255});
+  DrawRectangleRoundedLinesEx({frameRect.x + 3.5f, frameRect.y + 3.5f,
+                                frameRect.width - 7.f, frameRect.height - 7.f},
+                               0.04f, 6, 0.5f, {255, 240, 140, 100});
 
-  // Art texture or procedural fill
+  // ── CORNER FLOURISHES (ornate gold decorations at 4 corners) ──────────────
+  {
+    float fl = W * 0.08f; // flourish length
+    float ft = fmaxf(W * 0.018f, 1.5f); // flourish thickness
+    Color fcD = {120, 85, 15, 255};
+    Color fcB = {225, 185, 55, 255};
+    Color fcH = {255, 235, 130, 180};
+    float cxL = X + borderW * 0.5f, cxR = X + W - borderW * 0.5f;
+    float cyT = Y + borderW * 0.5f, cyB = Y + H - borderW * 0.5f;
+    // Top-left
+    DrawRectangle((int)cxL, (int)cyT, (int)fl, (int)ft, fcD);
+    DrawRectangle((int)cxL, (int)cyT, (int)ft, (int)fl, fcD);
+    DrawRectangle((int)(cxL+1), (int)(cyT+1), (int)(fl-2), (int)(ft-1), fcB);
+    DrawRectangle((int)(cxL+1), (int)(cyT+1), (int)(ft-1), (int)(fl-2), fcB);
+    // Diagonal curl
+    for (int d = 0; d < (int)(fl * 0.4f); d++) {
+      DrawRectangle((int)(cxL + d), (int)(cyT + d), 2, 2, fcH);
+    }
+    // Top-right
+    DrawRectangle((int)(cxR - fl), (int)cyT, (int)fl, (int)ft, fcD);
+    DrawRectangle((int)(cxR - ft), (int)cyT, (int)ft, (int)fl, fcD);
+    DrawRectangle((int)(cxR - fl + 1), (int)(cyT+1), (int)(fl-2), (int)(ft-1), fcB);
+    DrawRectangle((int)(cxR - ft + 1), (int)(cyT+1), (int)(ft-1), (int)(fl-2), fcB);
+    for (int d = 0; d < (int)(fl * 0.4f); d++) {
+      DrawRectangle((int)(cxR - d - 2), (int)(cyT + d), 2, 2, fcH);
+    }
+    // Bottom-left
+    DrawRectangle((int)cxL, (int)(cyB - ft), (int)fl, (int)ft, fcD);
+    DrawRectangle((int)cxL, (int)(cyB - fl), (int)ft, (int)fl, fcD);
+    DrawRectangle((int)(cxL+1), (int)(cyB - ft + 1), (int)(fl-2), (int)(ft-1), fcB);
+    DrawRectangle((int)(cxL+1), (int)(cyB - fl + 1), (int)(ft-1), (int)(fl-2), fcB);
+    for (int d = 0; d < (int)(fl * 0.4f); d++) {
+      DrawRectangle((int)(cxL + d), (int)(cyB - d - 2), 2, 2, fcH);
+    }
+    // Bottom-right
+    DrawRectangle((int)(cxR - fl), (int)(cyB - ft), (int)fl, (int)ft, fcD);
+    DrawRectangle((int)(cxR - ft), (int)(cyB - fl), (int)ft, (int)fl, fcD);
+    DrawRectangle((int)(cxR - fl + 1), (int)(cyB - ft + 1), (int)(fl-2), (int)(ft-1), fcB);
+    DrawRectangle((int)(cxR - ft + 1), (int)(cyB - fl + 1), (int)(ft-1), (int)(fl-2), fcB);
+    for (int d = 0; d < (int)(fl * 0.4f); d++) {
+      DrawRectangle((int)(cxR - d - 2), (int)(cyB - d - 2), 2, 2, fcH);
+    }
+  }
+
+  // ── Layer 3: NAME BAR (dark brown semi-transparent) ───────────────────────
+  DrawRectangleGradientV((int)inX, (int)inY, (int)inW, (int)(nameBarH + 1),
+                          {45, 28, 10, 240}, {20, 12, 4, 250});
+  // Gold separator under name
+  DrawRectangle((int)inX, (int)(inY + nameBarH - 1), (int)inW, 2, {200, 158, 42, 230});
+  DrawRectangle((int)inX, (int)(inY + nameBarH + 1), (int)inW, 1, {80, 50, 8, 140});
+  // Card name centered
+  {
+    int nw = MeasureText(cd.name, fsName);
+    int nx = (int)(inX + inW * 0.5f) - nw / 2;
+    int ny = (int)(inY + nameBarH * 0.18f);
+    DrawUI(cd.name, nx + 1, ny + 1, fsName, {0, 0, 0, 180});
+    DrawUI(cd.name, nx,     ny,     fsName, {248, 220, 150, 255});
+  }
+
+  // ── Layer 4: ART FRAME ────────────────────────────────────────────────────
+  Rectangle artRect = {inX, artTop, inW, artH};
+  DrawRectangle((int)inX, (int)artTop, (int)inW, (int)artH, {12, 8, 4, 255});
+  // Art texture
   {
     Texture2D &tex = (artTexId > 0 && artTexId < 200)
                      ? g_cardTextures[artTexId] : g_cardTextures[0];
     if (tex.id != 0) {
       Rectangle src2 = {0, 0, (float)CARD_TEX_W, (float)CARD_TEX_H};
-      // Shader path for rare/unique (foil) — fallback also looks great
       if (g_cardShader.id > 0 && view.rarity >= 1) {
         float t  = g_time; float rr = (float)view.rarity;
         float pp = view.isPlayable ? 1.f : 0.f;
@@ -6052,24 +6891,19 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
       }
     }
   }
-
-  // Art border: outer dark then inner gold (embossed look)
-  DrawRectangleLinesEx(artRect, 2.5f, {50, 30, 8, 255});
-  DrawRectangleLinesEx({iX+2.f, artT+2.f, iW-4.f, artH-4.f}, 1.5f, {190, 150, 40, 200});
-  DrawRectangleLinesEx({iX+4.f, artT+4.f, iW-8.f, artH-8.f}, 0.5f, {255, 220, 100, 80});
-
+  // Art frame border: dark inner shadow + gold edge
+  DrawRectangleLinesEx(artRect, 2.5f, {30, 18, 5, 255});
+  DrawRectangleLinesEx({inX + 2.f, artTop + 2.f, inW - 4.f, artH - 4.f},
+                        1.5f, {195, 155, 42, 210});
   // Unplayable dimmer
   if (!view.isPlayable)
-    DrawRectangle((int)iX, (int)artT, (int)iW, (int)artH, {0, 0, 0, 90});
+    DrawRectangle((int)inX, (int)artTop, (int)inW, (int)artH, {0, 0, 0, 80});
 
-  // ── Type strip ───────────────────────────────────────────────────────────
-  // Color depends on card type: warm amber for unit, cool blue for support
-  Color typeBase = cd.isUnit ? Color{55, 30, 8, 245} : Color{15, 38, 60, 245};
-  DrawRectangle((int)iX, (int)artB, (int)iW, (int)typeH, typeBase);
-  DrawRectangle((int)iX, (int)artB,       (int)iW, 1, {200, 155, 45, 180});
-  DrawRectangle((int)iX, (int)(artB + typeH - 1), (int)iW, 1, {200, 155, 45, 150});
-
-  // Type text: "UNIT - Subtype" or "SUPPORT"
+  // ── Layer 5: TYPE BAR (dark brown, "TYPE – SUBTYPE") ──────────────────────
+  Color typeCol = cd.isUnit ? Color{50, 28, 8, 245} : Color{15, 35, 55, 245};
+  DrawRectangle((int)inX, (int)artBot, (int)inW, (int)typeBarH, typeCol);
+  DrawRectangle((int)inX, (int)artBot, (int)inW, 1, {200, 160, 45, 200});
+  DrawRectangle((int)inX, (int)(artBot + typeBarH - 1), (int)inW, 1, {200, 160, 45, 160});
   {
     char typeBuf[48];
     if (cd.isUnit && cd.subtype && cd.subtype[0])
@@ -6077,23 +6911,24 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
     else
       snprintf(typeBuf, 48, cd.isUnit ? "Unit" : "Support");
     int tw2 = MeasureText(typeBuf, fsType);
-    DrawText(typeBuf, (int)(iX + iW * 0.5f - tw2 * 0.5f),
-             (int)(artB + typeH * 0.15f), fsType, {225, 200, 140, 240});
+    DrawUI(typeBuf, (int)(inX + inW * 0.5f - tw2 * 0.5f),
+             (int)(artBot + typeBarH * 0.15f), fsType, {230, 205, 145, 245});
   }
 
-  // ── Text box ─────────────────────────────────────────────────────────────
-  DrawRectangle((int)iX, (int)txtT, (int)iW, (int)(txtB - txtT), {10, 6, 3, 245});
-  DrawRectangle((int)iX, (int)typeB, (int)iW, 1, {140, 105, 28, 160});
+  // ── Layer 6: EFFECT TEXT BOX (dark brown/black) ───────────────────────────
+  DrawRectangleGradientV((int)inX, (int)effTop, (int)inW, (int)effH,
+                          {15, 10, 5, 245}, {8, 5, 2, 250});
+  DrawRectangle((int)inX, (int)effTop, (int)inW, 1, {150, 110, 30, 160});
 
   if (H > 70.f) {
-    float tbMaxW = iW - 4.f;
-    float curY   = txtT + 2.f;
-    float tbBot  = txtB - 2.f;
+    float tbMaxW = inW - 6.f;
+    float curY   = effTop + 3.f;
+    float tbBot  = effBot - 3.f;
 
-    // Keywords (teal italic-style pills)
+    // Keywords (teal bold)
     if (cd.keywords && cd.keywords[0]) {
       static const struct { const char *id; const char *label; } KW[] = {
-        {"fly","Flight"},{"dash","Haste"},{"tenacity","Tenacity"},
+        {"fly","Flight"},{"dash","Dash"},{"tenacity","Tenacity"},
         {"overrun","Trample"},{"harvest","Harvest"},{"dig","Dig"},{nullptr,nullptr}
       };
       char kwLine[80] = {};
@@ -6110,11 +6945,12 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
         first = false; *e = sv; p = (*e) ? e + 1 : e;
       }
       strncat(kwLine, ".", sizeof(kwLine) - strlen(kwLine) - 1);
-      DrawText(kwLine, (int)(iX + 2), (int)curY, fsKw, {95, 215, 185, 255});
+      int kwW = MeasureText(kwLine, fsKw);
+      DrawUI(kwLine, (int)(inX + inW * 0.5f - kwW * 0.5f), (int)curY, fsKw, {240, 220, 170, 255});
       curY += fsKw + 3;
     }
 
-    // Effect text — word-wrap
+    // Effect text — word-wrapped, center-aligned
     if (cd.effect && cd.effect[0] && curY < tbBot) {
       char effTmp[128]; snprintf(effTmp, 128, "%s", cd.effect);
       char *p = effTmp;
@@ -6124,135 +6960,160 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
       while (*p && curY + lineH <= tbBot) {
         int len = (int)strlen(p);
         if (len <= maxC) {
-          DrawText(p, (int)(iX + 2), (int)curY, fsEff, {210, 192, 158, 225});
+          int lw = MeasureText(p, fsEff);
+          DrawUI(p, (int)(inX + inW * 0.5f - lw * 0.5f), (int)curY, fsEff, {215, 198, 165, 230});
           break;
         }
         int brk = maxC;
         for (int j = maxC; j > 1; j--) if (p[j] == ' ') { brk = j; break; }
         char row[128]; memcpy(row, p, brk); row[brk] = '\0';
-        DrawText(row, (int)(iX + 2), (int)curY, fsEff, {210, 192, 158, 225});
+        int rw2 = MeasureText(row, fsEff);
+        DrawUI(row, (int)(inX + inW * 0.5f - rw2 * 0.5f), (int)curY, fsEff, {215, 198, 165, 230});
         p += brk; if (*p == ' ') p++;
         curY += lineH;
       }
     }
-
-    // Card number (bottom of text box, dim gray)
-    {
-      char numBuf[16]; snprintf(numBuf, 16, "%d/%d", cd.id, NUM_ALL_CARDS);
-      int nw2 = MeasureText(numBuf, fsEff - 1);
-      DrawText(numBuf, (int)(X + W * 0.5f - nw2 * 0.5f),
-               (int)(txtB - fsEff - 1), fsEff - 1, {120, 100, 72, 160});
-    }
   }
 
-  // ── Stat band divider line ────────────────────────────────────────────────
-  DrawRectangle((int)iX, (int)statT, (int)iW, 1, {185, 144, 35, 210});
+  // ── Layer 7: STAT BAND + RARITY ───────────────────────────────────────────
+  float statTop = effBot;
+  // Gold separator
+  DrawRectangle((int)inX, (int)statTop, (int)inW, 2, {195, 150, 38, 220});
 
-  // ── Cost coin (top-left corner, overlapping border) ──────────────────────
+  // ── COST COIN (top-left, overlapping frame) ───────────────────────────────
   {
     float gR  = W * 0.115f;
-    float gCX = X + padX * 0.35f + gR;
-    float gCY = Y + nameH * 0.5f;
+    float gCX = X + borderW + frameW * 0.3f + gR;
+    float gCY = Y + borderW + frameW * 0.3f + gR;
     float sh  = sinf(g_time * 4.f) * 0.5f + 0.5f;
+    // Drop shadow
+    DrawCircle((int)(gCX + 2), (int)(gCY + 2), (int)(gR + 1.f), {0, 0, 0, 100});
     // Outer dark ring
-    DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {50, 24, 4, 255});
-    // Gold coin layers (dark gold -> bright gold -> highlight)
-    DrawCircle((int)gCX, (int)gCY, (int)(gR),         {140, 105, 15, 255});
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.88f), {195, 155, 30, 255});
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.72f), {220, 185, 45, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {60, 35, 6, 255});
+    // Gold coin layers
+    DrawCircle((int)gCX, (int)gCY, (int)(gR),         {145, 110, 18, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.88f), {200, 160, 35, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.72f), {225, 190, 50, 255});
     // Inner bright center
     DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.40f),
-               {(unsigned char)(235 + (int)(20*sh)), (unsigned char)(210 + (int)(25*sh)),
-                (unsigned char)(80 + (int)(40*sh)), 255});
-    // Coin rim highlight (top-left glint)
-    DrawCircle((int)(gCX - gR * 0.28f), (int)(gCY - gR * 0.30f),
-               (int)(gR * 0.20f), {255, 245, 180, (unsigned char)(140 + (int)(60*sh))});
-    // Coin edge notch (subtle inner ring)
-    DrawCircleLines((int)gCX, (int)gCY, (int)(gR * 0.60f), {120, 85, 10, 120});
+               {(unsigned char)(240 + (int)(15*sh)), (unsigned char)(215 + (int)(20*sh)),
+                (unsigned char)(85 + (int)(35*sh)), 255});
+    // Top-left glint
+    DrawCircle((int)(gCX - gR * 0.25f), (int)(gCY - gR * 0.28f),
+               (int)(gR * 0.18f), {255, 248, 190, (unsigned char)(150 + (int)(50*sh))});
+    // Inner ring
+    DrawCircleLines((int)gCX, (int)gCY, (int)(gR * 0.58f), {130, 90, 14, 130});
     // Cost number
     char costB[4]; snprintf(costB, 4, "%d", view.cost);
     int cfs = Clamp((int)(gR * 1.5f), 8, 15);
     int cw  = MeasureText(costB, cfs);
-    DrawText(costB, (int)(gCX - cw * 0.5f + 1), (int)(gCY - cfs * 0.5f + 1), cfs, {60, 35, 5, 180});
-    DrawText(costB, (int)(gCX - cw * 0.5f),     (int)(gCY - cfs * 0.5f),     cfs, {255, 250, 220, 255});
+    DrawUI(costB, (int)(gCX - cw * 0.5f + 1), (int)(gCY - cfs * 0.5f + 1), cfs, {60, 35, 5, 180});
+    DrawUI(costB, (int)(gCX - cw * 0.5f),     (int)(gCY - cfs * 0.5f),     cfs, {255, 252, 225, 255});
   }
 
-  // ── Rarity gem (top-right corner) ────────────────────────────────────────
-  if (view.rarity > 0) {
-    float gR  = W * 0.100f;
-    float gCX = X + W - padX * 0.35f - gR;
-    float gCY = Y + nameH * 0.5f;
-    float sh  = sinf(g_time * 5.f) * 0.5f + 0.5f;
+  // ── ATK DIAMOND (bottom-left, red) ────────────────────────────────────────
+  if (cd.isUnit) {
+    float iconS = W * 0.17f; // icon size
+    float aCX = inX + iconS * 0.6f;
+    float aCY = statTop + statH * 0.5f;
+    float dh = iconS * 0.65f, dw2 = iconS * 0.45f;
+    // Shadow
+    DrawTriangle({aCX + 1, aCY - dh + 2}, {aCX + dw2 + 1, aCY + 2}, {aCX - dw2 + 1, aCY + 2}, {0,0,0,80});
+    DrawTriangle({aCX + 1, aCY + dh + 2}, {aCX - dw2 + 1, aCY + 2}, {aCX + dw2 + 1, aCY + 2}, {0,0,0,80});
+    // Red diamond — top half
+    DrawTriangle({aCX, aCY - dh}, {aCX + dw2, aCY}, {aCX - dw2, aCY}, {160, 30, 25, 255});
+    // Red diamond — bottom half
+    DrawTriangle({aCX, aCY + dh}, {aCX - dw2, aCY}, {aCX + dw2, aCY}, {130, 20, 18, 255});
+    // Highlight edge
+    DrawTriangle({aCX, aCY - dh + 2}, {aCX + dw2 - 2, aCY}, {aCX - dw2 + 2, aCY}, {200, 55, 40, 180});
+    // Inner diamond (lighter)
+    float id2 = dh * 0.55f, iw2 = dw2 * 0.55f;
+    DrawTriangle({aCX, aCY - id2}, {aCX + iw2, aCY}, {aCX - iw2, aCY}, {185, 45, 35, 200});
+    DrawTriangle({aCX, aCY + id2}, {aCX - iw2, aCY}, {aCX + iw2, aCY}, {155, 35, 28, 200});
+    // ATK number (white with black outline)
+    char buf[8]; snprintf(buf, 8, "%d", view.atk);
+    int aw = MeasureText(buf, fsStat);
+    int ax = (int)(aCX - aw * 0.5f);
+    int ay = (int)(aCY - fsStat * 0.45f);
+    // Black outline (4 directions)
+    DrawUI(buf, ax-1, ay,   fsStat, {0, 0, 0, 220});
+    DrawUI(buf, ax+1, ay,   fsStat, {0, 0, 0, 220});
+    DrawUI(buf, ax,   ay-1, fsStat, {0, 0, 0, 220});
+    DrawUI(buf, ax,   ay+1, fsStat, {0, 0, 0, 220});
+    DrawUI(buf, ax,   ay,   fsStat, {255, 255, 255, 255});
+  }
 
+  // ── DEF SHIELD (bottom-right, blue) ───────────────────────────────────────
+  if (cd.isUnit) {
+    float iconS = W * 0.17f;
+    float dCX = inX + inW - iconS * 0.6f;
+    float dCY = statTop + statH * 0.5f;
+    float sw = iconS * 0.50f, sh2 = iconS * 0.62f;
+    // Shield shape: top rounded rectangle + bottom pointed triangle
+    // Shadow
+    DrawRectangle((int)(dCX - sw + 2), (int)(dCY - sh2 * 0.5f + 2), (int)(sw * 2), (int)(sh2 * 0.7f), {0,0,0,80});
+    DrawTriangle({dCX + 2, dCY + sh2 + 2}, {dCX - sw + 2, dCY + sh2 * 0.2f + 2}, {dCX + sw + 2, dCY + sh2 * 0.2f + 2}, {0,0,0,80});
+    // Shield body (dark blue)
+    DrawRectangle((int)(dCX - sw), (int)(dCY - sh2 * 0.5f), (int)(sw * 2), (int)(sh2 * 0.7f), {30, 55, 140, 255});
+    // Shield bottom point
+    DrawTriangle({dCX, dCY + sh2}, {dCX - sw, dCY + sh2 * 0.2f}, {dCX + sw, dCY + sh2 * 0.2f}, {25, 45, 120, 255});
+    // Highlight (lighter inner shield)
+    float m = 0.75f;
+    DrawRectangle((int)(dCX - sw*m), (int)(dCY - sh2 * 0.5f * m), (int)(sw * 2 * m), (int)(sh2 * 0.7f * m), {50, 80, 170, 200});
+    DrawTriangle({dCX, dCY + sh2 * m}, {dCX - sw * m, dCY + sh2 * 0.2f * m}, {dCX + sw * m, dCY + sh2 * 0.2f * m}, {40, 65, 150, 200});
+    // Shield rim
+    DrawRectangleLinesEx({dCX - sw, dCY - sh2 * 0.5f, sw * 2, sh2 * 0.7f}, 1.f, {80, 120, 210, 200});
+    // DEF number (white with black outline)
+    char buf[8]; snprintf(buf, 8, "%d", view.def);
+    int dw3 = MeasureText(buf, fsStat);
+    int dx3 = (int)(dCX - dw3 * 0.5f);
+    int dy3 = (int)(dCY - fsStat * 0.35f);
+    DrawUI(buf, dx3-1, dy3,   fsStat, {0, 0, 0, 220});
+    DrawUI(buf, dx3+1, dy3,   fsStat, {0, 0, 0, 220});
+    DrawUI(buf, dx3,   dy3-1, fsStat, {0, 0, 0, 220});
+    DrawUI(buf, dx3,   dy3+1, fsStat, {0, 0, 0, 220});
+    DrawUI(buf, dx3,   dy3,   fsStat, {255, 255, 255, 255});
+  }
+
+  // ── RARITY TEXT (bottom center) ───────────────────────────────────────────
+  {
+    const char *rarityLabel;
+    Color rarityCol;
+    if (view.rarity == 2)      { rarityLabel = "UNIQUE"; rarityCol = {255, 215, 60, 255}; }
+    else if (view.rarity == 1) { rarityLabel = "RARE";   rarityCol = {200, 200, 210, 255}; }
+    else                       { rarityLabel = "COMMON"; rarityCol = {220, 210, 195, 255}; }
+    int rw2 = MeasureText(rarityLabel, fsRare);
+    int rx2 = (int)(inX + inW * 0.5f - rw2 * 0.5f);
+    int ry2 = (int)(statTop + statH - fsRare - 2);
+    DrawUI(rarityLabel, rx2 + 1, ry2 + 1, fsRare, {0, 0, 0, 150});
+    DrawUI(rarityLabel, rx2,     ry2,     fsRare, rarityCol);
+  }
+
+  // ── Rarity gem (top-right corner, small) ──────────────────────────────────
+  if (view.rarity > 0) {
+    float gR  = W * 0.065f;
+    float gCX = X + W - borderW - frameW * 0.3f - gR;
+    float gCY = Y + borderW + frameW * 0.3f + gR;
     Color c1 = (view.rarity == 2) ? Color{130, 40, 20, 255}  : Color{120, 90, 10, 255};
     Color c2 = (view.rarity == 2) ? Color{220, 80, 40, 255}  : Color{210, 168, 40, 255};
     Color c3 = (view.rarity == 2) ? Color{255, 145, 80, 255} : Color{255, 230, 100, 255};
-
-    DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {50, 24, 4, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR + 1.5f), {50, 24, 4, 255});
     DrawCircle((int)gCX, (int)gCY, (int)(gR),         c1);
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.68f), c2);
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.36f), c3);
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.65f), c2);
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.30f), c3);
     if (view.rarity == 2) {
-      // Animated shimmer for unique cards
-      Color shimmer = {255, (unsigned char)(190 + (int)(65 * sh)),
-                            (unsigned char)(80  + (int)(120 * sh)), 200};
-      DrawCircle((int)(gCX - gR * 0.2f), (int)(gCY - gR * 0.25f),
-                 (int)(gR * 0.22f), shimmer);
+      float sh2 = sinf(g_time * 5.f) * 0.5f + 0.5f;
+      DrawCircle((int)(gCX - gR * 0.18f), (int)(gCY - gR * 0.22f),
+                 (int)(gR * 0.20f), {255, (unsigned char)(190 + (int)(65*sh2)),
+                                          (unsigned char)(80 + (int)(120*sh2)), 200});
     }
-    // Rarity label
-    const char *rlbl = (view.rarity == 2) ? "U" : "R";
-    int rfs = Clamp((int)(gR * 1.4f), 7, 13);
-    int rw  = MeasureText(rlbl, rfs);
-    DrawText(rlbl, (int)(gCX - rw * 0.5f), (int)(gCY - rfs * 0.5f), rfs, {255, 245, 210, 255});
-
-    // Star pips below gem
-    int stars = view.rarity + 1;
-    float sY = gCY + gR + 3.f, sGap = 5.5f, sW = 3.5f;
-    float sX0 = gCX - (stars * sGap - (sGap - sW)) * 0.5f;
-    Color sc = (view.rarity == 2) ? Color{220, 130, 255, 235} : Color{220, 185, 55, 225};
-    for (int s = 0; s < stars; s++)
-      DrawRectangle((int)(sX0 + s * sGap), (int)sY, (int)sW, (int)sW, sc);
   }
 
-  // ── ATK / DEF stat badges (bottom band) ──────────────────────────────────
-  if (cd.isUnit) {
-    float bH  = H * 0.115f;
-    float bW  = iW * 0.425f;
-    float bY  = statT + (H * 0.13f - bH) * 0.5f;
-
-    // ATK badge — crimson left
-    Rectangle atkR = {iX, bY, bW, bH};
-    DrawRectangleRounded(atkR, 0.30f, 4, {75, 12, 10, 255});
-    DrawRectangleRounded(atkR, 0.30f, 4, {130, 25, 22, 200});
-    DrawRectangleRoundedLinesEx(atkR, 0.30f, 4, 1.5f, {215, 70, 50, 255});
-    DrawRectangleRoundedLinesEx({atkR.x+1,atkR.y+1,atkR.width-2,atkR.height-2},
-                                 0.30f, 4, 0.5f, {255, 160, 140, 80});
-
-    int sfs = Clamp((int)(bH * 0.65f), 7, 12);
-    DrawText("ATK", (int)(atkR.x + 4), (int)(atkR.y + 2),           sfs - 2, {255, 150, 130, 210});
-    char buf[8]; snprintf(buf, 8, "%d", view.atk);
-    int aw = MeasureText(buf, sfs);
-    DrawText(buf, (int)(atkR.x + bW - aw - 5), (int)(atkR.y + (bH - sfs) * 0.5f), sfs, {255, 242, 200, 255});
-
-    // DEF badge — teal right
-    Rectangle defR = {iX + iW - bW, bY, bW, bH};
-    DrawRectangleRounded(defR, 0.30f, 4, {8, 45, 35, 255});
-    DrawRectangleRounded(defR, 0.30f, 4, {16, 72, 58, 200});
-    DrawRectangleRoundedLinesEx(defR, 0.30f, 4, 1.5f, {40, 190, 150, 255});
-    DrawRectangleRoundedLinesEx({defR.x+1,defR.y+1,defR.width-2,defR.height-2},
-                                 0.30f, 4, 0.5f, {100, 255, 210, 80});
-
-    DrawText("DEF", (int)(defR.x + 4), (int)(defR.y + 2),           sfs - 2, {80, 230, 195, 210});
-    snprintf(buf, 8, "%d", view.def);
-    int dw = MeasureText(buf, sfs);
-    DrawText(buf, (int)(defR.x + bW - dw - 5), (int)(defR.y + (bH - sfs) * 0.5f), sfs, {195, 255, 225, 255});
-  }
-
-  // ── Playable green glow ring ──────────────────────────────────────────────
+  // ── Playable green glow ───────────────────────────────────────────────────
   if (view.isPlayable) {
     float pulse = sinf(g_time * 4.5f) * 0.28f + 0.72f;
     unsigned char ga = (unsigned char)(160 * pulse);
-    DrawRectangleRoundedLinesEx({X - 2, Y - 2, W + 4, H + 4}, 0.09f, 8, 2.5f,
+    DrawRectangleRoundedLinesEx({X - 2, Y - 2, W + 4, H + 4}, 0.06f, 6, 2.5f,
       {50, (unsigned char)(205 * pulse), 100, ga});
   }
 }
@@ -6298,38 +7159,46 @@ static void DrawMatchScene() {
   DrawArenaBackground();
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  3D TABLE SCENE  (60-degree perspective, desert hardwood table)
+  //  3D TABLE SCENE  (60-degree perspective, dark stone arena)
   // ══════════════════════════════════════════════════════════════════════════
   BeginMode3D(g_matchCam);
 
-  // ── Table body (desert hardwood) ──────────────────────────────────────────
-  DrawCube({0, -1.2f, 0.5f}, 28, 2.0f, 20, {68, 40, 17, 255});
-  DrawCubeWires({0, -1.2f, 0.5f}, 28, 2.0f, 20, {90, 55, 24, 255});
+  // ── Table body (dark stone arena slab) ───────────────────────────────────
+  DrawCube({0, -1.2f, 0.5f}, 28, 2.0f, 20, {38, 34, 42, 255});
+  DrawCubeWires({0, -1.2f, 0.5f}, 28, 2.0f, 20, {55, 48, 58, 255});
 
-  // Table legs (key light: left side slightly brighter)
-  float legH = 4.0f, legR = 0.40f;
-  DrawCylinder({-12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR, legH, 6, {52, 30, 11, 255});
-  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR, legH, 6, {46, 26,  9, 255});
-  DrawCylinder({-12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR, legH, 6, {52, 30, 11, 255});
-  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR, legH, 6, {46, 26,  9, 255});
+  // Stone pedestal legs (thick, angular)
+  float legH = 3.5f, legR = 0.55f;
+  DrawCylinder({-12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR * 1.2f, legH, 6, {32, 28, 36, 255});
+  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f, -8.5f}, legR, legR * 1.2f, legH, 6, {28, 24, 32, 255});
+  DrawCylinder({-12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR * 1.2f, legH, 6, {32, 28, 36, 255});
+  DrawCylinder({ 12.5f, -2.2f - legH * 0.5f,  9.5f}, legR, legR * 1.2f, legH, 6, {28, 24, 32, 255});
 
-  // Felt surface
-  DrawCube({0, -0.15f, 0.5f}, 26, 0.08f, 18, {20, 56, 30, 255});
-  // Gold edge trim
-  DrawCubeWires({0, -0.10f, 0.5f}, 26.2f, 0.12f, 18.2f, {182, 152, 62, 200});
-  // Centre dividing gold strip
-  DrawCube({0, -0.10f, 0.5f}, 24, 0.02f, 0.09f, {182, 152, 62, 190});
+  // Stone playing surface (dark weathered stone)
+  DrawCube({0, -0.15f, 0.5f}, 26, 0.10f, 18, {48, 42, 52, 255});
+  // Stone edge trim (carved border)
+  DrawCubeWires({0, -0.10f, 0.5f}, 26.2f, 0.14f, 18.2f, {72, 62, 78, 200});
+  // Stone inlay grooves (subtle texture lines)
+  for (int i = -3; i <= 3; i++) {
+    float gx = i * 3.5f;
+    DrawCube({gx, -0.09f, 0.5f}, 0.04f, 0.01f, 17.0f, {35, 30, 40, 120});
+  }
 
-  // Zone area felt shading
-  DrawCube({0, -0.12f, -2.5f}, 18, 0.01f, 4.0f, {15, 46, 25, 255});
-  DrawCube({0, -0.12f,  3.5f}, 18, 0.01f, 4.0f, {15, 46, 25, 255});
+  // Zone area darkened stone
+  DrawCube({0, -0.12f, -2.5f}, 18, 0.01f, 4.0f, {35, 30, 40, 255});
+  DrawCube({0, -0.12f,  3.5f}, 18, 0.01f, 4.0f, {35, 30, 40, 255});
 
-  // Corner markers
-  float cmY = -0.09f;
-  DrawSphere({-9.0f, cmY, -4.5f}, 0.12f, {182, 152, 62, 148});
-  DrawSphere({ 9.0f, cmY, -4.5f}, 0.12f, {182, 152, 62, 148});
-  DrawSphere({-9.0f, cmY,  5.5f}, 0.12f, {182, 152, 62, 148});
-  DrawSphere({ 9.0f, cmY,  5.5f}, 0.12f, {182, 152, 62, 148});
+  // ── Arena runes (glow between fields, color by phase) ──────────────────
+  DrawArenaRunes(m.phase);
+
+  // Corner ward stones (glowing)
+  float cmY = -0.06f;
+  float wardPulse = sinf(g_time * 2.5f) * 0.5f + 0.5f;
+  Color wardCol = {140, 120, 180, (unsigned char)(120 + wardPulse * 80)};
+  DrawSphere({-9.0f, cmY, -4.5f}, 0.15f, wardCol);
+  DrawSphere({ 9.0f, cmY, -4.5f}, 0.15f, wardCol);
+  DrawSphere({-9.0f, cmY,  5.5f}, 0.15f, wardCol);
+  DrawSphere({ 9.0f, cmY,  5.5f}, 0.15f, wardCol);
 
   // ── Slot depressions (5 per side, always visible) ─────────────────────────
   DrawSlotDepressions(0, human.fieldSize);
@@ -6341,6 +7210,7 @@ static void DrawMatchScene() {
   // ── AI field units ─────────────────────────────────────────────────────────
   for (int i = 0; i < ai.fieldSize; i++) {
     FieldUnit &fu = ai.field[i];
+    if (fu.deploying) continue; // hide until play animation completes
     Vector3 pos3  = GetFieldSlotPos(1, i, ai.fieldSize);
     const CardDef &cd = GetCard(fu.cardId);
     bool hasFly  = CardHasKeyword(cd, "fly");
@@ -6348,12 +7218,14 @@ static void DrawMatchScene() {
     Color frame  = fu.isDefender ? Color{55, 55, 200, 255} : Color{200, 162, 72, 255};
     if (i == g_matchHoverEnemyField) frame = {255, 100, 80, 255};
     DrawCard3DUnit(pos3, CW, CDEP, CTHK, fu.cardId, fu.activated,
-                   (i == g_matchHoverEnemyField), hasFly, hasDash, frame);
+                   (i == g_matchHoverEnemyField), hasFly, hasDash, frame,
+                   fu.canActivate, fu.cracked);
   }
 
   // ── Player field units ────────────────────────────────────────────────────
   for (int i = 0; i < human.fieldSize; i++) {
     FieldUnit &fu = human.field[i];
+    if (fu.deploying) continue; // hide until play animation completes
     Vector3 pos3  = GetFieldSlotPos(0, i, human.fieldSize);
     const CardDef &cd = GetCard(fu.cardId);
     bool hasFly  = CardHasKeyword(cd, "fly");
@@ -6363,7 +7235,8 @@ static void DrawMatchScene() {
                        ? Color{255, 222, 82, 255} : Color{122, 102, 62, 255};
     if (fu.isDefender) frame = {62, 102, 222, 255};
     DrawCard3DUnit(pos3, CW, CDEP, CTHK, fu.cardId, fu.activated,
-                   sel, hasFly, hasDash, frame);
+                   sel, hasFly, hasDash, frame,
+                   fu.canActivate, fu.cracked);
   }
 
   // ── AI face-down hand cards (top edge of table, patterned card backs) ───────
@@ -6454,7 +7327,7 @@ static void DrawMatchScene() {
     MatchPlayer &mp = m.players[side];
     for (int i = 0; i < mp.fieldSize; i++) {
       FieldUnit &fu = mp.field[i];
-      if (fu.pendingDeath) continue; // being destroyed — anim handles rendering
+      if (fu.pendingDeath || fu.deploying) continue; // anim handles rendering
       const CardDef &cd = GetCard(fu.cardId);
       Vector3 pos3 = GetFieldSlotPos(side, i, mp.fieldSize);
       if (CardHasKeyword(cd, "fly")) pos3.y += 0.45f;
@@ -6465,47 +7338,46 @@ static void DrawMatchScene() {
       if (ea < 0) ea = 0;
       if (ed < 0) ed = 0;
 
-      // ── ATK / DEF pill badge ──────────────────────────────────────────────
+      // ── ATK / DEF pill badge (large, always visible) ─────────────────────
       // Left shield: ATK (red-orange)
       {
         char buf[8]; snprintf(buf, 8, "%d", ea);
-        int w = MeasureText(buf, 11);
-        float bx = sp.x - 28 - w * 0.5f, by = sp.y + 14;
-        Color bg = (fu.powerCounters > 0) ? Color{20,60,15,220}
-                 : (fu.weakCounters  > 0) ? Color{60,15,15,220}
-                                          : Color{65,20,18,215};
-        DrawRectangleRounded({bx, by, (float)(w + 10), 16}, 0.55f, 4, bg);
-        DrawRectangleRoundedLinesEx({bx, by, (float)(w + 10), 16}, 0.55f, 4,
-                                     1.0f, {220, 100, 80, 200});
-        DrawText(buf, (int)(bx + 5), (int)(by + 2), 11,
-                 {255, 190, 160, 255});
+        int w = MeasureText(buf, 16);
+        float bx = sp.x - 32 - w * 0.5f, by = sp.y + 16;
+        Color bg = (fu.powerCounters > 0) ? Color{20,70,15,240}
+                 : (fu.weakCounters  > 0) ? Color{70,15,15,240}
+                                          : Color{75,20,18,235};
+        DrawRectangleRounded({bx - 2, by - 1, (float)(w + 16), 22}, 0.55f, 4, bg);
+        DrawRectangleRoundedLinesEx({bx - 2, by - 1, (float)(w + 16), 22}, 0.55f, 4,
+                                     1.5f, {255, 110, 80, 240});
+        DrawUI(buf, (int)(bx + 5), (int)(by + 2), 16,
+                 {255, 200, 170, 255});
       }
       // Right shield: DEF (blue-green)
       {
         char buf[8]; snprintf(buf, 8, "%d", ed);
-        int w = MeasureText(buf, 11);
-        float bx = sp.x + 18 - w * 0.5f, by = sp.y + 14;
-        Color bg = (fu.powerCounters > 0) ? Color{15,55,20,220}
-                 : (fu.weakCounters  > 0) ? Color{55,15,15,220}
-                                          : Color{15,40,62,215};
-        DrawRectangleRounded({bx, by, (float)(w + 10), 16}, 0.55f, 4, bg);
-        DrawRectangleRoundedLinesEx({bx, by, (float)(w + 10), 16}, 0.55f, 4,
-                                     1.0f, {80, 180, 240, 200});
-        DrawText(buf, (int)(bx + 5), (int)(by + 2), 11,
-                 {170, 225, 255, 255});
+        int w = MeasureText(buf, 16);
+        float bx = sp.x + 20 - w * 0.5f, by = sp.y + 16;
+        Color bg = (fu.powerCounters > 0) ? Color{15,65,20,240}
+                 : (fu.weakCounters  > 0) ? Color{65,15,15,240}
+                                          : Color{15,45,72,235};
+        DrawRectangleRounded({bx - 2, by - 1, (float)(w + 16), 22}, 0.55f, 4, bg);
+        DrawRectangleRoundedLinesEx({bx - 2, by - 1, (float)(w + 16), 22}, 0.55f, 4,
+                                     1.5f, {80, 200, 255, 240});
+        DrawUI(buf, (int)(bx + 5), (int)(by + 2), 16,
+                 {180, 235, 255, 255});
       }
 
-      // Keyword badges
-      DrawKeywordBadges(sp.x, sp.y - 8, cd);
+      // Keyword icons (small squares above card, clear of ATK/DEF)
+      DrawKeywordBadges(sp.x, sp.y, cd);
 
-      // Defender badge (blue pill above card)
+      // Defender icon (runtime state, not a card keyword)
       if (fu.isDefender) {
-        DrawRectangleRounded({sp.x - 20, sp.y - 46, 40, 14}, 0.5f, 4,
-                              {14, 18, 78, 220});
-        DrawRectangleRoundedLinesEx({sp.x - 20, sp.y - 46, 40, 14},
-                                     0.5f, 4, 1.0f, {100, 148, 255, 255});
-        DrawText("GUARD", (int)sp.x - 16, (int)sp.y - 44, 8,
-                 {140, 185, 255, 255});
+        float gx = sp.x + 22, gy = sp.y - 28;
+        DrawRectangleRounded({gx, gy, 14, 14}, 0.3f, 4, {12, 16, 52, 210});
+        DrawRectangleRoundedLinesEx({gx, gy, 14, 14}, 0.3f, 4, 1.0f, {80, 120, 255, 255});
+        int gw = MeasureText("G", 9);
+        DrawUI("G", (int)(gx + 7 - gw * 0.5f), (int)(gy + 2), 9, {80, 120, 255, 255});
       }
 
       // Tapped label
@@ -6513,7 +7385,7 @@ static void DrawMatchScene() {
         int tw = MeasureText("TAPPED", 8);
         DrawRectangleRounded({sp.x - tw/2.f - 4, sp.y + 33, (float)(tw + 8), 13},
                               0.5f, 4, {45, 18, 18, 200});
-        DrawText("TAPPED", (int)sp.x - tw / 2, (int)sp.y + 35, 8,
+        DrawUI("TAPPED", (int)sp.x - tw / 2, (int)sp.y + 35, 8,
                  {200, 80, 80, 200});
       }
 
@@ -6530,7 +7402,7 @@ static void DrawMatchScene() {
       int tw = MeasureText(buf, 9);
       DrawRectangleRounded({sp.x - tw/2.f - 5, sp.y - 10, (float)(tw + 10), 15},
                             0.5f, 4, bg);
-      DrawText(buf, (int)(sp.x - tw/2), (int)(sp.y - 9), 9, fg);
+      DrawUI(buf, (int)(sp.x - tw/2), (int)(sp.y - 9), 9, fg);
     };
     zBadge({ 10.5f, 0.5f,  5.5f}, "DECK:", human.deckSize,
            {28,22,14,215}, {200, 180, 130, 255});
@@ -6544,6 +7416,26 @@ static void DrawMatchScene() {
            {22,10,38,215}, {165,  82, 210, 255});
     zBadge({-10.5f, 0.5f, -8.8f}, "OBL:",  ai.oblivionSize,
            {18, 8,32,190}, {145,  65, 190, 230});
+  }
+
+  // ── Graveyard hover glow (indicates clickable) ──────────────────────────
+  {
+    Vector2 mouse2 = GetMousePosition();
+    const float hitR = 52.f;
+    for (int p = 0; p < 2; p++) {
+      if (m.players[p].graveSize <= 0) continue;
+      float gz = (p == 0) ? 5.5f : -6.5f;
+      Vector2 gsp = GetWorldToScreen({-10.5f, 0.5f, gz}, g_matchCam);
+      if (CheckCollisionPointCircle(mouse2, gsp, hitR)) {
+        float pulse = sinf(g_time * 4.0f) * 0.3f + 0.7f;
+        DrawCircle((int)gsp.x, (int)gsp.y, hitR * 0.8f,
+                   {160, 80, 220, (unsigned char)(pulse * 50)});
+        DrawCircleLines((int)gsp.x, (int)gsp.y, hitR * 0.8f,
+                        {180, 100, 240, (unsigned char)(pulse * 150)});
+        DrawUI("Click to view", (int)(gsp.x - 34), (int)(gsp.y + hitR * 0.5f),
+                 9, {200, 160, 255, (unsigned char)(pulse * 200)});
+      }
+    }
   }
 
   // ── Hand zone: radial fan at bottom with gold-trim matte backdrop ──────────
@@ -6561,10 +7453,10 @@ static void DrawMatchScene() {
   {
     Vector2 mouse2 = GetMousePosition();
     float fanCenter = (human.handSize - 1) * 0.5f;
+    // Pass 1: draw all non-hovered cards
     for (int i = 0; i < human.handSize && i < MAX_HAND; i++) {
       Rectangle r = GetHandCardRect(i, human.handSize);
       r.x += g_hspringOff[i];
-
       bool hov = (i == g_matchHoverHand);
 
       // Update hover-tilt spring
@@ -6572,32 +7464,36 @@ static void DrawMatchScene() {
                       mouse2.y - (r.y + r.height * 0.5f)};
       g_handCardViews[i].Update(GetFrameTime(), hov, mrel);
 
-      // Fan pseudo-rotation: blend base fan-tilt into hoverRotX so the
-      // parallelogram skew in DrawCardView gives a natural "fanned" look.
+      if (hov) continue; // defer hovered card to pass 2
+      if (i == g_dragCardIdx && g_dragActive) continue;
+
       float fanTilt = (i - fanCenter) /
                       fmaxf((float)(human.handSize - 1), 1.0f) * 0.55f;
       CardView fv = g_handCardViews[i];
-      fv.hoverRotX += fanTilt * (hov ? 0.20f : 1.0f);  // flatten on hover
+      fv.hoverRotX += fanTilt * 1.0f;
 
-      // Scale: 2.0× on hover for readable zoom
-      float scl   = hov ? 2.0f : fv.scale;
       Rectangle drawR = r;
-      if (hov) {
-        drawR = {r.x - r.width  * (scl - 1.0f) * 0.5f,
-                 r.y - r.height * (scl - 1.0f),
-                 r.width  * scl,
-                 r.height * scl};
-      }
-
-      // Skip dragged card's original position while actively dragging
-      if (i == g_dragCardIdx && g_dragActive) continue;
-
-      // Keyboard selection highlight
-      if (i == g_kbHandSel && g_zoomedCard < 0) {
+      if (i == g_kbHandSel && g_zoomedCard < 0)
         DrawRectangleRoundedLinesEx(drawR, 0.12f, 4, 3.0f, {255, 230, 60, 200});
-      }
-
-      // Full layered GPU render + text overlays
+      DrawCardView(drawR, fv, human.hand[i]);
+    }
+    // Pass 2: draw hovered card ON TOP of everything else
+    if (g_matchHoverHand >= 0 && g_matchHoverHand < human.handSize &&
+        !(g_matchHoverHand == g_dragCardIdx && g_dragActive)) {
+      int i = g_matchHoverHand;
+      Rectangle r = GetHandCardRect(i, human.handSize);
+      r.x += g_hspringOff[i];
+      float fanTilt = (i - fanCenter) /
+                      fmaxf((float)(human.handSize - 1), 1.0f) * 0.55f;
+      CardView fv = g_handCardViews[i];
+      fv.hoverRotX += fanTilt * 0.20f;  // flatten on hover
+      float scl = 2.0f;
+      Rectangle drawR = {r.x - r.width  * (scl - 1.0f) * 0.5f,
+                         r.y - r.height * (scl - 1.0f),
+                         r.width  * scl,
+                         r.height * scl};
+      if (i == g_kbHandSel && g_zoomedCard < 0)
+        DrawRectangleRoundedLinesEx(drawR, 0.12f, 4, 3.0f, {255, 230, 60, 200});
       DrawCardView(drawR, fv, human.hand[i]);
     }
   }
@@ -6612,7 +7508,7 @@ static void DrawMatchScene() {
                                   SCREEN_W * 0.84f, SCREEN_H * 0.20f},
                                  0.08f, 6, 3.0f, dzCol);
     if (inField) {
-      DrawText("RELEASE TO PLAY", SCREEN_W/2 - 55, (int)(SCREEN_H * 0.50f), 10,
+      DrawUI("RELEASE TO PLAY", SCREEN_W/2 - 55, (int)(SCREEN_H * 0.50f), 10,
                {120, 255, 120, 180});
     }
     // Card ghost following mouse
@@ -6630,21 +7526,17 @@ static void DrawMatchScene() {
     Rectangle zr = {SCREEN_W * 0.5f - zw * 0.5f, SCREEN_H * 0.5f - zh * 0.5f, zw, zh};
     CardView zv; zv.Init(human.hand[g_zoomedCard]); zv.isPlayable = true;
     DrawCardView(zr, zv, human.hand[g_zoomedCard]);
-    DrawText("E/Enter: Play   Esc/Right-click: Close",
+    DrawUI("E/Enter: Play   Esc/Right-click: Close",
              (int)(zr.x + zw * 0.5f) - 90, (int)(zr.y + zh + 10), 10,
              {180, 162, 122, 220});
     // Show card number hint (1-9)
     if (g_zoomedCard < 9) {
       char hint[4]; snprintf(hint, 4, "[%d]", g_zoomedCard + 1);
-      DrawText(hint, (int)(zr.x + 4), (int)(zr.y - 16), 11, {180, 162, 90, 200});
+      DrawUI(hint, (int)(zr.x + 4), (int)(zr.y - 16), 11, {180, 162, 90, 200});
     }
   }
 
-  // ── Opponent hand count ───────────────────────────────────────────────────
-  {
-    char buf[32]; snprintf(buf, 32, "Opponent Hand: %d", ai.handSize);
-    DrawText(buf, SCREEN_W / 2 - 50, 34, 12, {180, 162, 122, 200});
-  }
+  // (Opponent hand count moved into AI portrait panel below)
 
   // ── TCG Portrait Panels — glass-matte style ──────────────────────────────
   auto DrawHUDPanel = [](float px, float py, int life, int coins,
@@ -6673,14 +7565,14 @@ static void DrawMatchScene() {
     // Avatar initials
     const char *initials = isPlayer ? "P" : "AI";
     int iw = MeasureText(initials, 11);
-    DrawText(initials, (int)cx - iw/2, (int)(cy - 6), 11, {240, 240, 240, 255});
+    DrawUI(initials, (int)cx - iw/2, (int)(cy - 6), 11, {240, 240, 240, 255});
     // Portrait ring
     DrawCircleLines((int)cx, (int)cy, 16.f, borderCol);
 
     // ── HP label + value ──────────────────────────────────────────────────
     char hpBuf[16]; snprintf(hpBuf, 16, "%d", life);
-    DrawText("HP", (int)(px + 44), (int)(py + 8), 9, {180, 155, 100, 190});
-    DrawText(hpBuf, (int)(px + 60), (int)(py + 5), 16, {255, 222, 152, 255});
+    DrawUI("HP", (int)(px + 44), (int)(py + 8), 9, {180, 155, 100, 190});
+    DrawUI(hpBuf, (int)(px + 60), (int)(py + 5), 16, {255, 222, 152, 255});
 
     // ── HP bar ────────────────────────────────────────────────────────────
     float hpFrac = fmaxf(0.0f, fminf(1.0f, (float)life / 20.0f));
@@ -6702,43 +7594,95 @@ static void DrawMatchScene() {
     DrawCircle((int)(px + 48), (int)(py + 43), 5, {200, 180, 40, 220});
     DrawCircleLines((int)(px + 48), (int)(py + 43), 5, {240, 215, 80, 200});
     char coinBuf[16]; snprintf(coinBuf, 16, "%d", coins);
-    DrawText(coinBuf, (int)(px + 57), (int)(py + 38), 11, {222, 198, 55, 255});
+    DrawUI(coinBuf, (int)(px + 57), (int)(py + 38), 11, {222, 198, 55, 255});
   };
 
-  // Player panel (bottom-left)
-  DrawHUDPanel(8.f, (float)(SCREEN_H - 192), human.life, human.coins, true);
-  // AI panel (top-left)
-  DrawHUDPanel(8.f, 30.f, ai.life, ai.coins, false);
+  // Life change detection → trigger damage jitter / heal glow
+  {
+    float dt = GetFrameTime();
+    for (int p = 0; p < 2; p++) {
+      int curLife = m.players[p].life;
+      if (g_lifePrev[p] >= 0) {
+        if (curLife < g_lifePrev[p]) { g_lifeDmgTimer[p] = 0.35f; }
+        if (curLife > g_lifePrev[p]) { g_lifeHealTimer[p] = 0.5f; }
+      }
+      g_lifePrev[p] = curLife;
+      if (g_lifeDmgTimer[p] > 0) g_lifeDmgTimer[p] -= dt;
+      if (g_lifeHealTimer[p] > 0) g_lifeHealTimer[p] -= dt;
+    }
+  }
+
+  // Player panel (bottom-left) — jitter on damage, glow on heal
+  float pJitterX = g_lifeDmgTimer[0] > 0 ? (float)(rand() % 7 - 3) : 0;
+  float pJitterY = g_lifeDmgTimer[0] > 0 ? (float)(rand() % 5 - 2) : 0;
+  DrawHUDPanel((float)UI_SAFE + pJitterX, (float)(SCREEN_H - UI_SAFE - 170) + pJitterY, human.life, human.coins, true);
+  if (g_lifeHealTimer[0] > 0) {
+    float ha = g_lifeHealTimer[0] / 0.5f;
+    DrawRectangleRounded({(float)(UI_SAFE - 2), (float)(SCREEN_H - UI_SAFE - 172), 200.f, 58.f}, 0.28f, 4,
+                          {50, 255, 80, (unsigned char)(ha * 40)});
+  }
+  if (g_lifeDmgTimer[0] > 0) {
+    float hpX = (float)(UI_SAFE + 44) + pJitterX, hpY = (float)(SCREEN_H - UI_SAFE - 165) + pJitterY;
+    SpawnArenaBurst(hpX + 30, hpY + 20, 1, {255, 50, 30, 180});
+  }
+
+  // AI panel (top-right, clear of graveyard on left)
+  float aiPanelX = (float)(SCREEN_W - UI_SAFE - 200);
+  float aiPanelY = (float)UI_SAFE;
+  float aJitterX = g_lifeDmgTimer[1] > 0 ? (float)(rand() % 7 - 3) : 0;
+  float aJitterY = g_lifeDmgTimer[1] > 0 ? (float)(rand() % 5 - 2) : 0;
+  DrawHUDPanel(aiPanelX + aJitterX, aiPanelY + aJitterY, ai.life, ai.coins, false);
+  if (g_lifeHealTimer[1] > 0) {
+    float ha = g_lifeHealTimer[1] / 0.5f;
+    DrawRectangleRounded({aiPanelX - 2, aiPanelY - 2, 200.f, 58.f}, 0.28f, 4,
+                          {50, 255, 80, (unsigned char)(ha * 40)});
+  }
+  // Opponent hand count (below AI panel)
+  {
+    char buf[32]; snprintf(buf, 32, "Hand: %d", ai.handSize);
+    int tw = MeasureText(buf, 10);
+    DrawUI(buf, (int)(aiPanelX + 100 - tw / 2), (int)(aiPanelY + 58), 10,
+             {180, 150, 110, 200});
+  }
 
   // ── Turn banner flag (slides in on turn change) ───────────────────────────
   DrawTurnBanner(g_turnBannerTimer, g_turnBannerWho);
+  DrawPhaseBanner();
+
+  // Fast mode indicator
+  if (g_fastMode) {
+    DrawRectangleRounded({(float)(SCREEN_W - UI_SAFE - 62), (float)UI_SAFE, 56, 20}, 0.4f, 4, {200, 160, 40, 180});
+    DrawUI("FAST", SCREEN_W - UI_SAFE - 52, UI_SAFE + 4, 12, {255, 255, 255, 230});
+  }
 
   // ── Phase action buttons ──────────────────────────────────────────────────
   // Phase action buttons (clickable)
+  int btnR = SCREEN_W - UI_SAFE - 187; // right-aligned button X
+  int btnB = SCREEN_H - UI_SAFE;       // bottom-aligned base Y
   if (m.turn == 0 && m.phase == PHASE_DEVELOP) {
-    DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+    DrawRectangleRounded({(float)btnR, (float)(btnB - 145),
                           177, 30}, 0.3f, 4, {40, 80, 40, 235});
-    DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+    DrawRectangleRoundedLinesEx({(float)btnR, (float)(btnB - 145),
                                   177, 30}, 0.3f, 4, 1.5f, {100, 220, 100, 200});
-    DrawText("▶ ACTIVATE PHASE", SCREEN_W - 182, SCREEN_H - 178,
+    DrawUI("▶ ACTIVATE PHASE", btnR + 5, btnB - 138,
              10, {160, 255, 160, 255});
   }
   if (m.turn == 0 && m.phase == PHASE_ACTIVATE) {
-    DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+    DrawRectangleRounded({(float)btnR, (float)(btnB - 145),
                           177, 30}, 0.3f, 4, {90, 40, 40, 235});
-    DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 185),
+    DrawRectangleRoundedLinesEx({(float)btnR, (float)(btnB - 145),
                                   177, 30}, 0.3f, 4, 1.5f, {220, 100, 100, 200});
-    DrawText("■ END TURN", SCREEN_W - 182, SCREEN_H - 178,
+    DrawUI("■ END TURN", btnR + 5, btnB - 138,
              11, {255, 180, 180, 255});
     // Right-click hint
-    DrawText("Right-click unit = DEFEND toggle", SCREEN_W - 182, SCREEN_H - 205,
+    DrawUI("Right-click unit = DEFEND toggle", btnR + 5, btnB - 165,
              8, {180, 180, 255, 180});
     if (m.selectedFieldIdx >= 0) {
-      DrawRectangleRounded({(float)(SCREEN_W - 187), (float)(SCREEN_H - 220),
+      DrawRectangleRounded({(float)btnR, (float)(btnB - 180),
                             177, 30}, 0.3f, 4, {122, 42, 42, 225});
-      DrawRectangleRoundedLinesEx({(float)(SCREEN_W - 187), (float)(SCREEN_H - 220),
+      DrawRectangleRoundedLinesEx({(float)btnR, (float)(btnB - 180),
                                     177, 30}, 0.3f, 4, 1.5f, {220, 80, 80, 200});
-      DrawText("⚔ ATTACK PLAYER", SCREEN_W - 182, SCREEN_H - 213,
+      DrawUI("⚔ ATTACK PLAYER", btnR + 5, btnB - 173,
                10, {255, 160, 160, 255});
     }
   }
@@ -6764,7 +7708,7 @@ static void DrawMatchScene() {
          (float)mw + 30, 30},
         0.3f, 4,
         {20, 15, 10, (unsigned char)(alpha * 0.78f)});
-    DrawText(m.message, SCREEN_W / 2 - mw / 2,
+    DrawUI(m.message, SCREEN_W / 2 - mw / 2,
              (int)(SCREEN_H / 2.0f - 82), 14,
              {255, 232, 162, (unsigned char)alpha});
   }
@@ -6781,13 +7725,18 @@ static void DrawMatchScene() {
                {(unsigned char)(rc.r / 5), (unsigned char)(rc.g / 5),
                 (unsigned char)(rc.b / 5), (unsigned char)(58 + glow * 42)});
     int rw = MeasureText(result, 50);
-    DrawText(result, SCREEN_W / 2 - rw / 2, SCREEN_H / 2 - 50, 50, rc);
-    DrawText("Press ENTER to continue", SCREEN_W / 2 - 95,
+    DrawUI(result, SCREEN_W / 2 - rw / 2, SCREEN_H / 2 - 50, 50, rc);
+    DrawUI("Press ENTER to continue", SCREEN_W / 2 - 95,
              SCREEN_H / 2 + 22, 14, {202, 182, 142, 255});
   }
 
   // ── Floating damage / effect text ────────────────────────────────────────
   DrawFloatTexts();
+
+  // ── Dig wisps, token numbers, coin fly VFX ─────────────────────────────
+  DrawDigWisps();
+  DrawTokenFX();
+  DrawCoinFlys();
 
   // ── Desert Wind & Dust atmospherics (shared with overworld system) ────────
   DrawVFX();
@@ -6806,13 +7755,13 @@ static void DrawMatchScene() {
     DrawRectangleRounded({tipX, tipY, 202, 68}, 0.2f, 4, {24, 19, 14, 238});
     DrawRectangleRoundedLinesEx({tipX, tipY, 202, 68}, 0.2f, 4, 1.5f,
                                  {142, 122, 62, 255});
-    DrawText(cd.name, (int)tipX + 5, (int)tipY + 5, 11, {255, 232, 162, 255});
+    DrawUI(cd.name, (int)tipX + 5, (int)tipY + 5, 11, {255, 232, 162, 255});
     if (cd.effect[0])
-      DrawText(cd.effect, (int)tipX + 5, (int)tipY + 20, 7,
+      DrawUI(cd.effect, (int)tipX + 5, (int)tipY + 20, 7,
                {202, 182, 142, 222});
     if (cd.keywords[0]) {
       char kb[34]; snprintf(kb, 34, "[%s]", cd.keywords);
-      DrawText(kb, (int)tipX + 5, (int)tipY + 52, 8, {182, 222, 255, 222});
+      DrawUI(kb, (int)tipX + 5, (int)tipY + 52, 8, {182, 222, 255, 222});
     }
   }
 
@@ -6833,10 +7782,10 @@ static void DrawMatchScene() {
     const char *title = (g_graveModalPlayer == 0) ? "Your Graveyard" : "AI Graveyard";
     DrawRectangleRounded({MX, MY, MW, 32}, 0.06f, 4, {46, 22, 62, 255});
     int tw2 = MeasureText(title, 14);
-    DrawText(title, (int)(MX + (MW - tw2) * 0.5f), (int)(MY + 8), 14,
+    DrawUI(title, (int)(MX + (MW - tw2) * 0.5f), (int)(MY + 8), 14,
              {200, 160, 255, 255});
     // Close hint
-    DrawText("[ESC] close", (int)(MX + MW - 92), (int)(MY + 10), 9,
+    DrawUI("[ESC] close", (int)(MX + MW - 92), (int)(MY + 10), 9,
              {160, 130, 200, 200});
 
     // Card grid (sorted by: units first, then by cost ascending)
@@ -6894,18 +7843,18 @@ static void DrawMatchScene() {
                              (int)CW, (int)(CH * 0.45f),
                              {0,0,0,0}, {0,0,0,200});
       // Name
-      DrawText(cd2.name, (int)(cx + 3), (int)(cy + CH - 22), 7,
+      DrawUI(cd2.name, (int)(cx + 3), (int)(cy + CH - 22), 7,
                {230, 210, 255, 255});
       // ATK/DEF or cost
       if (cd2.isUnit) {
         char sb2[16]; snprintf(sb2, 16, "%d/%d", cd2.atk, cd2.def);
         int sw = MeasureText(sb2, 8);
-        DrawText(sb2, (int)(cx + CW - sw - 3), (int)(cy + CH - 12), 8,
+        DrawUI(sb2, (int)(cx + CW - sw - 3), (int)(cy + CH - 12), 8,
                  {255, 200, 150, 255});
       } else {
         char sb2[8]; snprintf(sb2, 8, "c:%d", cd2.cost);
         int sw = MeasureText(sb2, 8);
-        DrawText(sb2, (int)(cx + CW - sw - 3), (int)(cy + CH - 12), 8,
+        DrawUI(sb2, (int)(cx + CW - sw - 3), (int)(cy + CH - 12), 8,
                  {180, 255, 200, 255});
       }
       // Border
@@ -6971,6 +7920,18 @@ static void GenerateShopStock(int cityIdx) {
 
 static int g_shopSinglesScroll = 0;
 
+// ── Pack Opening Animation State ──────────────────────────────────────────
+static constexpr int PACK_SIZE = 10;
+static bool  g_packAnimActive = false;   // true = showing pack opening screen
+static int   g_packCards[PACK_SIZE];     // card IDs pulled this pack
+static int   g_packRevealed = 0;         // how many have been revealed
+static float g_packRevealTimer = 0.0f;   // timer for current card reveal
+static float g_packCardAge[PACK_SIZE];   // time since each card was revealed
+static float g_packShakeTimer = 0.0f;    // pack shake before burst
+static int   g_packPhase = 0;            // 0=shake, 1=reveal, 2=done
+static constexpr float PACK_SHAKE_DUR = 1.0f;  // shake duration
+static constexpr float CARD_REVEAL_INTERVAL = 0.35f; // time between reveals
+
 // ── Pack opening helper (GDD-compliant slot rates) ──────────────────────────
 static void OpenOnePack() {
   bool hasFairScale = g_inventory.HasFairScale();
@@ -7013,9 +7974,173 @@ static void OpenOnePack() {
   g_market.OnPackOpened();
 }
 
+// Animated version — stores pulled cards and starts the reveal animation
+static void OpenOnePackAnimated() {
+  int prevSize = g_collectionSize;
+  OpenOnePack();
+  // Copy last 10 cards added to collection into g_packCards
+  int added = g_collectionSize - prevSize;
+  for (int i = 0; i < PACK_SIZE; i++) {
+    if (i < added)
+      g_packCards[i] = g_collection[prevSize + i];
+    else
+      g_packCards[i] = 0;
+  }
+  g_packAnimActive = true;
+  g_packRevealed = 0;
+  g_packRevealTimer = 0.0f;
+  g_packPhase = 0;
+  g_packShakeTimer = 0.0f;
+  for (int i = 0; i < PACK_SIZE; i++) g_packCardAge[i] = 0.0f;
+}
+
+// Update & Draw the pack opening animation overlay
+static void UpdatePackOpenAnim(float dt) {
+  if (!g_packAnimActive) return;
+
+  if (g_packPhase == 0) {
+    // Shake phase
+    g_packShakeTimer += dt;
+    if (g_packShakeTimer >= PACK_SHAKE_DUR) {
+      g_packPhase = 1;
+      PlaySfx(SFX_CARD_PLAY);
+    }
+  } else if (g_packPhase == 1) {
+    // Reveal cards one by one
+    g_packRevealTimer += dt;
+    if (g_packRevealTimer >= CARD_REVEAL_INTERVAL && g_packRevealed < PACK_SIZE) {
+      g_packRevealTimer -= CARD_REVEAL_INTERVAL;
+      g_packRevealed++;
+      PlaySfx(SFX_CARD_DRAW);
+    }
+    if (g_packRevealed >= PACK_SIZE) g_packPhase = 2;
+  }
+
+  // Age each revealed card
+  for (int i = 0; i < g_packRevealed && i < PACK_SIZE; i++)
+    g_packCardAge[i] += dt;
+
+  // Click or key to skip/close
+  if (g_packPhase == 2) {
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || IsKeyPressed(KEY_ENTER) ||
+        IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ESCAPE)) {
+      g_packAnimActive = false;
+    }
+  } else if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) || IsKeyPressed(KEY_ENTER) ||
+             IsKeyPressed(KEY_SPACE)) {
+    // Skip to fully revealed
+    g_packRevealed = PACK_SIZE;
+    g_packPhase = 2;
+    for (int i = 0; i < PACK_SIZE; i++) g_packCardAge[i] = 2.0f;
+  }
+}
+
+static void DrawPackOpenAnim() {
+  if (!g_packAnimActive) return;
+
+  // Full-screen dark overlay
+  DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {12, 8, 5, 240});
+
+  // Title
+  const char *title = "PACK OPENING";
+  int tw = MeasureText(title, 22);
+  DrawUI(title, SCREEN_W / 2 - tw / 2 + 1, 21, 22, {0, 0, 0, 150});
+  DrawUI(title, SCREEN_W / 2 - tw / 2, 20, 22, {255, 220, 100, 255});
+
+  if (g_packPhase == 0) {
+    // Draw shaking pack
+    float shake = sinf(g_packShakeTimer * 30.0f) * (4.0f + g_packShakeTimer * 12.0f);
+    float px = SCREEN_W * 0.5f + shake, py = SCREEN_H * 0.45f;
+    float pw = 100, ph = 140;
+
+    // Pack wrapper
+    DrawRectangleRounded({px - pw*0.5f, py - ph*0.5f, pw, ph}, 0.12f, 6, {45, 35, 80, 255});
+    DrawRectangleRoundedLinesEx({px - pw*0.5f, py - ph*0.5f, pw, ph}, 0.12f, 6, 2.5f, {180, 140, 220, 255});
+    // Foil strip
+    float foilShimmer = sinf(g_packShakeTimer * 8.0f) * 0.3f + 0.7f;
+    DrawRectangle((int)(px - pw*0.35f), (int)(py - 10), (int)(pw*0.7f), 20,
+      {(unsigned char)(200*foilShimmer), (unsigned char)(180*foilShimmer),
+       (unsigned char)(255*foilShimmer), 200});
+    // Pack text
+    const char *ptext = "CARDS & COINS";
+    int ptw = MeasureText(ptext, 10);
+    DrawUI(ptext, (int)(px - ptw*0.5f), (int)(py - 4), 10, {40, 20, 60, 255});
+
+    // "Opening..." text
+    DrawUI("Opening...", SCREEN_W / 2 - 30, (int)(py + ph * 0.5f + 15), 12, {180, 160, 120, 200});
+  } else {
+    // Draw revealed cards in 2 rows of 5
+    int cols = 5, rows = 2;
+    float cardW = 90, cardH = 126;
+    float gapX = 12, gapY = 14;
+    float totalW = cols * cardW + (cols - 1) * gapX;
+    float totalH = rows * cardH + (rows - 1) * gapY;
+    float startX = (SCREEN_W - totalW) * 0.5f;
+    float startY = (SCREEN_H - totalH) * 0.5f + 10;
+
+    for (int i = 0; i < PACK_SIZE; i++) {
+      int col = i % cols, row = i / cols;
+      float cx = startX + col * (cardW + gapX);
+      float cy = startY + row * (cardH + gapY);
+
+      if (i < g_packRevealed && g_packCards[i] > 0) {
+        // Reveal animation: card flies up and scales in
+        float age = g_packCardAge[i];
+        float t = Clamp(age / 0.3f, 0.0f, 1.0f); // 0.3s reveal
+        float ease = 1.0f - powf(1.0f - t, 3.0f); // ease-out cubic
+
+        float scale = 0.5f + 0.5f * ease;
+        float offY = (1.0f - ease) * 60.0f;
+        float drawW = cardW * scale, drawH = cardH * scale;
+        float drawX = cx + (cardW - drawW) * 0.5f;
+        float drawY = cy + (cardH - drawH) * 0.5f + offY;
+
+        // Glow for rare/epic
+        const CardDef &cd = GetCard(g_packCards[i]);
+        if (cd.rarity >= 1 || cd.isUnique) {
+          Color glow = cd.isUnique ? Color{255, 180, 60, (unsigned char)(40 + (int)(30*sinf(g_time*4)))}
+                                   : Color{200, 200, 255, (unsigned char)(30 + (int)(20*sinf(g_time*4)))};
+          DrawRectangleRounded({drawX - 4, drawY - 4, drawW + 8, drawH + 8}, 0.12f, 4, glow);
+        }
+
+        CardView cv;
+        cv.Init(g_packCards[i]);
+        cv.isPlayable = true;
+        DrawCardView({drawX, drawY, drawW, drawH}, cv, g_packCards[i]);
+
+        // Rarity label below card
+        const char *rLabel = cd.isUnique ? "EPIC" : (cd.rarity >= 1 ? "RARE" : "COMMON");
+        Color rCol = cd.isUnique ? Color{255, 180, 60, 255} : (cd.rarity >= 1 ? Color{150, 180, 255, 255} : Color{160, 150, 130, 200});
+        int rlw = MeasureText(rLabel, 8);
+        DrawUI(rLabel, (int)(cx + cardW*0.5f - rlw*0.5f), (int)(cy + cardH + 2), 8, rCol);
+      } else {
+        // Unrevealed slot — dark card back
+        DrawRectangleRounded({cx, cy, cardW, cardH}, 0.10f, 4, {25, 18, 12, 220});
+        DrawRectangleRoundedLinesEx({cx, cy, cardW, cardH}, 0.10f, 4, 1.5f, {80, 60, 40, 180});
+        DrawUI("?", (int)(cx + cardW*0.5f - 4), (int)(cy + cardH*0.5f - 8), 16, {100, 80, 60, 150});
+      }
+    }
+
+    // Instructions
+    if (g_packPhase == 2) {
+      const char *hint = "Click or press Enter to continue";
+      int hw = MeasureText(hint, 11);
+      DrawUI(hint, SCREEN_W / 2 - hw / 2, (int)(startY + totalH + 25), 11, {200, 180, 120, 220});
+    } else {
+      const char *hint = "Click to skip";
+      int hw = MeasureText(hint, 10);
+      DrawUI(hint, SCREEN_W / 2 - hw / 2, (int)(startY + totalH + 25), 10, {150, 130, 100, 160});
+    }
+  }
+}
+
 // ── Shop System ─────────────────────────────────────────────────────────────
 static void UpdateShop(float dt) {
-  (void)dt;
+  // Pack opening animation takes priority over all shop input
+  if (g_packAnimActive) {
+    UpdatePackOpenAnim(dt);
+    return;
+  }
   Vector2 mouse = GetMousePosition();
 
   // Buy starter deck button
@@ -7032,9 +8157,9 @@ static void UpdateShop(float dt) {
   Rectangle packBtn = {SCREEN_W / 2 - 100, 260, 200, 40};
   if (CheckCollisionPointRec(mouse, packBtn) &&
       IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-    if (g_playerCoins >= packPrice) {
+    if (g_playerCoins >= packPrice && !g_packAnimActive) {
       g_playerCoins -= packPrice;
-      OpenOnePack();
+      OpenOnePackAnimated();
     }
   }
 
@@ -7109,27 +8234,32 @@ static void UpdateShop(float dt) {
   if (IsKeyPressed(KEY_ESCAPE)) {
     g_shopSinglesScroll = 0;
     g_scene = SCENE_OVERWORLD;
+    // Tutorial: after first shop visit, prompt for duel
+    if (g_tutState == TUT_IN_SHOP) {
+      g_tutState = TUT_AWAITING_MATCH_NPC;
+      g_tutTimer = 0.0f;
+    }
   }
 }
 
 static void DrawShopScene() {
   DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {50, 40, 28, 255});
-  DrawText("MERCHANT'S CARD SHOP", SCREEN_W / 2 - 120, 20, 20,
+  DrawUI("MERCHANT'S CARD SHOP", SCREEN_W / 2 - 120, 20, 20,
            {255, 220, 120, 255});
 
   char buf[128];
   snprintf(buf, 128, "Your Coins: %d    Collection: %d cards    Deck: %d cards",
            g_playerCoins, g_collectionSize, g_playerDeckSize);
-  DrawText(buf, SCREEN_W / 2 - 200, 60, 12, {200, 180, 140, 255});
+  DrawUI(buf, SCREEN_W / 2 - 200, 60, 12, {200, 180, 140, 255});
 
   // Starter deck button
   if (!g_hasStarterDeck) {
     DrawRectangleRounded({(float)SCREEN_W / 2 - 100, 200, 200, 40}, 0.3f, 4,
                          {60, 120, 60, 255});
-    DrawText("Get Starter Deck (FREE)", SCREEN_W / 2 - 85, 212, 12,
+    DrawUI("Get Starter Deck (FREE)", SCREEN_W / 2 - 85, 212, 12,
              {255, 255, 200, 255});
   } else {
-    DrawText("Starter deck acquired!", SCREEN_W / 2 - 80, 210, 12,
+    DrawUI("Starter deck acquired!", SCREEN_W / 2 - 80, 210, 12,
              {120, 200, 120, 200});
   }
 
@@ -7140,7 +8270,7 @@ static void DrawShopScene() {
   DrawRectangleRounded({(float)SCREEN_W / 2 - 100, 260, 200, 40}, 0.3f, 4,
                        packCol);
   snprintf(buf, 128, "Buy Card Pack (%d coins)", packPrice);
-  DrawText(buf, SCREEN_W / 2 - 85, 272, 12, {255, 255, 200, 255});
+  DrawUI(buf, SCREEN_W / 2 - 85, 272, 12, {255, 255, 200, 255});
 
   // Box button (24 packs + 1 epic promo)
   int boxPrice = (int)(200 * g_worldClock.GetShopMod() * g_inventory.GetBoxMod() + 0.5f);
@@ -7148,19 +8278,19 @@ static void DrawShopScene() {
                                              : Color{60, 45, 25, 255};
   DrawRectangleRounded({(float)SCREEN_W / 2 - 100, 310, 200, 40}, 0.3f, 4, boxCol);
   snprintf(buf, 128, "Buy Box (%d coins)", boxPrice);
-  DrawText(buf, SCREEN_W / 2 - 85, 318, 12, {255, 230, 160, 255});
-  DrawText("24 packs + 1 Epic promo", SCREEN_W / 2 - 75, 334, 8, {200, 180, 120, 180});
+  DrawUI(buf, SCREEN_W / 2 - 85, 318, 12, {255, 230, 160, 255});
+  DrawUI("24 packs + 1 Epic promo", SCREEN_W / 2 - 75, 334, 8, {200, 180, 120, 180});
 
   // Time of day indicator
   snprintf(buf, 128, "Time: %s (price mod: %.0f%%)", g_worldClock.GetName(),
            (g_worldClock.GetShopMod() - 1.0f) * 100);
-  DrawText(buf, SCREEN_W / 2 - 100, 95, 10, {180, 160, 120, 200});
+  DrawUI(buf, SCREEN_W / 2 - 100, 95, 10, {180, 160, 120, 200});
 
   // Per-city singles for sale (right panel)
   if (g_currentShopCity >= 0 && g_currentShopCity < 5) {
     static const char *cityNames[] = {"Zahav","Ma'ayan","Avak","Gan","Sela"};
     snprintf(buf, 128, "%s Singles:", cityNames[g_currentShopCity]);
-    DrawText(buf, SCREEN_W - 225, 120, 12, {255, 200, 100, 255});
+    DrawUI(buf, SCREEN_W - 225, 120, 12, {255, 200, 100, 255});
     float dayMod2 = g_worldClock.GetShopMod();
     float cardBuyMod = g_inventory.GetCardBuyMod();
     int startS = g_shopSinglesScroll;
@@ -7175,17 +8305,17 @@ static void DrawShopScene() {
       DrawRectangleRounded({(float)(SCREEN_W - 220), (float)sy, 210.f, 22.f},
                            0.2f, 4, btnCol);
       snprintf(buf, 128, "%s - %d coins", scd.name, price);
-      DrawText(buf, SCREEN_W - 215, sy + 4, 9, {220, 210, 180, 255});
+      DrawUI(buf, SCREEN_W - 215, sy + 4, 9, {220, 210, 180, 255});
     }
     // Scroll arrows
     if (g_shopSinglesScroll > 0)
-      DrawText("[UP]", SCREEN_W - 160, 130, 8, {180, 180, 120, 180});
+      DrawUI("[UP]", SCREEN_W - 160, 130, 8, {180, 180, 120, 180});
     if (g_shopSinglesScroll + 5 < SHOP_STOCK_SIZE)
-      DrawText("[DOWN]", SCREEN_W - 160, 140 + 5 * 24, 8, {180, 180, 120, 180});
+      DrawUI("[DOWN]", SCREEN_W - 160, 140 + 5 * 24, 8, {180, 180, 120, 180});
   }
 
   // Collection display with sell prices
-  DrawText("Your Collection (click [S] next to card to sell):", 30, 370, 14,
+  DrawUI("Your Collection (click [S] next to card to sell):", 30, 370, 14,
            {220, 200, 160, 255});
   int startIdx = g_shopScroll * 8;
   int y = 390;
@@ -7197,12 +8327,12 @@ static void DrawShopScene() {
     int buyPrice = g_market.GetBuyPrice(g_collection[i], dayMod);
     snprintf(buf, 128, "%s (Cost:%d %s) Buy:%d Sell:%d", cd.name, cd.cost,
              cd.isUnit ? cd.subtype : "Support", buyPrice, sellPrice);
-    DrawText(buf, 40, y, 10, {180, 170, 140, 220});
+    DrawUI(buf, 40, y, 10, {180, 170, 140, 220});
 
     // Sell button
     Rectangle sellBtn = {(float)SCREEN_W - 80, (float)y - 2, 50, 14};
     DrawRectangleRounded(sellBtn, 0.3f, 4, {140, 60, 60, 255});
-    DrawText("SELL", SCREEN_W - 72, y, 8, {255, 220, 180, 255});
+    DrawUI("SELL", SCREEN_W - 72, y, 8, {255, 220, 180, 255});
     if (CheckCollisionPointRec(GetMousePosition(), sellBtn) &&
         IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
       g_playerCoins += sellPrice;
@@ -7215,8 +8345,11 @@ static void DrawShopScene() {
     y += 16;
   }
 
-  DrawText("[Esc] Exit shop    [UP/DOWN] Scroll    Click SELL to sell cards",
+  DrawUI("[Esc] Exit shop    [UP/DOWN] Scroll    Click SELL to sell cards",
            20, SCREEN_H - 25, 10, {150, 130, 100, 150});
+
+  // Pack opening overlay (drawn on top of everything)
+  DrawPackOpenAnim();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7276,176 +8409,408 @@ static Color SubtypeColor(const char *sub) {
 
 // Generate a unique pixel-art creature based on card id (deterministic hash
 // art)
-static void DrawCardCreature(Image *img, int cardId, Color baseCol, int ox,
-                             int oy, int w, int h) {
-  unsigned seed = (unsigned)(cardId * 2654435761u);
-  int bw = w / 3 + (seed % 3);
-  int bh = h / 3 + ((seed >> 4) % 4);
-  int bx = ox + (w - bw) / 2;
-  int by = oy + h - bh - 2;
-  Color body = baseCol;
-  Color dark = {(unsigned char)(body.r * 0.6f), (unsigned char)(body.g * 0.6f),
-                (unsigned char)(body.b * 0.6f), 255};
-  Color light = {(unsigned char)Clamp(body.r * 1.3f, 0, 255),
-                 (unsigned char)Clamp(body.g * 1.3f, 0, 255),
-                 (unsigned char)Clamp(body.b * 1.3f, 0, 255), 255};
-  ImageDrawRectangle(img, bx, by, bw, bh, body);
-  ImageDrawRectangle(img, bx, by, bw, 1, light);
-  ImageDrawRectangle(img, bx, by + bh - 1, bw, 1, dark);
-  int hw2 = bw / 2 + ((seed >> 8) % 2);
-  int hh2 = bh / 2 + ((seed >> 12) % 2);
-  int hx = bx + (bw - hw2) / 2;
-  int hy = by - hh2 + 1;
-  ImageDrawRectangle(img, hx, hy, hw2, hh2, body);
-  ImageDrawRectangle(img, hx, hy, hw2, 1, light);
-  int ey = hy + hh2 / 3;
-  ImageDrawPixel(img, hx + hw2 / 4, ey, PALETTE[0]);
-  ImageDrawPixel(img, hx + hw2 * 3 / 4, ey, PALETTE[0]);
-  if ((seed >> 16) & 1) {
-    ImageDrawRectangle(img, bx - 3, by + 1, 3, bh / 2, dark);
-    ImageDrawRectangle(img, bx + bw, by + 1, 3, bh / 2, dark);
+// ── Pure art card textures — full-canvas illustrations per subtype ────────────
+// Hash helper for deterministic variation per card
+static unsigned cardHash(int id, int salt) {
+  return (unsigned)((id * 2654435761u) ^ (salt * 1103515245u));
+}
+static Color colLerp(Color a, Color b, float t) {
+  return {(unsigned char)(a.r + (b.r - a.r) * t), (unsigned char)(a.g + (b.g - a.g) * t),
+          (unsigned char)(a.b + (b.b - a.b) * t), 255};
+}
+
+// Draw themed full-canvas art based on subtype
+static void DrawCardArt(Image *img, const CardDef &cd) {
+  int W = CARD_TEX_W, H = CARD_TEX_H;
+  unsigned s = cardHash(cd.id, 0);
+  Color bg = SubtypeColor(cd.subtype);
+  Color bgDk = {(unsigned char)(bg.r * 0.3f), (unsigned char)(bg.g * 0.3f),
+                (unsigned char)(bg.b * 0.3f), 255};
+  Color bgLt = {(unsigned char)Clamp(bg.r * 1.4f, 0, 255),
+                (unsigned char)Clamp(bg.g * 1.4f, 0, 255),
+                (unsigned char)Clamp(bg.b * 1.4f, 0, 255), 255};
+
+  // Gradient background — dark at top, lighter at bottom (sky-to-ground feel)
+  for (int y = 0; y < H; y++) {
+    float t = (float)y / H;
+    Color row = colLerp(bgDk, bg, t * t);
+    ImageDrawRectangle(img, 0, y, W, 1, row);
   }
-  if ((seed >> 17) & 1) {
-    ImageDrawRectangle(img, bx + bw, by + bh - 3, 4, 2, dark);
+
+  // Ground line at ~75% height
+  int groundY = H * 3 / 4;
+  Color ground = {(unsigned char)(bg.r * 0.5f), (unsigned char)(bg.g * 0.45f),
+                  (unsigned char)(bg.b * 0.35f), 255};
+  for (int y = groundY; y < H; y++) {
+    float t = (float)(y - groundY) / (H - groundY);
+    ImageDrawRectangle(img, 0, y, W, 1, colLerp(ground, bgDk, t));
   }
-  if ((seed >> 18) & 1) {
-    ImageDrawPixel(img, hx + 1, hy - 1, dark);
-    ImageDrawPixel(img, hx + hw2 - 2, hy - 1, dark);
+
+  int cx = W / 2, cy = H / 2;
+  const char *sub = cd.subtype;
+
+  if (!cd.isUnit) {
+    // ── Spell cards: magical energy burst ──
+    Color glow = {220, 180, 60, 255};
+    Color core = {255, 240, 180, 255};
+    // Radiating beams
+    for (int a = 0; a < 16; a++) {
+      float angle = a * 0.3927f + (s % 100) * 0.01f;
+      for (int r = 4; r < 40; r++) {
+        int px = cx + (int)(cosf(angle) * r);
+        int py = cy + (int)(sinf(angle) * r);
+        if (px >= 0 && px < W && py >= 0 && py < H) {
+          float fade = 1.0f - r / 40.0f;
+          ImageDrawPixel(img, px, py, colLerp(bgDk, (r < 15) ? core : glow, fade));
+        }
+      }
+    }
+    // Central orb
+    for (int dy = -8; dy <= 8; dy++)
+      for (int dx = -8; dx <= 8; dx++) {
+        float d = sqrtf((float)(dx*dx + dy*dy));
+        if (d < 8.0f) {
+          float t = 1.0f - d / 8.0f;
+          ImageDrawPixel(img, cx+dx, cy+dy, colLerp(glow, core, t*t));
+        }
+      }
+  } else if (strstr(sub, "rat")) {
+    // ── Rat: crouching rodent silhouette ──
+    int bx = cx - 12 + (s%5), by = groundY - 18;
+    // Body (oval)
+    for (int dy = -6; dy <= 6; dy++)
+      for (int dx = -14; dx <= 14; dx++) {
+        float ex = dx / 14.0f, ey2 = dy / 6.0f;
+        if (ex*ex + ey2*ey2 < 1.0f)
+          ImageDrawPixel(img, bx+dx, by+dy, colLerp(bgDk, bg, 0.3f + ey2*0.3f));
+      }
+    // Head
+    for (int dy = -5; dy <= 5; dy++)
+      for (int dx = -7; dx <= 7; dx++) {
+        if (dx*dx + dy*dy < 36)
+          ImageDrawPixel(img, bx+16+dx, by-2+dy, colLerp(bgDk, bg, 0.4f));
+      }
+    // Eyes
+    ImageDrawPixel(img, bx+19, by-4, {255, 200, 60, 255});
+    ImageDrawPixel(img, bx+20, by-4, {255, 200, 60, 255});
+    // Ears
+    ImageDrawRectangle(img, bx+13, by-8, 3, 4, bg);
+    ImageDrawRectangle(img, bx+18, by-8, 3, 4, bg);
+    // Tail
+    for (int i = 0; i < 20; i++) {
+      int tx = bx - 14 - i/2, ty = by + (int)(sinf(i*0.5f)*3);
+      if (tx >= 0 && tx < W && ty >= 0 && ty < H) ImageDrawPixel(img, tx, ty, bgDk);
+    }
+  } else if (strstr(sub, "plant")) {
+    // ── Plant: flower/vine growing from ground ──
+    // Stem
+    for (int y = groundY; y > groundY - 50; y--) {
+      int sx = cx + (int)(sinf(y * 0.15f) * 4);
+      ImageDrawRectangle(img, sx-1, y, 3, 1, {50, 110, 40, 255});
+    }
+    // Leaves
+    for (int l = 0; l < 4; l++) {
+      int ly = groundY - 15 - l * 10;
+      int ldir = (l % 2) ? 1 : -1;
+      for (int i = 0; i < 10; i++) {
+        int lx = cx + ldir * (i + 2);
+        int lh = (int)(3.0f * sinf(i * 0.314f));
+        ImageDrawRectangle(img, lx, ly - lh, 2, 2 + lh, {60, 140, 45, 255});
+      }
+    }
+    // Flower at top
+    int fy = groundY - 52;
+    Color petal = {220, 60 + (s%80), 80, 255};
+    for (int a = 0; a < 6; a++) {
+      float ang = a * 1.047f;
+      for (int r = 2; r < 9; r++) {
+        int px = cx + (int)(cosf(ang) * r), py = fy + (int)(sinf(ang) * r);
+        if (px >= 0 && px < W && py >= 0 && py < H)
+          ImageDrawPixel(img, px, py, petal);
+      }
+    }
+    // Center
+    for (int dy = -3; dy <= 3; dy++)
+      for (int dx = -3; dx <= 3; dx++)
+        if (dx*dx+dy*dy < 10) ImageDrawPixel(img, cx+dx, fy+dy, {255,220,60,255});
+  } else if (strstr(sub, "golem")) {
+    // ── Golem: blocky stone figure ──
+    Color stone = {130, 125, 115, 255}, stoneDk = {80, 75, 68, 255}, stoneLt = {170, 165, 150, 255};
+    int bx2 = cx - 14, by2 = groundY - 40;
+    // Legs
+    ImageDrawRectangle(img, bx2+4, by2+28, 8, 14, stoneDk);
+    ImageDrawRectangle(img, bx2+18, by2+28, 8, 14, stoneDk);
+    // Body
+    ImageDrawRectangle(img, bx2, by2+6, 30, 24, stone);
+    ImageDrawRectangle(img, bx2+1, by2+7, 28, 2, stoneLt);
+    // Cracks
+    ImageDrawLine(img, bx2+8, by2+10, bx2+15, by2+22, stoneDk);
+    ImageDrawLine(img, bx2+20, by2+12, bx2+24, by2+20, stoneDk);
+    // Head
+    ImageDrawRectangle(img, bx2+6, by2-2, 18, 10, stone);
+    ImageDrawRectangle(img, bx2+7, by2-1, 16, 1, stoneLt);
+    // Eyes (glowing)
+    ImageDrawRectangle(img, bx2+10, by2+2, 3, 3, {80, 200, 255, 255});
+    ImageDrawRectangle(img, bx2+18, by2+2, 3, 3, {80, 200, 255, 255});
+    // Arms
+    ImageDrawRectangle(img, bx2-8, by2+10, 9, 7, stoneDk);
+    ImageDrawRectangle(img, bx2+29, by2+10, 9, 7, stoneDk);
+  } else if (strstr(sub, "bug")) {
+    // ── Bug: insect with wings and legs ──
+    Color shell = bg;
+    // Body segments
+    for (int seg = 0; seg < 3; seg++) {
+      int sy = cy - 5 + seg * 10;
+      for (int dy = -5; dy <= 5; dy++)
+        for (int dx = -8; dx <= 8; dx++)
+          if (dx*dx*0.4f + dy*dy < 25)
+            ImageDrawPixel(img, cx+dx, sy+dy, (seg==0) ? bgLt : shell);
+    }
+    // Wings
+    Color wing = {bgLt.r, bgLt.g, bgLt.b, 180};
+    for (int dy = -15; dy <= 15; dy++)
+      for (int dx = -20; dx <= -5; dx++) {
+        float ex2 = (dx+12.0f)/8.0f, ey3 = dy/15.0f;
+        if (ex2*ex2 + ey3*ey3 < 1.0f)
+          ImageDrawPixel(img, cx+dx, cy-5+dy, wing);
+      }
+    for (int dy = -15; dy <= 15; dy++)
+      for (int dx = 5; dx <= 20; dx++) {
+        float ex2 = (dx-12.0f)/8.0f, ey3 = dy/15.0f;
+        if (ex2*ex2 + ey3*ey3 < 1.0f)
+          ImageDrawPixel(img, cx+dx, cy-5+dy, wing);
+      }
+    // Eyes
+    ImageDrawPixel(img, cx-3, cy-12, {255, 50, 50, 255});
+    ImageDrawPixel(img, cx+3, cy-12, {255, 50, 50, 255});
+    // Legs
+    for (int l = 0; l < 3; l++) {
+      int ly = cy + l*8;
+      ImageDrawLine(img, cx-8, ly, cx-18, ly+6, bgDk);
+      ImageDrawLine(img, cx+8, ly, cx+18, ly+6, bgDk);
+    }
+  } else if (strstr(sub, "berserker")) {
+    // ── Berserker: muscular warrior with weapon ──
+    Color skin = {180, 130, 90, 255}, skinDk = {130, 90, 60, 255};
+    int bx2 = cx, by2 = groundY - 38;
+    // Body
+    ImageDrawRectangle(img, bx2-10, by2+8, 20, 20, skin);
+    ImageDrawRectangle(img, bx2-10, by2+8, 20, 2, {200, 150, 100, 255});
+    // Head
+    for (int dy = -8; dy <= 0; dy++)
+      for (int dx = -7; dx <= 7; dx++)
+        if (dx*dx + dy*dy < 56) ImageDrawPixel(img, bx2+dx, by2+dy, skin);
+    // Eyes (fierce)
+    ImageDrawPixel(img, bx2-3, by2-3, {255, 60, 30, 255});
+    ImageDrawPixel(img, bx2+3, by2-3, {255, 60, 30, 255});
+    // Legs
+    ImageDrawRectangle(img, bx2-8, by2+28, 7, 12, skinDk);
+    ImageDrawRectangle(img, bx2+1, by2+28, 7, 12, skinDk);
+    // Weapon (axe)
+    ImageDrawRectangle(img, bx2+12, by2-5, 3, 35, {100, 70, 40, 255});
+    ImageDrawRectangle(img, bx2+10, by2-5, 10, 8, {160, 160, 170, 255});
+    // War paint
+    ImageDrawLine(img, bx2-5, by2-2, bx2+5, by2-2, {180, 40, 30, 255});
+  } else if (strstr(sub, "mage")) {
+    // ── Mage: robed figure with magic ──
+    Color robe = {60, 50, 140, 255}, robeLt = {100, 90, 180, 255};
+    int bx2 = cx, by2 = groundY - 36;
+    // Robe body (triangle shape)
+    for (int y = 0; y < 30; y++) {
+      int hw = 6 + y / 2;
+      ImageDrawRectangle(img, bx2-hw, by2+8+y, hw*2, 1, (y < 5) ? robeLt : robe);
+    }
+    // Head
+    for (int dy = -6; dy <= 0; dy++)
+      for (int dx = -5; dx <= 5; dx++)
+        if (dx*dx + dy*dy < 30) ImageDrawPixel(img, bx2+dx, by2+dy, {200, 170, 140, 255});
+    // Hat
+    for (int y = 0; y < 12; y++) {
+      int hw = 7 - y/2;
+      if (hw > 0) ImageDrawRectangle(img, bx2-hw, by2-6-y, hw*2, 1, robe);
+    }
+    // Staff
+    ImageDrawRectangle(img, bx2+14, by2-12, 2, 50, {120, 90, 50, 255});
+    // Magic glow at staff tip
+    for (int dy = -4; dy <= 4; dy++)
+      for (int dx = -4; dx <= 4; dx++)
+        if (dx*dx+dy*dy < 16) ImageDrawPixel(img, bx2+15+dx, by2-14+dy, {120, 200, 255, 255});
+  } else if (strstr(sub, "angel") || strstr(sub, "spirit")) {
+    // ── Angel/Spirit: ethereal winged figure ──
+    Color glow = {200, 200, 240, 255}, glowBr = {240, 240, 255, 255};
+    int by2 = cy - 5;
+    // Body (glowing silhouette)
+    for (int y = 0; y < 25; y++) {
+      int hw = 5 + (y < 12 ? y/3 : (24-y)/3);
+      for (int dx = -hw; dx <= hw; dx++)
+        ImageDrawPixel(img, cx+dx, by2+y, colLerp(glow, glowBr, 0.5f));
+    }
+    // Head (bright circle)
+    for (int dy = -5; dy <= 5; dy++)
+      for (int dx = -5; dx <= 5; dx++)
+        if (dx*dx+dy*dy < 25) ImageDrawPixel(img, cx+dx, by2-3+dy, glowBr);
+    // Halo
+    for (int a = 0; a < 24; a++) {
+      float ang = a * 0.2618f;
+      ImageDrawPixel(img, cx+(int)(cosf(ang)*8), by2-10+(int)(sinf(ang)*3), {255,220,100,255});
+    }
+    // Wings
+    for (int side = -1; side <= 1; side += 2)
+      for (int f = 0; f < 12; f++) {
+        float ang = (f * 0.15f) - 0.9f;
+        for (int r = 6; r < 25; r++) {
+          int px = cx + side * (int)(cosf(ang) * r + 8);
+          int py = by2 + 5 + (int)(sinf(ang) * r);
+          if (px >= 0 && px < W && py >= 0 && py < H)
+            ImageDrawPixel(img, px, py, colLerp(glow, glowBr, 1.0f - r/25.0f));
+        }
+      }
+  } else if (strstr(sub, "demon")) {
+    // ── Demon: dark horned figure with flames ──
+    Color demonC = {100, 30, 50, 255}, fire = {220, 100, 30, 255};
+    int by2 = groundY - 40;
+    // Body
+    for (int y = 0; y < 28; y++) {
+      int hw = 8 + y/4;
+      ImageDrawRectangle(img, cx-hw, by2+10+y, hw*2, 1, demonC);
+    }
+    // Head
+    for (int dy = -7; dy <= 0; dy++)
+      for (int dx = -6; dx <= 6; dx++)
+        if (dx*dx + dy*dy < 42) ImageDrawPixel(img, cx+dx, by2+2+dy, demonC);
+    // Horns
+    for (int h2 = 0; h2 < 10; h2++) {
+      ImageDrawPixel(img, cx-5-h2/2, by2-5-h2, {60, 20, 30, 255});
+      ImageDrawPixel(img, cx+5+h2/2, by2-5-h2, {60, 20, 30, 255});
+    }
+    // Eyes
+    ImageDrawPixel(img, cx-3, by2-1, fire);
+    ImageDrawPixel(img, cx+3, by2-1, fire);
+    // Flames at base
+    for (int f = 0; f < 20; f++) {
+      int fx = cx - 15 + (s+f*7)%30;
+      int fh = 5 + (s+f*13)%10;
+      for (int fy = 0; fy < fh; fy++)
+        if (fx >= 0 && fx < W)
+          ImageDrawPixel(img, fx, groundY-fy, colLerp(fire, {255,220,60,255}, fy/(float)fh));
+    }
+  } else if (strstr(sub, "zombie")) {
+    // ── Zombie: shambling figure with torn clothes ──
+    Color flesh = {120, 140, 90, 255}, cloth = {70, 60, 50, 255};
+    int bx2 = cx + 3, by2 = groundY - 35; // slight lean
+    // Body (ragged)
+    for (int y = 0; y < 22; y++) {
+      int hw = 7 + ((s+y)%3);
+      ImageDrawRectangle(img, bx2-hw, by2+10+y, hw*2, 1, (y%3==0) ? cloth : flesh);
+    }
+    // Head (tilted)
+    for (int dy = -6; dy <= 0; dy++)
+      for (int dx = -5; dx <= 5; dx++)
+        if (dx*dx+dy*dy < 28) ImageDrawPixel(img, bx2-2+dx, by2+2+dy, flesh);
+    // Empty eye
+    ImageDrawPixel(img, bx2-4, by2, {30, 20, 15, 255});
+    ImageDrawPixel(img, bx2, by2, {180, 200, 60, 255}); // glowing eye
+    // Arms reaching forward
+    ImageDrawRectangle(img, bx2-18, by2+14, 12, 4, flesh);
+    ImageDrawRectangle(img, bx2+8, by2+12, 12, 4, flesh);
+    // Legs
+    ImageDrawRectangle(img, bx2-5, by2+32, 5, 10, cloth);
+    ImageDrawRectangle(img, bx2+2, by2+32, 5, 10, cloth);
+  } else if (strstr(sub, "beast")) {
+    // ── Beast: four-legged creature ──
+    Color fur = bg, furDk = bgDk;
+    int bx2 = cx, by2 = groundY - 20;
+    // Body (horizontal oval)
+    for (int dy = -7; dy <= 7; dy++)
+      for (int dx = -18; dx <= 18; dx++) {
+        float ex2 = dx/18.0f, ey2 = dy/7.0f;
+        if (ex2*ex2 + ey2*ey2 < 1.0f) ImageDrawPixel(img, bx2+dx, by2+dy, fur);
+      }
+    // Head
+    for (int dy = -6; dy <= 6; dy++)
+      for (int dx = -8; dx <= 8; dx++)
+        if (dx*dx+dy*dy < 50) ImageDrawPixel(img, bx2+20+dx, by2-4+dy, fur);
+    // Eye
+    ImageDrawPixel(img, bx2+24, by2-6, {255, 200, 50, 255});
+    // Legs (4)
+    for (int l = 0; l < 4; l++) {
+      int lx = bx2 - 12 + l * 8;
+      ImageDrawRectangle(img, lx, by2+6, 4, 10, furDk);
+    }
+    // Tail
+    for (int i = 0; i < 12; i++)
+      ImageDrawPixel(img, bx2-18-i, by2-2+(int)(sinf(i*0.6f)*3), furDk);
+  } else if (strstr(sub, "wurm")) {
+    // ── Wurm: serpentine body ──
+    Color scale = bg, scaleLt = bgLt;
+    for (int seg = 0; seg < 20; seg++) {
+      float t = seg / 20.0f;
+      int sx = cx + (int)(sinf(t * 6.28f) * 20);
+      int sy = (int)(H * 0.2f + t * H * 0.6f);
+      int rad = (int)(8 - t * 4);
+      for (int dy = -rad; dy <= rad; dy++)
+        for (int dx = -rad; dx <= rad; dx++)
+          if (dx*dx+dy*dy < rad*rad && sx+dx >= 0 && sx+dx < W && sy+dy >= 0 && sy+dy < H)
+            ImageDrawPixel(img, sx+dx, sy+dy, (dy < 0) ? scaleLt : scale);
+    }
+    // Eye
+    ImageDrawPixel(img, cx+(int)(sinf(0)*20)+2, (int)(H*0.2f)-1, {255,60,30,255});
+  } else if (strstr(sub, "merchant")) {
+    // ── Merchant: robed figure with goods ──
+    Color robe2 = {170, 140, 60, 255}, robeDk = {120, 95, 35, 255};
+    int by2 = groundY - 36;
+    for (int y = 0; y < 28; y++) {
+      int hw = 5 + y/3;
+      ImageDrawRectangle(img, cx-hw, by2+8+y, hw*2, 1, (y < 4) ? robe2 : robeDk);
+    }
+    // Head with turban
+    for (int dy = -6; dy <= 0; dy++)
+      for (int dx = -5; dx <= 5; dx++)
+        if (dx*dx+dy*dy < 28) ImageDrawPixel(img, cx+dx, by2+dy, {190,155,110,255});
+    ImageDrawRectangle(img, cx-6, by2-8, 12, 5, {240, 220, 180, 255});
+    // Sack of goods
+    for (int dy = -5; dy <= 5; dy++)
+      for (int dx = -6; dx <= 6; dx++)
+        if (dx*dx+dy*dy < 36) ImageDrawPixel(img, cx+16+dx, by2+18+dy, {140,100,50,255});
+  } else {
+    // ── Default (soldier, rogue, etc.): armed humanoid ──
+    Color armor = bg, armorDk = bgDk;
+    int by2 = groundY - 38;
+    // Body
+    ImageDrawRectangle(img, cx-8, by2+8, 16, 22, armor);
+    ImageDrawRectangle(img, cx-8, by2+8, 16, 2, bgLt);
+    // Head
+    for (int dy = -6; dy <= 0; dy++)
+      for (int dx = -5; dx <= 5; dx++)
+        if (dx*dx+dy*dy < 30) ImageDrawPixel(img, cx+dx, by2+dy, {190,155,110,255});
+    // Helmet/hood
+    ImageDrawRectangle(img, cx-6, by2-8, 12, 5, armorDk);
+    // Eyes
+    ImageDrawPixel(img, cx-2, by2-2, PALETTE[0]);
+    ImageDrawPixel(img, cx+2, by2-2, PALETTE[0]);
+    // Weapon (sword)
+    ImageDrawRectangle(img, cx+12, by2-8, 2, 38, {180,180,190,255});
+    ImageDrawRectangle(img, cx+9, by2+2, 8, 3, {120,90,50,255}); // crossguard
+    // Legs
+    ImageDrawRectangle(img, cx-6, by2+30, 5, 10, armorDk);
+    ImageDrawRectangle(img, cx+1, by2+30, 5, 10, armorDk);
+    // Shield (if soldier/rogue)
+    if (strstr(sub, "soldier") || strstr(sub, "rogue")) {
+      ImageDrawRectangle(img, cx-18, by2+10, 10, 14, armorDk);
+      ImageDrawRectangle(img, cx-17, by2+12, 8, 10, armor);
+    }
   }
-  ImageDrawRectangle(img, bx + 1, by + bh, 2, 3, dark);
-  ImageDrawRectangle(img, bx + bw - 3, by + bh, 2, 3, dark);
 }
 
 static void GenerateCardTexture(int cardIdx) {
   const CardDef &cd = ALL_CARDS[cardIdx];
   Image img = GenImageColor(CARD_TEX_W, CARD_TEX_H, PALETTE[0]);
 
-  // Outer frame (2px border — gold for common, purple for rare, rainbow for
-  // unique)
-  Color frameCol = cd.rarity == 1 ? Color{180, 80, 220, 255}
-                   : cd.isUnique  ? Color{220, 180, 60, 255}
-                                  : PALETTE[3];
-  ImageDrawRectangleLines(&img, {0, 0, (float)CARD_TEX_W, (float)CARD_TEX_H}, 2,
-                          frameCol);
-  ImageDrawRectangleLines(
-      &img, {2, 2, (float)(CARD_TEX_W - 4), (float)CARD_TEX_H - 4}, 1,
-      PALETTE[1]);
-
-  // Top bar: name background
-  ImageDrawRectangle(&img, 3, 3, CARD_TEX_W - 6, 14, PALETTE[1]);
-  ImageDrawText(&img, cd.name, 16, 5, 8, PALETTE[5]);
-
-  // Cost circle (top-left) — gold coin for all cards
-  Color costBg = {195, 155, 30, 255};
-  ImageDrawRectangle(&img, 4, 4, 11, 11, costBg);
-  ImageDrawRectangleLines(&img, {4, 4, 11, 11}, 1, PALETTE[0]);
-  char costStr[4];
-  snprintf(costStr, 4, "%d", cd.cost);
-  ImageDrawText(&img, costStr, 6, 5, 8, PALETTE[6]);
-
-  // Art area (top half below name bar)
-  int artY = 18;
-  int artH = 50;
-  Color artBg = cd.isUnit ? SubtypeColor(cd.subtype) : Color{60, 90, 50, 255};
-  Color artBgDk = {(unsigned char)(artBg.r * 0.4f),
-                   (unsigned char)(artBg.g * 0.4f),
-                   (unsigned char)(artBg.b * 0.4f), 255};
-  ImageDrawRectangle(&img, 4, artY, CARD_TEX_W - 8, artH, artBgDk);
-  ImageDrawRectangleLines(
-      &img, {4, (float)artY, (float)(CARD_TEX_W - 8), (float)artH}, 1,
-      PALETTE[2]);
-
-  // Draw creature/spell art
-  if (cd.isUnit) {
-    DrawCardCreature(&img, cd.id, artBg, 8, artY + 4, CARD_TEX_W - 16,
-                     artH - 8);
-  } else {
-    int cx2 = CARD_TEX_W / 2, cy2 = artY + artH / 2;
-    for (int a = 0; a < 8; a++) {
-      float angle = a * 0.785f;
-      for (int r = 3; r < 12; r++) {
-        int px = cx2 + (int)(cosf(angle) * r);
-        int py = cy2 + (int)(sinf(angle) * r);
-        if (px >= 4 && px < CARD_TEX_W - 4 && py >= artY && py < artY + artH) {
-          Color sc = (r < 7) ? PALETTE[4] : PALETTE[14];
-          ImageDrawPixel(&img, px, py, sc);
-        }
-      }
-    }
-  }
-
-  // Divider line
-  int divY = artY + artH + 1;
-  ImageDrawRectangle(&img, 4, divY, CARD_TEX_W - 8, 1, PALETTE[3]);
-
-  // Subtype text
-  if (cd.isUnit && cd.subtype[0]) {
-    char subBuf[32];
-    snprintf(subBuf, 32, "[%s]", cd.subtype);
-    ImageDrawText(&img, subBuf, 6, divY + 2, 8, PALETTE[15]);
-  } else {
-    ImageDrawText(&img, "[Support]", 6, divY + 2, 8, PALETTE[9]);
-  }
-
-  // Rules text area
-  int textY = divY + 12;
-  int textH = CARD_TEX_H - textY - 18;
-  ImageDrawRectangle(&img, 4, textY, CARD_TEX_W - 8, textH, {40, 30, 18, 255});
-  if (cd.effect[0]) {
-    char line1[48] = {}, line2[48] = {};
-    int len = (int)strlen(cd.effect);
-    if (len <= 20) {
-      snprintf(line1, 47, "%s", cd.effect);
-    } else {
-      int brk = 20;
-      while (brk > 10 && cd.effect[brk] != ' ')
-        brk--;
-      if (brk <= 10)
-        brk = 20;
-      snprintf(line1, brk + 1, "%s", cd.effect);
-      snprintf(line2, 47, "%s",
-               cd.effect + brk + (cd.effect[brk] == ' ' ? 1 : 0));
-    }
-    ImageDrawText(&img, line1, 6, textY + 2, 8, PALETTE[5]);
-    if (line2[0])
-      ImageDrawText(&img, line2, 6, textY + 11, 8, PALETTE[5]);
-  }
-
-  // Stat blocks (units only)
-  if (cd.isUnit) {
-    int statY = CARD_TEX_H - 16;
-    ImageDrawRectangle(&img, 3, statY, 22, 14, {140, 40, 30, 255});
-    ImageDrawRectangleLines(&img, {3, (float)statY, 22, 14}, 1, PALETTE[0]);
-    char atkStr[8];
-    snprintf(atkStr, 8, "%d", cd.atk);
-    ImageDrawText(&img, atkStr, 7, statY + 3, 8, PALETTE[6]);
-    ImageDrawPixel(&img, 5, statY + 2, PALETTE[4]);
-    ImageDrawPixel(&img, 5, statY + 3, PALETTE[4]);
-
-    ImageDrawRectangle(&img, CARD_TEX_W - 25, statY, 22, 14,
-                       {40, 50, 140, 255});
-    ImageDrawRectangleLines(
-        &img, {(float)(CARD_TEX_W - 25), (float)statY, 22, 14}, 1, PALETTE[0]);
-    char defStr[8];
-    snprintf(defStr, 8, "%d", cd.def);
-    ImageDrawText(&img, defStr, CARD_TEX_W - 21, statY + 3, 8, PALETTE[6]);
-    ImageDrawPixel(&img, CARD_TEX_W - 23, statY + 2, PALETTE[8]);
-    ImageDrawPixel(&img, CARD_TEX_W - 23, statY + 3, PALETTE[8]);
-  } else {
-    int statY = CARD_TEX_H - 14;
-    char cstr[16];
-    snprintf(cstr, 16, "Cost: %d", cd.cost);
-    ImageDrawText(&img, cstr, CARD_TEX_W / 2 - 20, statY + 2, 8, PALETTE[15]);
-  }
-
-  // Keywords strip (above stats)
-  if (cd.keywords[0]) {
-    int kwY = CARD_TEX_H - 28;
-    ImageDrawText(&img, cd.keywords, 6, kwY, 8, PALETTE[14]);
-  }
+  // Pure art — no frame, no text, no stats. DrawCardView handles all UI.
+  DrawCardArt(&img, cd);
 
   Texture2D tex = LoadTextureFromImage(img);
-  SetTextureFilter(tex, TEXTURE_FILTER_POINT);
+  SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
   UnloadImage(img);
   g_cardTextures[cd.id] = tex;
 }
@@ -7484,7 +8849,7 @@ static void DrawNPCDialog() {
   DrawRectangleLinesEx({(float)nameBoxX, (float)nameBoxY,
                         (float)nameW, (float)nameBoxH}, 1.5f,
                        {200, 170, 100, 255});
-  DrawText(name, nameBoxX + 12, nameBoxY + 6, 16, {255, 230, 150, 255});
+  DrawUI(name, nameBoxX + 12, nameBoxY + 6, 16, {255, 230, 150, 255});
 
   // ── Message Box (main dialogue area) ───────────────────────────────────
   DrawRectangle(msgBoxX, msgBoxY, msgBoxW, msgBoxH, {18, 13, 9, 230});
@@ -7494,9 +8859,9 @@ static void DrawNPCDialog() {
 
   if (g_dialogPhase == DIALOG_TALK && g_dialogText) {
     // ── Talk phase: show lore text ─────────────────────────────────────
-    DrawText(g_dialogText, msgBoxX + 18, msgBoxY + 14, 14,
+    DrawUI(g_dialogText, msgBoxX + 18, msgBoxY + 14, 14,
              {230, 220, 190, 255});
-    DrawText("[Enter] OK", msgBoxX + msgBoxW - 100, msgBoxY + msgBoxH - 22,
+    DrawUI("[Enter] OK", msgBoxX + msgBoxW - 100, msgBoxY + msgBoxH - 22,
              10, {180, 160, 120, 180});
   } else if (g_targetNPC >= 0 && g_npcs[g_targetNPC].nomadic) {
     // ── Nomadic merchant menu ──────────────────────────────────────────
@@ -7507,9 +8872,9 @@ static void DrawNPCDialog() {
       char offerBuf[128];
       snprintf(offerBuf, sizeof(offerBuf),
                "I carry a rare item on my travels:\n  %s\nA small donation (5-20 coins)?", itemName);
-      DrawText(offerBuf, msgBoxX + 18, msgBoxY + 14, 13, {230, 220, 190, 255});
+      DrawUI(offerBuf, msgBoxX + 18, msgBoxY + 14, 13, {230, 220, 190, 255});
     } else {
-      DrawText("I have given away all my wares.\nPerhaps our paths cross again.",
+      DrawUI("I have given away all my wares.\nPerhaps our paths cross again.",
                msgBoxX + 18, msgBoxY + 14, 13, {180, 170, 150, 255});
     }
     const char *opts[] = {"Accept", "Decline"};
@@ -7518,39 +8883,54 @@ static void DrawNPCDialog() {
       Color col = sel ? Color{255, 220, 80, 255} : Color{210, 200, 170, 255};
       char buf[32];
       snprintf(buf, sizeof(buf), "%s%s", sel ? "> " : "  ", opts[i]);
-      DrawText(buf, msgBoxX + 18, msgBoxY + msgBoxH - 55 + i * 20, 16, col);
+      DrawUI(buf, msgBoxX + 18, msgBoxY + msgBoxH - 55 + i * 20, 16, col);
     }
-    DrawText("[W/S] Select  [Enter/E] Confirm  [Esc] Close",
+    DrawUI("[W/S] Select  [Enter/E] Confirm  [Esc] Close",
              msgBoxX + 18, msgBoxY + msgBoxH - 22, 10, {160, 140, 100, 160});
   } else {
-    // ── Menu phase: Talk / Trade / Duel / Close ────────────────────────
+    // ── Menu phase — options depend on is_deck_owner (g_hasStarterDeck) ──
     bool isTournamentMaster = (g_targetNPC >= 0 &&
         g_npcs[g_targetNPC].role == NPC_ROLE_TOURNAMENT);
     const char *duelLabel = isTournamentMaster ? "Tournament" : "Duel";
-    const char *options[] = {"Talk", "Trade", duelLabel, "Close"};
-    for (int i = 0; i < 4; i++) {
-      bool sel = (i == g_dialogSelection);
-      Color col = sel ? Color{255, 220, 80, 255} : Color{210, 200, 170, 255};
-      const char *arrow = sel ? "> " : "  ";
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%s%s", arrow, options[i]);
-      DrawText(buf, msgBoxX + 18, msgBoxY + 14 + i * 20, 16, col);
-    }
-    // Tournament master: show city round progress in dialog
-    if (isTournamentMaster) {
-      int ci = g_npcs[g_targetNPC].cityIndex;
-      bool badgeEarned = g_tournament.cityChampionDefeated[ci];
-      char statusBuf[80];
-      if (badgeEarned) {
-        snprintf(statusBuf, sizeof(statusBuf), "City Badge: EARNED");
-        DrawText(statusBuf, msgBoxX + msgBoxW - 180, msgBoxY + 14, 10, {100,255,100,200});
-      } else {
-        snprintf(statusBuf, sizeof(statusBuf), "Round %d/3",
-                 (g_tournament.currentCity == ci) ? g_tournament.roundsWon : 0);
-        DrawText(statusBuf, msgBoxX + msgBoxW - 120, msgBoxY + 14, 10, {220,200,100,200});
+
+    if (!g_hasStarterDeck) {
+      // State A: No deck — only Talk and Close (flavor text / world-building)
+      const char *options[] = {"Talk", "Close"};
+      for (int i = 0; i < 2; i++) {
+        bool sel = (i == g_dialogSelection);
+        Color col = sel ? Color{255, 220, 80, 255} : Color{210, 200, 170, 255};
+        const char *arrow = sel ? "> " : "  ";
+        char buf2[64];
+        snprintf(buf2, sizeof(buf2), "%s%s", arrow, options[i]);
+        DrawUI(buf2, msgBoxX + 18, msgBoxY + 14 + i * 20, 16, col);
+      }
+    } else {
+      // State B: Has deck — full menu: Talk, Trade, Duel, Close
+      const char *options[] = {"Talk", "Trade", duelLabel, "Close"};
+      for (int i = 0; i < 4; i++) {
+        bool sel = (i == g_dialogSelection);
+        Color col = sel ? Color{255, 220, 80, 255} : Color{210, 200, 170, 255};
+        const char *arrow = sel ? "> " : "  ";
+        char buf2[64];
+        snprintf(buf2, sizeof(buf2), "%s%s", arrow, options[i]);
+        DrawUI(buf2, msgBoxX + 18, msgBoxY + 14 + i * 20, 16, col);
+      }
+      // Tournament master: show city round progress in dialog
+      if (isTournamentMaster) {
+        int ci = g_npcs[g_targetNPC].cityIndex;
+        bool badgeEarned = g_tournament.cityChampionDefeated[ci];
+        char statusBuf[80];
+        if (badgeEarned) {
+          snprintf(statusBuf, sizeof(statusBuf), "City Badge: EARNED");
+          DrawUI(statusBuf, msgBoxX + msgBoxW - 180, msgBoxY + 14, 10, {100,255,100,200});
+        } else {
+          snprintf(statusBuf, sizeof(statusBuf), "Round %d/3",
+                   (g_tournament.currentCity == ci) ? g_tournament.roundsWon : 0);
+          DrawUI(statusBuf, msgBoxX + msgBoxW - 120, msgBoxY + 14, 10, {220,200,100,200});
+        }
       }
     }
-    DrawText("[W/S] Select  [Enter/E] Confirm  [Esc] Close",
+    DrawUI("[W/S] Select  [Enter/E] Confirm  [Esc] Close",
              msgBoxX + 18, msgBoxY + msgBoxH - 22, 10,
              {160, 140, 100, 160});
   }
@@ -7562,11 +8942,28 @@ static void UpdateNPCDialog() {
   if (!g_npcDialogOpen)
     return;
 
+  // Skip input on the frame dialog was opened (same Enter press that opened it)
+  if (g_npcDialogJustOpened) {
+    g_npcDialogJustOpened = false;
+    return;
+  }
+
   bool confirm = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_E) || g_padAPressed;
 
   if (g_dialogPhase == DIALOG_TALK) {
     // In talk mode, any confirm/escape closes the dialog
     if (confirm || IsKeyPressed(KEY_ESCAPE) || g_padBPressed) {
+      // Tutorial pre-match dialog: confirming launches the tutorial duel
+      if (g_tutState == TUT_PRE_MATCH_DIALOG) {
+        g_npcDialogOpen = false;
+        g_dialogPhase   = DIALOG_MENU;
+        g_dialogText    = nullptr;
+        StartTutorialMatch(g_tutNpcIdx);
+        g_scene = SCENE_MATCH;
+        g_tutState = TUT_MATCH_PLAYING;
+        g_tutTimer = 0.0f;
+        return;
+      }
       // For nomadic NPCs the talk phase is a one-shot farewell — close entirely
       if (g_targetNPC >= 0 && g_npcs[g_targetNPC].nomadic) {
         g_npcDialogOpen = false;
@@ -7581,7 +8978,9 @@ static void UpdateNPCDialog() {
   }
 
   // ── Menu navigation ────────────────────────────────────────────────────
-  int maxSel = (g_targetNPC >= 0 && g_npcs[g_targetNPC].nomadic) ? 1 : 3;
+  // Nomadic: 2 options (0-1), No deck: 2 options (0-1), Has deck: 4 options (0-3)
+  int maxSel = (g_targetNPC >= 0 && g_npcs[g_targetNPC].nomadic) ? 1
+             : (!g_hasStarterDeck) ? 1 : 3;
   if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W)) {
     g_dialogSelection--;
     if (g_dialogSelection < 0) g_dialogSelection = maxSel;
@@ -7617,11 +9016,21 @@ static void UpdateNPCDialog() {
 
   if (confirm) {
     PlaySfx(SFX_CONFIRM);
-    switch (g_dialogSelection) {
-    case 0: { // Talk — show random card-game lore
+    // Remap selection when no deck: 0=Talk, 1=Close
+    int sel = g_dialogSelection;
+    if (!g_hasStarterDeck && sel == 1) sel = 3; // Close
+    switch (sel) {
+    case 0: { // Talk — show random card-game lore / flavor text
       int line = GetRandomValue(0, 2);
       int idx = (g_targetNPC >= 0 && g_targetNPC < 4) ? g_targetNPC : 0;
-      g_dialogText = g_npcLore[idx][line];
+      // Guide NPC gives hint about where to get a deck
+      if (g_targetNPC >= 0 && g_npcs[g_targetNPC].role == NPC_ROLE_GUIDE && !g_hasStarterDeck) {
+        g_dialogText = "You need a deck to compete! Visit the Card\n"
+                       "Shop in the bazaar tent and pick up a starter\n"
+                       "pack. Then prove your worth at the House of Glory.";
+      } else {
+        g_dialogText = g_npcLore[idx][line];
+      }
       g_dialogPhase = DIALOG_TALK;
       break;
     }
@@ -7637,6 +9046,7 @@ static void UpdateNPCDialog() {
           if (g_currentShopCity >= 0 && g_currentShopCity < 5 &&
               !g_shopCityVisited[g_currentShopCity]) {
             g_shopCityVisited[g_currentShopCity] = true;
+            OpenOnePack();
             OpenOnePack();
             OpenOnePack();
           }
@@ -7700,18 +9110,44 @@ static void UpdateNPCDialog() {
 // ── InteractWithNPC — called when player presses Enter/E near an NPC ─────────
 //    Opens dialogue, makes NPC face the player, resets dialogue state.
 static void InteractWithNPC(int npcIdx) {
+  // ── Tutorial intercept: any village NPC shows intro dialog then starts duel ─
+  if (g_tutState == TUT_AWAITING_NPC_TALK && !g_npcs[npcIdx].nomadic) {
+    g_tutNpcIdx = npcIdx;
+    // Open NPC dialog with intro text — match starts when player confirms
+    g_npcDialogOpen = true;
+    g_npcDialogJustOpened = true; // prevent same-frame Enter from dismissing
+    g_targetNPC = npcIdx;
+    g_dialogSelection = 0;
+    g_dialogPhase = DIALOG_TALK;
+    g_dialogText = "I've never seen you before... Are you new here?\n"
+                   "This whole kingdom is all about Cards & Coins.\n"
+                   "What? You've never heard of Cards & Coins?\n"
+                   "Let me show you!";
+    g_tutState = TUT_PRE_MATCH_DIALOG;
+    // NPC faces the player
+    float dx = g_player.posX - g_npcs[npcIdx].worldX;
+    float dz = g_player.posZ - g_npcs[npcIdx].worldZ;
+    float angle = atan2f(dx, dz) * RAD2DEG;
+    if (angle < 0) angle += 360.0f;
+    g_npcs[npcIdx].facingAngle = angle;
+    g_npcs[npcIdx].targetAngle = angle;
+    return;
+  }
+
   g_npcDialogOpen = true;
   g_targetNPC = npcIdx;
   g_dialogSelection = 0;
   g_dialogPhase = DIALOG_MENU;
   g_dialogText = nullptr;
   // NPC instantly faces the player
-  float dx = g_player.posX - g_npcs[npcIdx].worldX;
-  float dz = g_player.posZ - g_npcs[npcIdx].worldZ;
-  float angle = atan2f(dx, dz) * RAD2DEG;
-  if (angle < 0) angle += 360.0f;
-  g_npcs[npcIdx].facingAngle = angle;
-  g_npcs[npcIdx].targetAngle = angle;
+  {
+    float dx = g_player.posX - g_npcs[npcIdx].worldX;
+    float dz = g_player.posZ - g_npcs[npcIdx].worldZ;
+    float angle = atan2f(dx, dz) * RAD2DEG;
+    if (angle < 0) angle += 360.0f;
+    g_npcs[npcIdx].facingAngle = angle;
+    g_npcs[npcIdx].targetAngle = angle;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -7780,7 +9216,7 @@ static void DrawMenuOverlay() {
     const char *title = "MENU";
     int tw = MeasureText(title, 18);
     DrawRectangleRounded({px+6, py+6, pw-12, 32}, 0.3f, 4, {55, 40, 22, 255});
-    DrawText(title, (int)(px + pw*0.5f - tw*0.5f), (int)(py + 13), 18, {240, 210, 120, 255});
+    DrawUI(title, (int)(px + pw*0.5f - tw*0.5f), (int)(py + 13), 18, {240, 210, 120, 255});
 
     // 4 menu buttons
     const char *labels[] = {"Collection", "Decks", "Settings", "Save"};
@@ -7814,10 +9250,10 @@ static void DrawMenuOverlay() {
       DrawCircle((int)icx, (int)icy, 14, {20, 14, 8, 255});
       DrawCircle((int)icx, (int)icy, 12, iconCols[i]);
       int iw2 = MeasureText(icons[i], 12);
-      DrawText(icons[i], (int)(icx - iw2*0.5f), (int)(icy - 6), 12, {255, 255, 255, 240});
+      DrawUI(icons[i], (int)(icx - iw2*0.5f), (int)(icy - 6), 12, {255, 255, 255, 240});
 
       // Label
-      DrawText(labels[i], (int)(btnX + 48), (int)(btnY + btnH*0.5f - 8), 16,
+      DrawUI(labels[i], (int)(btnX + 48), (int)(btnY + btnH*0.5f - 8), 16,
                hov ? Color{255, 240, 170, 255} : Color{200, 180, 120, 255});
 
       // Click handler
@@ -7828,7 +9264,7 @@ static void DrawMenuOverlay() {
     }
 
     // Close hint
-    DrawText("Esc: Close", (int)(px + pw*0.5f - 30), (int)(py + ph - 22), 10,
+    DrawUI("Esc: Close", (int)(px + pw*0.5f - 30), (int)(py + ph - 22), 10,
              {140, 120, 80, 150});
     return;
   }
@@ -7850,7 +9286,7 @@ static void DrawMenuOverlay() {
   {
     const char *tt = tabTitles[g_menuTab];
     int ttw = MeasureText(tt, 16);
-    DrawText(tt, mx + mw / 2 - ttw / 2, my + 10, 16, {220, 190, 100, 255});
+    DrawUI(tt, mx + mw / 2 - ttw / 2, my + 10, 16, {220, 190, 100, 255});
   }
 
   // Back button (top-left)
@@ -7860,7 +9296,7 @@ static void DrawMenuOverlay() {
     bool bHov = CheckCollisionPointRec(mp, backR);
     DrawRectangleRounded(backR, 0.4f, 4,
       bHov ? Color{80, 60, 35, 255} : Color{55, 42, 24, 255});
-    DrawText("< Back", mx + 15, my + 11, 11,
+    DrawUI("< Back", mx + 15, my + 11, 11,
       bHov ? Color{255, 230, 130, 255} : Color{180, 155, 95, 220});
     if (bHov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
       g_menuShowHub = true;
@@ -7871,7 +9307,7 @@ static void DrawMenuOverlay() {
 
   if (g_menuTab == TAB_COLLECTION) {
     // COLLECTION BROWSER: 3x4 grid of card thumbnails
-    DrawText("Your Collection", mx + 15, panelY, 14, {200, 175, 100, 255});
+    DrawUI("Your Collection", mx + 15, panelY, 14, {200, 175, 100, 255});
 
     int cardW = 100, cardH = 136;
     int gapX = 12, gapY = 10;
@@ -7907,7 +9343,7 @@ static void DrawMenuOverlay() {
         char countStr[16];
         snprintf(countStr, 16, "x%d", g_cardCopies[idx].count);
         int tw = MeasureText(countStr, 10);
-        DrawText(countStr, cx2 + cardW / 2 - tw / 2, cy2 + cardH + 2, 10,
+        DrawUI(countStr, cx2 + cardW / 2 - tw / 2, cy2 + cardH + 2, 10,
                  {200, 175, 100, 200});
 
         // Click to select
@@ -7935,7 +9371,7 @@ static void DrawMenuOverlay() {
       }
       // Card details below
       int ty = gridY + 208;
-      DrawText(cd.name, detX + 10, ty, 14, {240, 220, 150, 255});
+      DrawUI(cd.name, detX + 10, ty, 14, {240, 220, 150, 255});
       ty += 20;
       char info[64];
       if (cd.isUnit) {
@@ -7944,18 +9380,18 @@ static void DrawMenuOverlay() {
       } else {
         snprintf(info, 64, "Support - Cost: %d", cd.cost);
       }
-      DrawText(info, detX + 10, ty, 11, {180, 160, 110, 255});
+      DrawUI(info, detX + 10, ty, 11, {180, 160, 110, 255});
       ty += 16;
       if (cd.isUnit && cd.subtype[0]) {
-        DrawText(cd.subtype, detX + 10, ty, 10, {160, 140, 100, 200});
+        DrawUI(cd.subtype, detX + 10, ty, 10, {160, 140, 100, 200});
         ty += 14;
       }
       if (cd.keywords[0]) {
-        DrawText(cd.keywords, detX + 10, ty, 10, {200, 180, 80, 220});
+        DrawUI(cd.keywords, detX + 10, ty, 10, {200, 180, 80, 220});
         ty += 14;
       }
       if (cd.effect[0]) {
-        DrawText(cd.effect, detX + 10, ty, 10, {180, 170, 130, 220});
+        DrawUI(cd.effect, detX + 10, ty, 10, {180, 170, 130, 220});
         ty += 14;
       }
 
@@ -7963,7 +9399,7 @@ static void DrawMenuOverlay() {
       int btnY = ty + 10;
       DrawRectangle(detX + 10, btnY, 100, 22, {80, 60, 35, 255});
       DrawRectangleLines(detX + 10, btnY, 100, 22, {180, 150, 80, 200});
-      DrawText("[A] Add to Deck", detX + 14, btnY + 5, 10,
+      DrawUI("[A] Add to Deck", detX + 14, btnY + 5, 10,
                {220, 200, 120, 255});
 
       // Handle add-to-deck
@@ -7978,7 +9414,7 @@ static void DrawMenuOverlay() {
       }
     }
 
-    DrawText("Scroll: Mouse Wheel", mx + 15, my + mh - 20, 10,
+    DrawUI("Scroll: Mouse Wheel", mx + 15, my + mh - 20, 10,
              {140, 120, 80, 150});
 
   } else if (g_menuTab == TAB_DECKS) {
@@ -7991,7 +9427,7 @@ static void DrawMenuOverlay() {
     char deckTitle[64];
     snprintf(deckTitle, 64, "Your Deck (%d/%d cards)", g_playerDeckSize,
              MAX_DECK);
-    DrawText(deckTitle, mx + 18, panelY + 6, 13, {220, 190, 100, 255});
+    DrawUI(deckTitle, mx + 18, panelY + 6, 13, {220, 190, 100, 255});
 
     // List deck cards
     int listY = panelY + 24;
@@ -8012,7 +9448,7 @@ static void DrawMenuOverlay() {
           cd.isUnit ? Color{200, 180, 120, 255} : Color{120, 180, 120, 255};
       char entry[80];
       snprintf(entry, 80, "%d. [%d] %s", i + 1, cd.cost, cd.name);
-      DrawText(entry, mx + 18, iy + 3, 10, tc);
+      DrawUI(entry, mx + 18, iy + 3, 10, tc);
 
       // Click to remove from deck
       if (hovered && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -8025,7 +9461,7 @@ static void DrawMenuOverlay() {
     }
 
     // Remove hint
-    DrawText("Click card to remove  |  [B] Remove last", mx + 18,
+    DrawUI("Click card to remove  |  [B] Remove last", mx + 18,
              panelY + panelH - 22, 9, {160, 140, 100, 160});
     if (IsKeyPressed(KEY_B) && g_playerDeckSize > 0)
       g_playerDeckSize--;
@@ -8036,7 +9472,7 @@ static void DrawMenuOverlay() {
     DrawRectangle(rightX, panelY, rightW, panelH - 10, {35, 28, 18, 220});
     DrawRectangleLines(rightX, panelY, rightW, panelH - 10,
                        {140, 110, 60, 180});
-    DrawText("Card Pool", rightX + 8, panelY + 6, 13, {220, 190, 100, 255});
+    DrawUI("Card Pool", rightX + 8, panelY + 6, 13, {220, 190, 100, 255});
 
     // Compact card list (pool)
     int poolY = panelY + 24;
@@ -8055,7 +9491,7 @@ static void DrawMenuOverlay() {
                         {30, 25, 15, 240});
           DrawRectangleLines((int)mp.x + 10, (int)mp.y - 30, 200, 28,
                              {140, 110, 60, 200});
-          DrawText(cd.effect, (int)mp.x + 14, (int)mp.y - 26, 8,
+          DrawUI(cd.effect, (int)mp.x + 14, (int)mp.y - 26, 8,
                    {200, 180, 130, 255});
         }
       }
@@ -8068,7 +9504,7 @@ static void DrawMenuOverlay() {
       else
         snprintf(entry, 80, "[%d] %s x%d", cd.cost, cd.name,
                  g_cardCopies[i].count);
-      DrawText(entry, rightX + 10, iy + 3, 10, tc);
+      DrawUI(entry, rightX + 10, iy + 3, 10, tc);
 
       // Click to add to deck
       if (hovered && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -8080,7 +9516,7 @@ static void DrawMenuOverlay() {
 
   } else if (g_menuTab == TAB_SAVE) {
     // SAVE/LOAD SYSTEM
-    DrawText("Save & Load", mx + 15, panelY, 16, {220, 190, 100, 255});
+    DrawUI("Save & Load", mx + 15, panelY, 16, {220, 190, 100, 255});
 
     int btnW = 200, btnH = 40;
     int cx = mx + mw / 2 - btnW / 2;
@@ -8092,7 +9528,7 @@ static void DrawMenuOverlay() {
     DrawRectangleLinesEx(
         {(float)cx, (float)(panelY + 40), (float)btnW, (float)btnH}, 1.0f,
         {100, 180, 100, 255});
-    DrawText("SAVE GAME", cx + 55, panelY + 52, 14, {220, 255, 220, 255});
+    DrawUI("SAVE GAME", cx + 55, panelY + 52, 14, {220, 255, 220, 255});
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
       Vector2 mp = GetMousePosition();
       if (mp.x >= cx && mp.x < cx + btnW && mp.y >= panelY + 40 &&
@@ -8111,7 +9547,7 @@ static void DrawMenuOverlay() {
     DrawRectangleLinesEx(
         {(float)cx, (float)(panelY + 100), (float)btnW, (float)btnH}, 1.0f,
         {100, 140, 220, 255});
-    DrawText("LOAD GAME", cx + 55, panelY + 112, 14, {220, 220, 255, 255});
+    DrawUI("LOAD GAME", cx + 55, panelY + 112, 14, {220, 220, 255, 255});
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
       Vector2 mp = GetMousePosition();
       if (mp.x >= cx && mp.x < cx + btnW && mp.y >= panelY + 100 &&
@@ -8124,47 +9560,47 @@ static void DrawMenuOverlay() {
 
     // Save notification
     if (g_saveNotification) {
-      DrawText("Game Saved!", cx + 55, panelY + 160, 14, {120, 255, 120, 255});
+      DrawUI("Game Saved!", cx + 55, panelY + 160, 14, {120, 255, 120, 255});
     }
 
-    DrawText("Save file: savegame.dat (in game directory)", mx + 15,
+    DrawUI("Save file: savegame.dat (in game directory)", mx + 15,
              panelY + panelH - 30, 10, {140, 120, 80, 150});
 
   } else if (g_menuTab == TAB_SETTINGS) {
     // SETTINGS
-    DrawText("Settings", mx + 15, panelY, 16, {220, 190, 100, 255});
+    DrawUI("Settings", mx + 15, panelY, 16, {220, 190, 100, 255});
 
     // Tournament info
     char tInfo[128];
     snprintf(tInfo, 128, "City: %s", g_tournament.GetCityName());
-    DrawText(tInfo, mx + 15, panelY + 40, 12, {200, 180, 130, 255});
+    DrawUI(tInfo, mx + 15, panelY + 40, 12, {200, 180, 130, 255});
     snprintf(tInfo, 128, "League: %s  (Round %d/%d)",
              g_tournament.GetLeagueName(), g_tournament.roundsWon,
              g_tournament.roundsPerLeague);
-    DrawText(tInfo, mx + 15, panelY + 58, 12, {200, 180, 130, 255});
+    DrawUI(tInfo, mx + 15, panelY + 58, 12, {200, 180, 130, 255});
     snprintf(tInfo, 128, "Tournaments Won: %d",
              g_tournament.totalTournamentsWon);
-    DrawText(tInfo, mx + 15, panelY + 76, 12, {200, 180, 130, 255});
+    DrawUI(tInfo, mx + 15, panelY + 76, 12, {200, 180, 130, 255});
     if (g_tournament.capitalUnlocked)
-      DrawText("CAPITAL UNLOCKED!", mx + 15, panelY + 94, 14,
+      DrawUI("CAPITAL UNLOCKED!", mx + 15, panelY + 94, 14,
                {255, 220, 80, 255});
 
     // Inventory
-    DrawText("Inventory:", mx + 15, panelY + 120, 14, {220, 190, 100, 255});
+    DrawUI("Inventory:", mx + 15, panelY + 120, 14, {220, 190, 100, 255});
     for (int i = 0; i < ITEM_COUNT; i++) {
       Color c = g_inventory.items[i].owned ? Color{200, 255, 200, 255}
                                            : Color{100, 90, 70, 150};
       snprintf(tInfo, 128, "%s %s - %s",
                g_inventory.items[i].owned ? "[x]" : "[ ]",
                g_inventory.items[i].name, g_inventory.items[i].desc);
-      DrawText(tInfo, mx + 25, panelY + 140 + i * 18, 10, c);
+      DrawUI(tInfo, mx + 25, panelY + 140 + i * 18, 10, c);
     }
 
     // Market info
-    DrawText("Economy:", mx + 15, panelY + 250, 14, {220, 190, 100, 255});
+    DrawUI("Economy:", mx + 15, panelY + 250, 14, {220, 190, 100, 255});
     snprintf(tInfo, 128, "Time: %s  |  Shop Modifier: %.0f%%",
              g_worldClock.GetName(), g_worldClock.GetShopMod() * 100);
-    DrawText(tInfo, mx + 25, panelY + 270, 10, {180, 160, 120, 200});
+    DrawUI(tInfo, mx + 25, panelY + 270, 10, {180, 160, 120, 200});
   }
 
   // Bottom status bar
@@ -8173,7 +9609,7 @@ static void DrawMenuOverlay() {
            "Coins: %d  |  Collection: %d cards  |  Deck: %d/%d  |  Tab/Arrows: "
            "Switch  |  Esc: Close",
            g_playerCoins, g_collectionSize, g_playerDeckSize, MAX_DECK);
-  DrawText(statusStr, mx + 15, my + mh - 8, 9, {160, 140, 100, 180});
+  DrawUI(statusStr, mx + 15, my + mh - 8, 9, {160, 140, 100, 180});
 
   // Save notification overlay (decays)
   if (g_saveNotification) {
@@ -8948,6 +10384,8 @@ static Model BuildRockModel(const ProceduralMesh &pm, Color col) {
   mesh.vertexCount = (int)pm.indices.size();
   mesh.triangleCount = triCount;
   mesh.vertices = (float *)MemAlloc(mesh.vertexCount * 3 * sizeof(float));
+  mesh.texcoords = (float *)MemAlloc(mesh.vertexCount * 2 * sizeof(float));
+  memset(mesh.texcoords, 0, mesh.vertexCount * 2 * sizeof(float));
   mesh.normals = (float *)MemAlloc(mesh.vertexCount * 3 * sizeof(float));
   mesh.colors = (unsigned char *)MemAlloc(mesh.vertexCount * 4);
   for (int i = 0; i < (int)pm.indices.size(); i += 3) {
@@ -8964,6 +10402,12 @@ static Model BuildRockModel(const ProceduralMesh &pm, Color col) {
       n.x /= nl;
       n.y /= nl;
       n.z /= nl;
+    }
+    // Ensure CCW winding (swap b,c if normal points inward)
+    Vector3 center = {(a.x+b.x+c.x)/3.0f, (a.y+b.y+c.y)/3.0f, (a.z+b.z+c.z)/3.0f};
+    if (n.x*center.x + n.y*center.y + n.z*center.z < 0.0f) {
+      Vector3 tmp = b; b = c; c = tmp;
+      n = {-n.x, -n.y, -n.z};
     }
     Vector3 verts[3] = {a, b, c};
     for (int j = 0; j < 3; j++) {
@@ -8984,6 +10428,7 @@ static Model BuildRockModel(const ProceduralMesh &pm, Color col) {
   }
   UploadMesh(&mesh, false);
   Model model = LoadModelFromMesh(mesh);
+  model.materials[0].shader = g_shRock;
   return model;
 }
 
@@ -9004,7 +10449,7 @@ static Model GenerateProceduralRock(float baseRadius, Color col) {
 }
 
 // ── Rock instance storage ───────────────────────────────────────────────────
-static constexpr int MAX_ROCKS = 12;
+static constexpr int MAX_ROCKS = 48;
 struct RockInstance {
   float x, z, rotY, scale;
   float cachedY; // cached GetDuneHeight — rocks don't move
@@ -9013,7 +10458,7 @@ struct RockInstance {
 static RockInstance g_rockInstances[MAX_ROCKS];
 static int g_numRocks = 0;
 // ── Vegetation instances (Northern Wastes cacti, agave, dry trees) ──────────
-static constexpr int MAX_VEGETATION = 80;
+static constexpr int MAX_VEGETATION = 160;
 enum VegType { VEG_SAGUARO = 0, VEG_PRICKLY_PEAR, VEG_AGAVE, VEG_DRY_TREE };
 struct VegetationInstance {
   float x, z;
@@ -9032,22 +10477,93 @@ static constexpr float OBELISK_Z = 7.5f;
 static float g_obeliskY = 0.0f; // cached at init
 
 
+static bool IsOnRoad(float px, float pz); // fwd decl
 static void InitProceduralRocks() {
   g_numRocks = 0;
   Color rockCols[] = {{165, 140, 110, 255},
                       {180, 155, 120, 255},
                       {145, 125, 95, 255},
                       {190, 165, 130, 255}};
-  for (int i = 0; i < MAX_ROCKS && g_numRocks < MAX_ROCKS; i++) {
-    int rx = GetRandomValue(2, MAP_W - 3);
-    int ry = GetRandomValue(2, MAP_H - 3);
+  // Landmark rock positions — scattered across the map for navigation
+  // Positions are hand-picked to avoid tent locations
+  static const struct { float x, z, scale; } rockSpots[] = {
+    // Village surrounds (larger, denser)
+    { 72, 55, 0.9f}, { 115, 55, 0.75f}, { 90, 72, 0.7f}, {112, 72, 0.8f},
+    { 80, 60, 0.65f}, { 95, 58, 0.55f}, {105, 65, 0.6f}, { 88, 48, 0.7f},
+    { 78, 68, 0.5f}, {108, 52, 0.6f},
+    // Roads between cities
+    { 60, 40, 0.95f}, {140, 40, 0.75f}, { 60, 95, 0.9f}, {140, 95, 0.8f},
+    // North
+    { 40, 20, 1.1f}, {160, 20, 0.9f}, { 80, 10, 0.75f}, {120, 10, 0.7f},
+    // South
+    { 40, 120, 0.9f}, {160, 120, 0.8f}, { 80, 135, 0.95f}, {120, 135, 0.75f},
+    // Central landmarks
+    { 55, 75, 0.8f}, {145, 75, 0.9f}, {100, 95, 0.75f}, {100, 40, 0.7f},
+    // Near cities
+    { 25, 80, 0.9f}, {175, 80, 0.8f}, { 38, 32, 0.75f}, {162, 32, 0.9f},
+    // Scattered desert
+    { 15, 50, 0.7f}, {185, 50, 0.75f}, { 50, 110, 0.9f}, {150, 110, 0.8f},
+    { 85, 85, 0.6f}, {115, 85, 0.65f},
+  };
+  int numSpots = (int)(sizeof(rockSpots) / sizeof(rockSpots[0]));
+  for (int i = 0; i < numSpots && g_numRocks < MAX_ROCKS; i++) {
+    float rx = rockSpots[i].x, rz = rockSpots[i].z;
+    // Roads removed — no road exclusion needed
     RockInstance &ri = g_rockInstances[g_numRocks++];
-    ri.x = (float)rx;
-    ri.z = (float)ry;
+    ri.x = rx;
+    ri.z = rz;
     ri.rotY = (float)GetRandomValue(0, 360);
-    ri.scale = 0.3f + (float)GetRandomValue(0, 40) * 0.01f;
+    ri.scale = rockSpots[i].scale;
     ri.cachedY = GetDuneHeight(ri.x, ri.z);
-    ri.model = GenerateProceduralRock(1.0f, rockCols[i % 4]);
+    ri.model = GenerateProceduralRock(1.0f, rockCols[g_numRocks % 4]);
+  }
+}
+
+// ── Border rocks: giant rock formations at map edges ──────────────────────────
+static constexpr int MAX_BORDER_ROCKS = 120;
+struct BorderRock { float x, z, y, scale, rotY; };
+static BorderRock g_borderRocks[MAX_BORDER_ROCKS];
+static int g_numBorderRocks = 0;
+static Model g_borderRockModels[4]; // 4 shared models for variety
+
+static void InitBorderRocks() {
+  g_numBorderRocks = 0;
+  Color cols[] = {{130, 105, 75, 255}, {150, 120, 85, 255},
+                  {115, 95, 65, 255}, {140, 110, 80, 255}};
+  for (int i = 0; i < 4; i++)
+    g_borderRockModels[i] = GenerateProceduralRock(1.0f, cols[i]);
+
+  // Place rocks along all 4 edges with some randomness
+  auto addBorder = [&](float x, float z, float sc) {
+    if (g_numBorderRocks >= MAX_BORDER_ROCKS) return;
+    BorderRock &br = g_borderRocks[g_numBorderRocks++];
+    br.x = x; br.z = z;
+    br.y = GetDuneHeight(x, z);
+    br.scale = sc;
+    br.rotY = (float)GetRandomValue(0, 360);
+  };
+
+  // North edge (z ~ 0)
+  for (float x = 0; x < MAP_W; x += 6.0f + GetRandomValue(0, 4))
+    addBorder(x + GetRandomValue(-2, 2), (float)GetRandomValue(-1, 3), 2.5f + GetRandomValue(0, 100)*0.02f);
+  // South edge (z ~ MAP_H)
+  for (float x = 0; x < MAP_W; x += 6.0f + GetRandomValue(0, 4))
+    addBorder(x + GetRandomValue(-2, 2), MAP_H - (float)GetRandomValue(-1, 3), 2.5f + GetRandomValue(0, 100)*0.02f);
+  // West edge (x ~ 0)
+  for (float z = 5; z < MAP_H - 5; z += 6.0f + GetRandomValue(0, 4))
+    addBorder((float)GetRandomValue(-1, 3), z + GetRandomValue(-2, 2), 2.5f + GetRandomValue(0, 100)*0.02f);
+  // East edge (x ~ MAP_W)
+  for (float z = 5; z < MAP_H - 5; z += 6.0f + GetRandomValue(0, 4))
+    addBorder(MAP_W - (float)GetRandomValue(-1, 3), z + GetRandomValue(-2, 2), 2.5f + GetRandomValue(0, 100)*0.02f);
+}
+
+static void DrawBorderRocks() {
+  for (int i = 0; i < g_numBorderRocks; i++) {
+    BorderRock &br = g_borderRocks[i];
+    if (DistSqToPlayer(br.x, br.z) > 2500.0f) continue; // 50u cull
+    if (!SphereInFrustum(br.x, br.y, br.z, br.scale * 4.0f)) continue;
+    DrawModelEx(g_borderRockModels[i % 4], {br.x, br.y, br.z},
+                {0,1,0}, br.rotY, {br.scale, br.scale, br.scale}, WHITE);
   }
 }
 
@@ -9063,7 +10579,9 @@ struct TentInstance {
   const char *signText;
   int doorGX, doorGY; // door tile in grid coords
   Scene interiorScene;
-  BoundingBox wallAABB;     // full tent collision
+  BoundingBox wallAABB;     // full tent AABB (kept for visibility/shadow checks)
+  BoundingBox wallSegs[5];  // 0=north 1=east 2=west 3=south-left 4=south-right
+  int numWallSegs;
   BoundingBox doorAABB;     // 1×1 door trigger
   BoundingBox interiorAABB; // ceiling-hide trigger volume
   bool roofVisible;         // false = player inside, roof hidden
@@ -9075,6 +10593,26 @@ struct TentInstance {
 static constexpr int MAX_TENTS = 30;
 static TentInstance g_tentInstances[MAX_TENTS];
 static int g_numTents = 0;
+
+// Build 5 thin wall-segment AABBs with a door gap on the south face
+static void ComputeWallSegments(TentInstance &t) {
+  float hs = t.tentHS;
+  float wt = 0.35f;   // wall thickness
+  float doorHW = 0.8f; // door half-width
+  float dCX = (float)t.doorGX;
+  float wx = t.worldX, wz = t.worldZ;
+  // North wall
+  t.wallSegs[0] = {{wx-hs, 0, wz-hs}, {wx+hs, 4, wz-hs+wt}};
+  // East wall
+  t.wallSegs[1] = {{wx+hs-wt, 0, wz-hs}, {wx+hs, 4, wz+hs}};
+  // West wall
+  t.wallSegs[2] = {{wx-hs, 0, wz-hs}, {wx-hs+wt, 4, wz+hs}};
+  // South-left (west edge to door gap)
+  t.wallSegs[3] = {{wx-hs, 0, wz+hs-wt}, {dCX-doorHW, 4, wz+hs}};
+  // South-right (door gap to east edge)
+  t.wallSegs[4] = {{dCX+doorHW, 0, wz+hs-wt}, {wx+hs, 4, wz+hs}};
+  t.numWallSegs = 5;
+}
 
 static void PlaceTentSized(int gx, int gy, float hs, Color wall, Color roof,
                            const char *sign, Scene interior) {
@@ -9116,6 +10654,7 @@ static void PlaceTentSized(int gx, int gy, float hs, Color wall, Color roof,
   }
   t.wallAABB.min = {t.worldX - hs, 0.0f, t.worldZ - hs};
   t.wallAABB.max = {t.worldX + hs, 4.0f, t.worldZ + hs};
+  ComputeWallSegments(t);
   float ddx = (float)t.doorGX + 0.5f, ddz = (float)t.doorGY + 0.5f;
   t.doorAABB.min = {ddx - 1.0f, 0.0f, ddz - 0.6f};
   t.doorAABB.max = {ddx + 1.0f, 2.0f, ddz + 0.6f};
@@ -9174,6 +10713,7 @@ static void PlaceTent(int gx, int gy, Color wall, Color roof, const char *sign,
   // AABB: full tent walls (4×4×4 world units)
   t.wallAABB.min = {t.worldX - 2.0f, 0.0f, t.worldZ - 2.0f};
   t.wallAABB.max = {t.worldX + 2.0f, 4.0f, t.worldZ + 2.0f};
+  ComputeWallSegments(t);
   // AABB: door trigger (2.0 wide × 1.2 deep, centered on door tile)
   float ddx = (float)t.doorGX + 0.5f, ddz = (float)t.doorGY + 0.5f;
   t.doorAABB.min = {ddx - 1.0f, 0.0f, ddz - 0.6f};
@@ -9912,51 +11452,8 @@ static constexpr float DUNE_MAX_HEIGHT = 3.0f;
 static constexpr float DUNE_FREQUENCY = 0.16f;
 
 static float GetDuneHeight(float x, float z) {
-  float n = PerlinFBM(x * DUNE_FREQUENCY, z * DUNE_FREQUENCY, 3, 0.5f);
-  float h = n - 0.5f;
-  float s = powf(fabsf(h), 1.6f);
-  h = 0.7f * h + 0.3f * (h >= 0.0f ? s : -s);
-  float base = h * DUNE_MAX_HEIGHT;
-
-  // ── Ma'ayan: oasis depression (early-exit > 18 units) ────────────────────
-  {
-    float dx = x - CITY_MAAYAN_X, dz = z - CITY_MAAYAN_Z;
-    float d2 = dx*dx + dz*dz;
-    if (d2 < 324.0f) // 18*18
-      base -= expf(-d2 / (10.0f*10.0f)) * 1.8f;
-  }
-  // ── Avak: flat eroded plain (early-exit > 20 units) ──────────────────────
-  {
-    float dx = x - CITY_AVAK_X, dz = z - CITY_AVAK_Z;
-    float d2 = dx*dx + dz*dz;
-    if (d2 < 400.0f) { // 20*20
-      float flat = expf(-d2 / (13.0f*13.0f));
-      base *= (1.0f - flat * 0.85f);
-    }
-  }
-  // ── Gan: terraced hills (early-exit > 22 units) ───────────────────────────
-  {
-    float dx = x - CITY_GAN_X, dz = z - CITY_GAN_Z;
-    float d2 = dx*dx + dz*dz;
-    if (d2 < 484.0f) { // 22*22
-      float dist      = sqrtf(d2);
-      float influence = expf(-d2 / (14.0f*14.0f));
-      float tier      = fmaxf(0.0f, floorf((14.0f - dist) / 3.0f));
-      base += influence * tier * 0.5f;
-    }
-  }
-  // ── Sela: canyon trench (early-exit > 20 units) ───────────────────────────
-  {
-    float dx = x - CITY_SELA_X, dz = z - CITY_SELA_Z;
-    float d2 = dx*dx + dz*dz;
-    if (d2 < 400.0f) { // 20*20
-      float crossSect = expf(-(dz*dz) / (5.5f*5.5f))
-                      * expf(-(dx*dx) / (13.0f*13.0f));
-      base -= crossSect * 5.5f;
-    }
-  }
-
-  return base;
+  (void)x; (void)z;
+  return 0.0f; // Flat terrain — no dunes
 }
 
 // Bilinear sample matching the terrain mesh's 0.5-unit vertex grid.
@@ -9991,18 +11488,23 @@ static Texture2D g_sandGritTexture;
 static bool g_terrainReady = false;
 
 static Texture2D GenerateSandTexture() {
-  int sz = 128;
+  int sz = 256;
   Image img = GenImageColor(sz, sz, {210, 185, 140, 255});
-  // Multi-pass noise for seamless sand grain look
   for (int y = 0; y < sz; y++)
     for (int x = 0; x < sz; x++) {
-      float n = PerlinFBM((float)x * 0.15f, (float)y * 0.15f, 4, 0.6f);
-      int v = (int)(n * 12.0f);
-      Color c = GetImageColor(img, x, y);
-      c.r = (unsigned char)Clamp(c.r + v, 150, 245);
-      c.g = (unsigned char)Clamp(c.g + v - 2, 130, 220);
-      c.b = (unsigned char)Clamp(c.b + v - 6, 90, 195);
-      ImageDrawPixel(&img, x, y, c);
+      float u = (float)x / (float)sz;
+      float v = (float)y / (float)sz;
+      // Wind-blown sand ripples
+      float rip1 = sinf((u * 12.0f + v * 4.0f) * 6.2832f);
+      float rip2 = sinf((u * 5.0f - v * 10.0f) * 6.2832f) * 0.4f;
+      float ripple = (rip1 + rip2) * 0.5f + 0.5f;
+      float noise = PerlinFBM((float)x * 0.08f, (float)y * 0.08f, 3, 0.5f);
+      float grain = PerlinFBM((float)x * 0.35f, (float)y * 0.35f, 2, 0.7f);
+      float val = ripple * 0.5f + noise * 0.3f + grain * 0.2f;
+      unsigned char r = (unsigned char)Clamp(165.0f + val * 75.0f, 155, 245);
+      unsigned char g = (unsigned char)Clamp(140.0f + val * 70.0f, 130, 215);
+      unsigned char b = (unsigned char)Clamp(90.0f  + val * 70.0f, 80, 170);
+      ImageDrawPixel(&img, x, y, {r, g, b, 255});
     }
   Texture2D t = LoadTextureFromImage(img);
   SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
@@ -10012,18 +11514,21 @@ static Texture2D GenerateSandTexture() {
 }
 
 static Texture2D GenerateSandNormalTexture() {
-  int sz = 128;
+  int sz = 256;
   Image img = GenImageColor(sz, sz, {128, 128, 255, 255});
   for (int y = 0; y < sz; y++)
     for (int x = 0; x < sz; x++) {
       float u = (float)x / (float)sz;
       float v = (float)y / (float)sz;
-      float rip = sinf(u * 32.0f) * 0.5f + 0.5f;
-      rip += sinf((u + v * 0.5f) * 18.0f) * 0.5f + 0.5f;
-      rip *= 0.5f; // subtle
-      unsigned char r = (unsigned char)Clamp(128 + rip * 40.0f, 0, 255);
-      unsigned char g = (unsigned char)Clamp(128 + rip * 40.0f, 0, 255);
-      unsigned char b = 255;
+      // Strong wind-blown ripple lines
+      float rip1 = sinf((u * 22.0f + v * 8.0f) * 6.2832f);
+      float rip2 = sinf((u * 9.0f - v * 18.0f) * 6.2832f) * 0.4f;
+      float rip3 = sinf((u * 35.0f + v * 3.0f) * 6.2832f) * 0.25f;
+      float combined = rip1 + rip2 + rip3;
+      // Encode as normal perturbation (stronger displacement)
+      unsigned char r = (unsigned char)Clamp(128.0f + combined * 55.0f, 0, 255);
+      unsigned char g = (unsigned char)Clamp(128.0f + combined * 45.0f, 0, 255);
+      unsigned char b = 220; // slightly less z = steeper normals
       ImageDrawPixel(&img, x, y, {r, g, b, 255});
     }
   Texture2D t = LoadTextureFromImage(img);
@@ -10034,27 +11539,145 @@ static Texture2D GenerateSandNormalTexture() {
 }
 
 static Texture2D GenerateSandGritTexture() {
-  int sz = 128;
+  int sz = 256;
   Image img = GenImageColor(sz, sz, {200, 170, 120, 255});
   for (int y = 0; y < sz; y++)
     for (int x = 0; x < sz; x++) {
       float u = (float)x / (float)sz;
       float v = (float)y / (float)sz;
-      float n = PerlinFBM(u * 8.0f, v * 8.0f, 3, 0.65f);
-      bool high = n > 0.52f;
-      Color c = high ? Color{180, 150, 100, 255} : Color{120, 90, 60, 255};
+      float n = PerlinFBM(u * 10.0f, v * 10.0f, 3, 0.65f);
+      // Three-tone grit: dark patches, mid, light pebbles
+      Color c;
+      if (n < 0.42f)      c = {105, 78, 48, 255};   // dark grit
+      else if (n < 0.56f)  c = {165, 138, 95, 255};  // mid sand
+      else                  c = {200, 175, 130, 255}; // light pebble
       ImageDrawPixel(&img, x, y, c);
     }
   Texture2D t = LoadTextureFromImage(img);
-  SetTextureFilter(t, TEXTURE_FILTER_POINT);
+  SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
   SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
   UnloadImage(img);
   return t;
 }
 
+static Texture2D GenerateStoneTexture() {
+  int sz = 256;
+  Image img = GenImageColor(sz, sz, {140, 138, 132, 255});
+  for (int y = 0; y < sz; y++)
+    for (int x = 0; x < sz; x++) {
+      float u = (float)x / (float)sz, v = (float)y / (float)sz;
+      float n1 = PerlinFBM(u * 6.0f, v * 6.0f, 4, 0.55f);
+      float n2 = PerlinFBM(u * 18.0f + 50.0f, v * 18.0f + 50.0f, 2, 0.5f);
+      // Stone blocks: irregular grid lines
+      float gx = sinf(u * 8.0f * 6.2832f) * 0.5f + 0.5f;
+      float gy = sinf(v * 12.0f * 6.2832f) * 0.5f + 0.5f;
+      float grid = (gx < 0.06f || gy < 0.06f) ? 0.7f : 1.0f;
+      float val = n1 * 0.5f + n2 * 0.2f + 0.3f;
+      unsigned char r = (unsigned char)Clamp(120.0f + val * 50.0f * grid, 90, 175);
+      unsigned char g = (unsigned char)Clamp(118.0f + val * 48.0f * grid, 88, 172);
+      unsigned char b = (unsigned char)Clamp(112.0f + val * 45.0f * grid, 82, 165);
+      ImageDrawPixel(&img, x, y, {r, g, b, 255});
+    }
+  Texture2D t = LoadTextureFromImage(img);
+  SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
+  SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
+  UnloadImage(img);
+  return t;
+}
+
+static Texture2D GenerateGrassTexture() {
+  int sz = 256;
+  Image img = GenImageColor(sz, sz, {75, 130, 55, 255});
+  for (int y = 0; y < sz; y++)
+    for (int x = 0; x < sz; x++) {
+      float u = (float)x / (float)sz, v = (float)y / (float)sz;
+      float n = PerlinFBM(u * 8.0f, v * 8.0f, 3, 0.6f);
+      float blades = sinf((u * 40.0f + n * 3.0f) * 6.2832f) * 0.3f + 0.7f;
+      float val = n * 0.5f + blades * 0.5f;
+      unsigned char r = (unsigned char)Clamp(55.0f + val * 45.0f, 40, 105);
+      unsigned char g = (unsigned char)Clamp(110.0f + val * 55.0f, 90, 175);
+      unsigned char b = (unsigned char)Clamp(35.0f + val * 35.0f, 20, 80);
+      ImageDrawPixel(&img, x, y, {r, g, b, 255});
+    }
+  Texture2D t = LoadTextureFromImage(img);
+  SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
+  SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
+  UnloadImage(img);
+  return t;
+}
+
+static Texture2D GenerateBrickTexture() {
+  int sz = 256;
+  Image img = GenImageColor(sz, sz, {165, 75, 55, 255});
+  for (int y = 0; y < sz; y++)
+    for (int x = 0; x < sz; x++) {
+      float u = (float)x / (float)sz, v = (float)y / (float)sz;
+      // Brick pattern: offset rows
+      float row = v * 8.0f;
+      int rowI = (int)floorf(row);
+      float col = u * 4.0f + (rowI % 2) * 0.5f;
+      float brickU = col - floorf(col);
+      float brickV = row - floorf(row);
+      // Mortar lines
+      bool mortar = (brickU < 0.04f || brickV < 0.06f);
+      float n = PerlinFBM(u * 12.0f + 30.0f, v * 12.0f + 30.0f, 2, 0.5f);
+      if (mortar) {
+        unsigned char g = (unsigned char)Clamp(130.0f + n * 30.0f, 110, 160);
+        ImageDrawPixel(&img, x, y, {g, (unsigned char)(g - 10), (unsigned char)(g - 20), 255});
+      } else {
+        float val = n * 0.3f + 0.7f;
+        unsigned char r = (unsigned char)Clamp(145.0f + val * 50.0f, 120, 200);
+        unsigned char g = (unsigned char)Clamp(55.0f + val * 35.0f, 40, 95);
+        unsigned char b = (unsigned char)Clamp(40.0f + val * 30.0f, 25, 75);
+        ImageDrawPixel(&img, x, y, {r, g, b, 255});
+      }
+    }
+  Texture2D t = LoadTextureFromImage(img);
+  SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
+  SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
+  UnloadImage(img);
+  return t;
+}
+
+static Texture2D GenerateMarbleTexture() {
+  int sz = 256;
+  Image img = GenImageColor(sz, sz, {235, 230, 220, 255});
+  for (int y = 0; y < sz; y++)
+    for (int x = 0; x < sz; x++) {
+      float u = (float)x / (float)sz, v = (float)y / (float)sz;
+      // Marble veins: sin of perturbed coordinates
+      float n = PerlinFBM(u * 4.0f, v * 4.0f, 4, 0.5f);
+      float vein = sinf((u * 6.0f + n * 3.0f) * 6.2832f);
+      float vein2 = sinf((v * 8.0f + n * 2.5f) * 6.2832f) * 0.5f;
+      float combined = (vein + vein2) * 0.5f + 0.5f;
+      float val = combined * 0.4f + n * 0.2f + 0.4f;
+      unsigned char r = (unsigned char)Clamp(210.0f + val * 40.0f, 195, 250);
+      unsigned char g = (unsigned char)Clamp(205.0f + val * 38.0f, 190, 245);
+      unsigned char b = (unsigned char)Clamp(195.0f + val * 35.0f, 178, 235);
+      // Occasional gold vein
+      if (vein > 0.92f) {
+        r = (unsigned char)Clamp(r + 20, 0, 255);
+        g = (unsigned char)Clamp(g + 5, 0, 255);
+        b = (unsigned char)(b * 0.7f);
+      }
+      ImageDrawPixel(&img, x, y, {r, g, b, 255});
+    }
+  Texture2D t = LoadTextureFromImage(img);
+  SetTextureFilter(t, TEXTURE_FILTER_BILINEAR);
+  SetTextureWrap(t, TEXTURE_WRAP_REPEAT);
+  UnloadImage(img);
+  return t;
+}
+
+// Additional terrain textures (generated at startup)
+static Texture2D g_stoneTexture;
+static Texture2D g_grassTexture;
+static Texture2D g_brickTexture;
+static Texture2D g_marbleTexture;
+
 static void GenerateTerrainMesh() {
   // Subdivided grid: 2 triangles per tile, with heightmap displacement
-  int resX = MAP_W * 2, resZ = MAP_H * 2; // 2x subdivision (larger map — still smooth)
+  int resX = MAP_W, resZ = MAP_H; // 1x subdivision — good enough with texture
   int vertCount = (resX + 1) * (resZ + 1);
   int triCount = resX * resZ * 2;
 
@@ -10064,7 +11687,7 @@ static void GenerateTerrainMesh() {
   mesh.vertices = (float *)MemAlloc(mesh.vertexCount * 3 * sizeof(float));
   mesh.texcoords = (float *)MemAlloc(mesh.vertexCount * 2 * sizeof(float));
   mesh.normals = (float *)MemAlloc(mesh.vertexCount * 3 * sizeof(float));
-  mesh.colors = (unsigned char *)MemAlloc(mesh.vertexCount * 4);
+  mesh.colors = (unsigned char *)MemAlloc(mesh.vertexCount * 4 * sizeof(unsigned char));
 
   // Build height cache
   std::vector<float> heights((resX + 1) * (resZ + 1));
@@ -10118,10 +11741,10 @@ static void GenerateTerrainMesh() {
       float h11 = heights[(zy + 1) * (resX + 1) + zx + 1];
       float u0 = x0, u1 = x1, v0 = z0, v1 = z1;
 
-      // Triangle 1: vertices (zx,zy), (zx+1,zy), (zx,zy+1)
-      Vector3 pts1[3] = {{x0,h00,z0},{x1,h10,z0},{x0,h01,z1}};
-      Vector3 nrm1[3] = {getSN(zx,zy), getSN(zx+1,zy), getSN(zx,zy+1)};
-      float uvs1[6] = {u0, v0, u1, v0, u0, v1};
+      // Triangle 1: CCW winding for upward-facing normal
+      Vector3 pts1[3] = {{x0,h00,z0},{x0,h01,z1},{x1,h10,z0}};
+      Vector3 nrm1[3] = {getSN(zx,zy), getSN(zx,zy+1), getSN(zx+1,zy)};
+      float uvs1[6] = {u0, v0, u0, v1, u1, v0};
       for (int k = 0; k < 3; k++) {
         mesh.vertices[vi * 3]     = pts1[k].x;
         mesh.vertices[vi * 3 + 1] = pts1[k].y;
@@ -10129,24 +11752,20 @@ static void GenerateTerrainMesh() {
         mesh.normals[vi * 3]      = nrm1[k].x;
         mesh.normals[vi * 3 + 1]  = nrm1[k].y;
         mesh.normals[vi * 3 + 2]  = nrm1[k].z;
-        mesh.texcoords[vi * 2]     = uvs1[k * 2] * 0.25f;
-        mesh.texcoords[vi * 2 + 1] = uvs1[k * 2 + 1] * 0.25f;
-        float sunDot = Clamp(nrm1[k].x * (-g_sunDir.x) + nrm1[k].y * (-g_sunDir.y) +
-                             nrm1[k].z * (-g_sunDir.z), 0, 1);
-        float light = 0.55f + 0.45f * sunDot;
-        float yNorm = (pts1[k].y - minH) / (maxH - minH + 1e-5f);
-        light *= 0.82f + 0.30f * yNorm;
-        mesh.colors[vi * 4 + 0] = (unsigned char)Clamp(210 * light, 0, 255);
-        mesh.colors[vi * 4 + 1] = (unsigned char)Clamp(185 * light, 0, 255);
-        mesh.colors[vi * 4 + 2] = (unsigned char)Clamp(140 * light, 0, 255);
+        mesh.texcoords[vi * 2]     = uvs1[k * 2] * 0.07f;
+        mesh.texcoords[vi * 2 + 1] = uvs1[k * 2 + 1] * 0.07f;
+        // Neutral white vertex color — shader handles biome blending
+        mesh.colors[vi * 4]     = 255;
+        mesh.colors[vi * 4 + 1] = 255;
+        mesh.colors[vi * 4 + 2] = 255;
         mesh.colors[vi * 4 + 3] = 255;
         vi++;
       }
 
-      // Triangle 2: vertices (zx+1,zy), (zx+1,zy+1), (zx,zy+1)
-      Vector3 pts2[3] = {{x1,h10,z0},{x1,h11,z1},{x0,h01,z1}};
-      Vector3 nrm2[3] = {getSN(zx+1,zy), getSN(zx+1,zy+1), getSN(zx,zy+1)};
-      float uvs2[6] = {u1, v0, u1, v1, u0, v1};
+      // Triangle 2: CCW winding for upward-facing normal
+      Vector3 pts2[3] = {{x1,h10,z0},{x0,h01,z1},{x1,h11,z1}};
+      Vector3 nrm2[3] = {getSN(zx+1,zy), getSN(zx,zy+1), getSN(zx+1,zy+1)};
+      float uvs2[6] = {u1, v0, u0, v1, u1, v1};
       for (int k = 0; k < 3; k++) {
         mesh.vertices[vi * 3]     = pts2[k].x;
         mesh.vertices[vi * 3 + 1] = pts2[k].y;
@@ -10154,16 +11773,11 @@ static void GenerateTerrainMesh() {
         mesh.normals[vi * 3]      = nrm2[k].x;
         mesh.normals[vi * 3 + 1]  = nrm2[k].y;
         mesh.normals[vi * 3 + 2]  = nrm2[k].z;
-        mesh.texcoords[vi * 2]     = uvs2[k * 2] * 0.25f;
-        mesh.texcoords[vi * 2 + 1] = uvs2[k * 2 + 1] * 0.25f;
-        float sunDot = Clamp(nrm2[k].x * (-g_sunDir.x) + nrm2[k].y * (-g_sunDir.y) +
-                             nrm2[k].z * (-g_sunDir.z), 0, 1);
-        float light = 0.55f + 0.45f * sunDot;
-        float yNorm = (pts2[k].y - minH) / (maxH - minH + 1e-5f);
-        light *= 0.82f + 0.30f * yNorm;
-        mesh.colors[vi * 4 + 0] = (unsigned char)Clamp(210 * light, 0, 255);
-        mesh.colors[vi * 4 + 1] = (unsigned char)Clamp(185 * light, 0, 255);
-        mesh.colors[vi * 4 + 2] = (unsigned char)Clamp(140 * light, 0, 255);
+        mesh.texcoords[vi * 2]     = uvs2[k * 2] * 0.07f;
+        mesh.texcoords[vi * 2 + 1] = uvs2[k * 2 + 1] * 0.07f;
+        mesh.colors[vi * 4]     = 255;
+        mesh.colors[vi * 4 + 1] = 255;
+        mesh.colors[vi * 4 + 2] = 255;
         mesh.colors[vi * 4 + 3] = 255;
         vi++;
       }
@@ -10171,20 +11785,11 @@ static void GenerateTerrainMesh() {
 
   UploadMesh(&mesh, false);
   g_terrainModel = LoadModelFromMesh(mesh);
-  g_sandTexture = GenerateSandTexture();
-  g_sandNormalTexture = GenerateSandNormalTexture();
-  g_sandGritTexture = GenerateSandGritTexture();
-  g_terrainModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture =
-      g_sandTexture;
-  g_terrainModel.materials[0].maps[MATERIAL_MAP_NORMAL].texture =
-      g_sandNormalTexture;
-  g_terrainModel.materials[0].maps[MATERIAL_MAP_SPECULAR].texture =
-      g_sandGritTexture;
+  // Apply fully-procedural triplanar shader (no textures needed — all biomes in GLSL)
   g_terrainModel.materials[0].shader = g_shTriplanar;
-  float sandScale = 0.25f;
-  SetShaderValue(g_shTriplanar, g_locSandScale, &sandScale, SHADER_UNIFORM_FLOAT);
-  Vector3 sdir = g_sunDir;
-  SetShaderValue(g_shTriplanar, g_locTripSunDir, &sdir, SHADER_UNIFORM_VEC3);
+  TraceLog(LOG_INFO, "TERRAIN MESH: vertCount=%d triCount=%d shaderID=%d",
+           g_terrainModel.meshes[0].vertexCount, g_terrainModel.meshes[0].triangleCount,
+           g_terrainModel.materials[0].shader.id);
   g_terrainReady = true;
 }
 
@@ -10192,6 +11797,29 @@ static void GenerateTerrainMesh() {
 // §7  OVERWORLD — Init / Update / Draw
 // ═══════════════════════════════════════════════════════════════════════════════
 
+
+// ─── IsOnRoad — returns true if point (px,pz) lies within any road corridor ──
+static bool IsOnRoad(float px, float pz) {
+  const float centerX = 100.0f, centerZ = 75.0f;
+  const float ROAD_HALF = 2.0f; // half-width + margin
+  const float cityX[] = {CITY_SELA_X, CITY_MAAYAN_X, CITY_AVAK_X, CITY_GAN_X};
+  const float cityZ[] = {CITY_SELA_Z, CITY_MAAYAN_Z, CITY_AVAK_Z, CITY_GAN_Z};
+  for (int r = 0; r < 4; r++) {
+    float dx = centerX - cityX[r], dz = centerZ - cityZ[r];
+    float len = sqrtf(dx*dx + dz*dz);
+    if (len < 1.0f) continue;
+    // Project point onto road line segment
+    float ax = px - cityX[r], az = pz - cityZ[r];
+    float t = (ax * dx + az * dz) / (len * len);
+    if (t < 0.0f || t > 1.0f) continue;
+    // Perpendicular distance
+    float closestX = cityX[r] + dx * t;
+    float closestZ = cityZ[r] + dz * t;
+    float distSq = (px - closestX) * (px - closestX) + (pz - closestZ) * (pz - closestZ);
+    if (distSq < ROAD_HALF * ROAD_HALF) return true;
+  }
+  return false;
+}
 
 // ─── InitNorthernWastes — organic cactus/tree clusters in z < 14 ─────────────
 static void InitNorthernWastes() {
@@ -10207,12 +11835,34 @@ static void InitNorthernWastes() {
     {170.0f, 47.5f, 11.0f, 6, VEG_PRICKLY_PEAR},  // eastern prickly pear
     { 75.0f, 60.0f, 12.5f, 5, VEG_SAGUARO},       // approach sentinels L
     {125.0f, 60.0f, 12.5f, 5, VEG_DRY_TREE},      // approach sentinels R
+    // ── Central desert (z 65-95) — sparse landmark vegetation ────────
+    { 55.0f, 78.0f,  8.0f, 3, VEG_SAGUARO},       // west of village
+    {148.0f, 78.0f,  8.0f, 3, VEG_SAGUARO},       // east of village
+    { 70.0f, 92.0f,  7.0f, 2, VEG_PRICKLY_PEAR},  // SW path marker
+    {135.0f, 92.0f,  7.0f, 2, VEG_AGAVE},         // SE path marker
+    {100.0f, 88.0f,  6.0f, 2, VEG_DRY_TREE},      // south of village
     // ── Southern Desert (z > 95) — sandstorm-scoured ────────────────
     {100.0f,105.0f, 14.0f, 7, VEG_DRY_TREE},      // south centre dead grove
     { 45.0f,115.0f, 12.0f, 6, VEG_AGAVE},         // SW agave
     {155.0f,115.0f, 12.0f, 6, VEG_PRICKLY_PEAR},  // SE prickly pear
     { 75.0f,130.0f, 10.0f, 5, VEG_DRY_TREE},      // deep south trees L
     {130.0f,130.0f, 10.0f, 5, VEG_DRY_TREE},      // deep south trees R
+    // ── Additional landmarks — road-side and city-adjacent ──────────────
+    { 60.0f, 50.0f,  6.0f, 3, VEG_SAGUARO},       // road marker: village→Sela
+    {140.0f, 50.0f,  6.0f, 3, VEG_SAGUARO},       // road marker: village→Gan
+    { 60.0f,100.0f,  7.0f, 3, VEG_DRY_TREE},      // road marker: village→Ma'ayan south
+    {140.0f,100.0f,  7.0f, 3, VEG_DRY_TREE},      // road marker: village→Avak
+    {100.0f,115.0f,  8.0f, 4, VEG_PRICKLY_PEAR},  // road to Avak midpoint
+    { 28.0f, 75.0f,  5.0f, 3, VEG_AGAVE},         // Ma'ayan oasis shoreline E
+    { 16.0f, 75.0f,  5.0f, 3, VEG_AGAVE},         // Ma'ayan oasis shoreline W
+    {170.0f, 70.0f, 10.0f, 5, VEG_AGAVE},         // dense agave near Gan
+    {180.0f, 80.0f,  8.0f, 4, VEG_PRICKLY_PEAR},  // Gan south prickly pear
+    { 30.0f, 25.0f,  8.0f, 4, VEG_DRY_TREE},      // dry trees near Sela
+    { 40.0f, 35.0f,  7.0f, 3, VEG_SAGUARO},       // Sela approach saguaros
+    {  5.0f, 40.0f,  8.0f, 4, VEG_PRICKLY_PEAR},  // west map edge
+    {195.0f, 40.0f,  8.0f, 4, VEG_SAGUARO},       // east map edge
+    {  5.0f,120.0f,  8.0f, 4, VEG_DRY_TREE},      // SW map edge
+    {195.0f,120.0f,  8.0f, 4, VEG_SAGUARO},       // SE map edge
   };
   static constexpr int NUM_CLUSTERS =
       (int)(sizeof(clusters) / sizeof(clusters[0]));
@@ -10235,6 +11885,8 @@ static void InitNorthernWastes() {
         if (dx*dx + dz*dz < 9.0f) { nearTent = true; break; }
       }
       if (nearTent) continue;
+      // Skip if on a road corridor
+      if (IsOnRoad(px, pz)) continue;
       VegetationInstance &vi = g_vegInstances[g_numVeg++];
       vi.x = px;
       vi.z = pz;
@@ -10251,6 +11903,338 @@ static void InitNorthernWastes() {
       vi.colliderRadius = vi.scale * 0.45f;
       vi.cachedY = GetDuneHeight(vi.x, vi.z);
     }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCRIPTED TUTORIAL MATCH — step-by-step guided overlay
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static const char *GetTutMatchText() {
+  switch (g_tutMatchStep) {
+  case TSTEP_WELCOME:
+    return "Welcome to your first duel!\n"
+           "I'll walk you through each step. Press [Enter] to continue.";
+  case TSTEP_EXPLAIN_HP:
+    return "Each player starts with 20 HP and 0 coins.\n"
+           "Your HP is bottom-left, opponent's is top-right.\n"
+           "Reduce the opponent's HP to 0 to win! [Enter]";
+  case TSTEP_COLLECT_EXPLAIN:
+    return "COLLECT PHASE: You draw a card and gain 2 coins.\n"
+           "Coins let you play cards from your hand. [Enter]";
+  case TSTEP_HAND_EXPLAIN:
+    return "Look at the cards in your hand at the bottom.\n"
+           "Each card has an ATK (attack) and DEF (defense) value.\n"
+           "The number in the top-left is its coin cost. [Enter]";
+  case TSTEP_DEVELOP_EXPLAIN:
+    return "DEVELOP PHASE: Play cards onto the field!\n"
+           "Drag a card from your hand upward onto the field.\n"
+           "Or click a card, then press [Enter] to play it. [Enter]";
+  case TSTEP_WAIT_PLAY_CARD:
+    return "Go ahead — drag or click a card to play it!\n"
+           "Pick one you can afford (cost <= your coins).";
+  case TSTEP_CARD_PLAYED:
+    return "Great job! Your unit is now on the field.\n"
+           "Play more cards if you can, or press the green\n"
+           "ACTIVATE PHASE button (bottom-right) to attack. [Enter]";
+  case TSTEP_ACTIVATE_EXPLAIN:
+    return "ACTIVATE PHASE: Time to attack!\n"
+           "Click one of YOUR units on the field to select it.\n"
+           "Then click an enemy unit to attack it. [Enter]";
+  case TSTEP_WAIT_ATTACK:
+    if (g_match.phase == PHASE_DEVELOP)
+      return "First, click the green ACTIVATE PHASE button\n"
+             "(bottom-right) to move to the attack phase.";
+    return "Select your unit, then click an enemy to attack!\n"
+           "If no enemies, click ATTACK PLAYER to hit their HP.\n"
+           "(Or press END TURN if you prefer to skip.)";
+  case TSTEP_ATTACK_DONE:
+    return "Combat resolved! ATK vs DEF determines the outcome.\n"
+           "If your ATK > their DEF, they're destroyed.\n"
+           "If you attack the player directly, they lose HP. [Enter]";
+  case TSTEP_ENDTURN_EXPLAIN:
+    return "Before ending your turn, you can right-click your\n"
+           "units to set them as DEFENDERS (blue shield).\n"
+           "Defenders protect your HP from enemy attacks. [Enter]";
+  case TSTEP_WAIT_ENDTURN:
+    return "Click the red END TURN button (bottom-right)\n"
+           "or press [Space] to end your turn.";
+  case TSTEP_OPPONENT_TURN:
+    return "Your opponent is taking their turn.\n"
+           "Watch what they do...";
+  case TSTEP_FREE_PLAY:
+    return "You've got the basics! Keep playing on your own.\n"
+           "Win or lose, you'll learn from the experience!";
+  default: return nullptr;
+  }
+}
+
+static void UpdateTutMatchStep(float dt) {
+  if (!g_isTutorialMatch) return;
+
+  GameMatch &m = g_match;
+  MatchPlayer &human = m.players[0];
+
+  // Handle paused state — wait for Enter to advance
+  if (g_tutMatchPaused) {
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_E) || g_padAPressed) {
+      g_tutMatchPaused = false;
+      g_tutMatchTimer = 0.0f;
+      // Advance to next step
+      switch (g_tutMatchStep) {
+      case TSTEP_WELCOME:       g_tutMatchStep = TSTEP_EXPLAIN_HP; g_tutMatchPaused = true; break;
+      case TSTEP_EXPLAIN_HP:    g_tutMatchStep = TSTEP_COLLECT_EXPLAIN; g_tutMatchPaused = true; break;
+      case TSTEP_COLLECT_EXPLAIN: g_tutMatchStep = TSTEP_HAND_EXPLAIN; break; // let COLLECT phase fire first
+      case TSTEP_HAND_EXPLAIN:  g_tutMatchStep = TSTEP_DEVELOP_EXPLAIN; g_tutMatchPaused = true; break;
+      case TSTEP_DEVELOP_EXPLAIN:
+        g_tutMatchStep = TSTEP_WAIT_PLAY_CARD;
+        g_tutMatchCardsBefore = human.fieldSize;
+        break;
+      case TSTEP_CARD_PLAYED:   g_tutMatchStep = TSTEP_ACTIVATE_EXPLAIN; g_tutMatchPaused = true; break;
+      case TSTEP_ACTIVATE_EXPLAIN: g_tutMatchStep = TSTEP_WAIT_ATTACK; break;
+      case TSTEP_ATTACK_DONE:   g_tutMatchStep = TSTEP_ENDTURN_EXPLAIN; g_tutMatchPaused = true; break;
+      case TSTEP_ENDTURN_EXPLAIN: g_tutMatchStep = TSTEP_WAIT_ENDTURN; break;
+      default: break;
+      }
+    }
+    return; // Block all other match input while paused
+  }
+
+  g_tutMatchTimer += dt;
+
+  // Auto-detect transitions based on game state
+  switch (g_tutMatchStep) {
+  case TSTEP_WELCOME:
+    g_tutMatchPaused = true;
+    break;
+
+  case TSTEP_HAND_EXPLAIN:
+    // Wait for COLLECT to auto-advance, then pause in DEVELOP phase
+    if (m.phase == PHASE_DEVELOP) {
+      g_tutMatchPaused = true;
+    }
+    break;
+
+  case TSTEP_WAIT_PLAY_CARD:
+    // Detect when player plays a card (field size increases)
+    if (human.fieldSize > g_tutMatchCardsBefore) {
+      g_tutMatchStep = TSTEP_CARD_PLAYED;
+      g_tutMatchPaused = true;
+    }
+    break;
+
+  case TSTEP_WAIT_ATTACK:
+    // Detect when player attacks (any unit becomes activated) or phase changes
+    if (m.phase == PHASE_END || m.phase == PHASE_GAME_OVER) {
+      g_tutMatchStep = TSTEP_WAIT_ENDTURN; // skip ahead
+    } else {
+      for (int i = 0; i < human.fieldSize; i++) {
+        if (human.field[i].activated) {
+          g_tutMatchStep = TSTEP_ATTACK_DONE;
+          g_tutMatchPaused = true;
+          break;
+        }
+      }
+    }
+    break;
+
+  case TSTEP_WAIT_ENDTURN:
+    // Detect when turn passes to AI
+    if (m.turn == 1) {
+      g_tutMatchStep = TSTEP_OPPONENT_TURN;
+      g_tutMatchTimer = 0.0f;
+    }
+    break;
+
+  case TSTEP_OPPONENT_TURN:
+    // Wait for AI turn to finish, then go to free play
+    if (m.turn == 0) {
+      g_tutMatchTurnCount++;
+      if (g_tutMatchTurnCount >= 1) {
+        g_tutMatchStep = TSTEP_FREE_PLAY;
+        g_tutMatchTimer = 0.0f;
+      } else {
+        // Could loop back for more guided turns, but 1 is enough
+        g_tutMatchStep = TSTEP_FREE_PLAY;
+      }
+    }
+    break;
+
+  case TSTEP_FREE_PLAY:
+    // After 4 seconds, hide the tutorial overlay
+    if (g_tutMatchTimer > 4.0f) {
+      g_tutMatchStep = TSTEP_COUNT; // done, no more overlay
+    }
+    break;
+
+  default: break;
+  }
+}
+
+static void DrawTutMatchOverlay() {
+  if (!g_isTutorialMatch) return;
+  if (g_tutMatchStep >= TSTEP_COUNT) return;
+
+  const char *text = GetTutMatchText();
+  if (!text) return;
+
+  // ── Left-side tutorial panel ────────────────────────────────────────────
+  float panelW = 280.0f;
+  float panelX = (float)UI_SAFE + 8.0f;
+  float panelY = (float)UI_SAFE + 80.0f; // below HP panel
+  float panelH = 200.0f;
+
+  // Measure text height to auto-size panel
+  int fontSize = 13;
+  int textW = (int)(panelW - 28.0f);
+  // Count newlines for height estimate
+  int lines = 1;
+  int maxLineChars = textW / (fontSize * 0.55f);
+  const char *p = text;
+  int lineLen = 0;
+  while (*p) {
+    if (*p == '\n') { lines++; lineLen = 0; }
+    else { lineLen++; if (lineLen > maxLineChars) { lines++; lineLen = 0; } }
+    p++;
+  }
+  panelH = 34.0f + lines * (fontSize + 3) + 30.0f; // header + text + bottom pad
+
+  auto drawPanel = [&](Color bg, Color border, Color labelCol, Color textCol) {
+    DrawRectangleRounded({panelX, panelY, panelW, panelH}, 0.08f, 6, bg);
+    DrawRectangleRoundedLinesEx({panelX, panelY, panelW, panelH}, 0.08f, 6, 2.0f, border);
+    // "TUTORIAL" label
+    DrawUI("TUTORIAL", (int)(panelX + 12), (int)(panelY + 6), 11, labelCol);
+    // Separator
+    DrawRectangle((int)(panelX + 12), (int)(panelY + 20), (int)(panelW - 24), 1,
+                  {border.r, border.g, border.b, 80});
+    // Word-wrapped text
+    DrawUI(text, (int)(panelX + 14), (int)(panelY + 26), fontSize, textCol);
+  };
+
+  // Normal state (non-paused)
+  drawPanel({10, 8, 4, 220}, {220, 185, 70, 255},
+            {220, 185, 70, 200}, {240, 230, 200, 255});
+
+  // Pulsing indicator for waiting states
+  if (!g_tutMatchPaused &&
+      (g_tutMatchStep == TSTEP_WAIT_PLAY_CARD ||
+       g_tutMatchStep == TSTEP_WAIT_ATTACK ||
+       g_tutMatchStep == TSTEP_WAIT_ENDTURN)) {
+    float pulse = 0.5f + 0.5f * sinf(g_tutMatchTimer * 4.0f);
+    unsigned char alpha = (unsigned char)(100 + pulse * 155);
+    DrawUI(">>>", (int)(panelX + panelW - 50), (int)(panelY + panelH - 24), 20,
+             {255, 220, 60, alpha});
+  }
+
+  // Dimming overlay when paused (blocks input)
+  if (g_tutMatchPaused) {
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 100});
+    // Redraw panel on top of dim with brighter gold
+    drawPanel({10, 8, 4, 240}, {255, 215, 60, 255},
+              {255, 215, 60, 230}, {255, 245, 210, 255});
+
+    // Blinking [Enter] prompt at bottom of panel
+    float blink = sinf(g_tutMatchTimer * 3.0f);
+    if (blink > 0.0f) {
+      DrawUI("[Enter] Continue", (int)(panelX + 14), (int)(panelY + panelH - 18),
+               11, {255, 220, 80, 220});
+    }
+
+    // Arrow pointers to relevant UI elements
+    if (g_tutMatchStep == TSTEP_EXPLAIN_HP) {
+      // Arrow to player HP panel (bottom-left)
+      DrawTriangle({(float)UI_SAFE + 90, (float)(SCREEN_H - UI_SAFE - 175)},
+                   {(float)UI_SAFE + 80, (float)(SCREEN_H - UI_SAFE - 190)},
+                   {(float)UI_SAFE + 100, (float)(SCREEN_H - UI_SAFE - 190)},
+                   {255, 220, 60, 200});
+      // Arrow to AI HP panel (top-right)
+      DrawTriangle({(float)(SCREEN_W - UI_SAFE - 100), (float)UI_SAFE + 60},
+                   {(float)(SCREEN_W - UI_SAFE - 110), (float)UI_SAFE + 75},
+                   {(float)(SCREEN_W - UI_SAFE - 90), (float)UI_SAFE + 75},
+                   {255, 100, 60, 200});
+    }
+  }
+}
+
+static void UpdateSignpostInteraction(); // fwd decl
+// ═══════════════════════════════════════════════════════════════════════════════
+// TUTORIAL SYSTEM — Post-onboarding guided walkthrough
+// ═══════════════════════════════════════════════════════════════════════════════
+static void UpdateTutorial(float dt) {
+  if (g_tutState == TUT_INACTIVE || g_tutState == TUT_DONE) return;
+
+  g_tutTimer += dt;
+
+  switch (g_tutState) {
+  case TUT_AWAITING_NPC_TALK:
+    // Player has no deck — waiting to talk to any village NPC
+    g_tutAutoWalk = false;
+    break;
+
+  case TUT_PRE_MATCH_DIALOG:
+    // NPC intro dialog showing — handled by UpdateNPCDialog
+    break;
+
+  case TUT_NPC_WALK_TO_SHOP:
+  case TUT_ENTERING_SHOP:
+  case TUT_IN_SHOP:
+  case TUT_AWAITING_MATCH_NPC:
+  case TUT_NPC_WALK_TO_HOG:
+  case TUT_ENTERING_HOG:
+  case TUT_MATCH_INTRO:
+    // Legacy states — all handled by the new flow; skip to done
+    g_tutAutoWalk = false;
+    g_tutState = TUT_DONE;
+    break;
+
+  case TUT_MATCH_PLAYING: {
+    // Scripted tutorial match now handles its own overlay via DrawTutMatchOverlay
+    GameMatch &m = g_match;
+    if (m.phase == PHASE_GAME_OVER) {
+      g_tutState = TUT_MATCH_COMPLETE;
+      g_tutTimer = 0.0f;
+    }
+    g_tutText = nullptr; // overlay handled by scripted system
+    break;
+  }
+
+  case TUT_MATCH_COMPLETE:
+    g_tutText = g_match.playerWon
+      ? "Congratulations! You won your first duel!\nYou're ready to explore Eretz!"
+      : "Good effort! You'll get stronger with practice.\nExplore Eretz and build your deck!";
+    // Wait for match exit (SCENE_OVERWORLD) — handled in match exit hook
+    break;
+
+  default:
+    break;
+  }
+}
+
+static void DrawTutorialOverlay() {
+  if (g_tutState == TUT_INACTIVE || g_tutState == TUT_DONE) return;
+  if (!g_tutText) return;
+
+  // Bottom-of-screen text bar with gold border
+  float barH = 60.0f;
+  float barY = (float)SCREEN_H - barH - (float)UI_SAFE - 10.0f;
+  float barX = (float)UI_SAFE + 10.0f;
+  float barW = (float)SCREEN_W - (float)UI_SAFE * 2.0f - 20.0f;
+
+  // Semi-transparent dark background
+  DrawRectangleRounded({barX, barY, barW, barH}, 0.15f, 6, {20, 15, 8, 220});
+  // Gold border
+  DrawRectangleRoundedLinesEx({barX, barY, barW, barH}, 0.15f, 6, 2.0f,
+                               {210, 175, 90, 255});
+  // Text
+  DrawUI(g_tutText, (int)(barX + 16), (int)(barY + 10), 14,
+           {255, 240, 200, 255});
+
+  // Pulsing arrow indicator for guidance states
+  if (g_tutState == TUT_AWAITING_NPC_TALK || g_tutState == TUT_AWAITING_MATCH_NPC) {
+    float pulse = 0.5f + 0.5f * sinf(g_tutTimer * 3.0f);
+    unsigned char alpha = (unsigned char)(120 + pulse * 135);
+    DrawUI(">>", (int)(barX + barW - 40), (int)(barY + 18), 20,
+             {255, 200, 80, alpha});
   }
 }
 
@@ -10302,9 +12286,10 @@ static void InitOverworld() {
   }
 
   // --- Village NPCs ---
-  // Elder Aziz (outside Elder's Tent at 80,48 — door south at z=52)
+  // Elder Aziz — GUIDE NPC (outside Elder's Tent at 80,48 — door south at z=52)
   { NPC &n = g_npcs[g_numNpcs++];
     n.gx=82; n.gy=53; n.worldX=82.f; n.worldZ=53.f; n.name="Elder Aziz";
+    n.role=NPC_ROLE_GUIDE; n.cityIndex=-1;
     n.shirtCol={160,130,70,255}; n.pantsCol={80,70,50,255}; n.hatCol={160,130,70,255};
     n.dir=DIR_DOWN; n.facingAngle=n.targetAngle=DirToAngle(DIR_DOWN);
     n.colors=MakeChibiColors({190,155,110,255},{50,40,25,255},{160,130,70,255},
@@ -10673,6 +12658,7 @@ static void InitOverworld() {
 
   // Procedural rocks
   InitProceduralRocks();
+  InitBorderRocks();
 
   // Generate dune terrain mesh
   GenerateTerrainMesh();
@@ -10831,34 +12817,20 @@ static void ResolveCircleCollision(float &cx, float &cz, float r) {
         resolved = false;
       }
     }
-    // Tent AABB push-out — door corridor exempt so player can walk through
+    // Tent wall-segment push-out (5 thin wall AABBs per tent, door gap implicit)
     for (int i = 0; i < g_numTents; i++) {
       const TentInstance &ti = g_tentInstances[i];
-      const BoundingBox &bb = ti.wallAABB;
-      float nearX = Clamp(cx, bb.min.x, bb.max.x);
-      float nearZ = Clamp(cz, bb.min.z, bb.max.z);
-      float dx = cx - nearX, dz = cz - nearZ;
-      float dist2 = dx * dx + dz * dz;
-      if (dist2 < r * r && dist2 > 0.0001f) {
-        // Check if player is in the door corridor — skip push-out if so
-        // Door spans columns doorGX-1 and doorGX (i.e. X from doorGX-1 to doorGX+1),
-        // so center = doorGX with ±1.1 tolerance
-        float doorCX = (float)ti.doorGX; // actual center of 2-tile-wide door
-        bool inDoor = (cx >= doorCX - 1.1f && cx <= doorCX + 1.1f &&
-                       cz >= bb.max.z - 1.0f); // south wall approach only
-        if (!inDoor) {
+      for (int s = 0; s < ti.numWallSegs; s++) {
+        const BoundingBox &bb = ti.wallSegs[s];
+        float nearX = Clamp(cx, bb.min.x, bb.max.x);
+        float nearZ = Clamp(cz, bb.min.z, bb.max.z);
+        float dx = cx - nearX, dz = cz - nearZ;
+        float dist2 = dx * dx + dz * dz;
+        if (dist2 < r * r && dist2 > 0.0001f) {
           float dist = sqrtf(dist2);
           float push = r - dist + 0.001f;
           cx += (dx / dist) * push;
           cz += (dz / dist) * push;
-          resolved = false;
-        }
-      } else if (dist2 < 0.0001f) {
-        // Exactly inside: push south out the door
-        float doorCX = (float)ti.doorGX;
-        bool inDoor = (cx >= doorCX - 1.1f && cx <= doorCX + 1.1f);
-        if (!inDoor) {
-          cz += r + 0.05f;
           resolved = false;
         }
       }
@@ -10944,6 +12916,9 @@ static Vector3 UpdatePlayerVelocity(float dt) {
     float newZ = g_player.posZ + vel.z * dt;
     // Resolve collisions with wall sliding
     ResolveCircleCollision(newX, newZ, g_player.colliderRadius);
+    // Clamp to map bounds (border rocks at edges)
+    newX = Clamp(newX, 3.0f, (float)(MAP_W - 3));
+    newZ = Clamp(newZ, 3.0f, (float)(MAP_H - 3));
     g_player.posX = newX;
     g_player.posZ = newZ;
     // Snap grid coords for legacy collision map compat
@@ -10984,37 +12959,22 @@ static void UpdateOverworld(float dt) {
   g_time += dt;
   UpdateTentVisibility();
 
-  // ── Onboarding sequence (first time only) ──────────────────────────────
+  // ── First-frame init: player starts as blank slate ──────────────────────
   if (!g_onboardingDone) {
-    if (!g_onboardingActive) {
-      g_onboardingActive = true;
-      g_onboardingTextIdx = 0;
-    }
-    if (IsKeyPressed(KEY_ENTER) || g_padAPressed ||
-        IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      g_onboardingTextIdx++;
-      if (g_onboardingTextIdx == 2 && !g_hasStarterDeck) {
-        // Give starter deck at step 2
-        GiveStarterDeck();
-        g_inventory.Give(ITEM_KINGDOM_MAP); // starter item
-      }
-      if (g_onboardingTextIdx >= NUM_ONBOARDING_TEXTS) {
-        g_onboardingDone = true;
-        g_onboardingActive = false;
-        g_grandpaTutorialDone = true;
-      }
-    }
-    // During onboarding, skip normal movement but still update visuals
-    UpdateVFX(dt);
-    // Camera follow
-    float gY0 = GetDuneHeight(g_player.posX, g_player.posZ);
-    g_cam.position = {g_player.posX, gY0 + 14.0f, g_player.posZ + 10.0f};
-    g_cam.target = {g_player.posX, GetDuneHeight(g_player.posX, g_player.posZ), g_player.posZ};
-    return;
+    g_onboardingDone = true;
+    g_onboardingActive = false;
+    g_grandpaTutorialDone = true;
+    // Player starts with no cards, no items — must talk to Guide NPC
+    if (!g_hasStarterDeck && g_tutState == TUT_INACTIVE)
+      g_tutState = TUT_AWAITING_NPC_TALK;
   }
 
   // Screen-space particles (camera-independent wind)
   UpdateVFX(dt);
+
+  // Tutorial system update
+  UpdateTutorial(dt);
+  UpdateSignpostInteraction();
 
   // ── FLUID MOVEMENT: vector-based velocity with diagonal normalization ─────
   Vector3 vel = {0, 0, 0};
@@ -11191,273 +13151,480 @@ static void DrawWaterPlane(Vector3 center, float w, float d) {
 }
 
 
-// ─── 2. Ma'ayan — The Oasis (W, ~22,75) ──────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNPOSTS — Interactive direction signs placed at city hubs
+// ═══════════════════════════════════════════════════════════════════════════════
+struct Signpost { float x, z; const char *text; };
+static const Signpost g_signposts[] = {
+  // Village center
+  {97.0f, 72.0f,  "Card Shop -> N    House of Glory -> E"},
+  // Sela (Iron Quarter)
+  {CITY_SELA_X + 3.0f, CITY_SELA_Z + 5.0f, "Village -> SE    Card Shop -> SE"},
+  // Ma'ayan (Verdant Oasis)
+  {CITY_MAAYAN_X + 5.0f, CITY_MAAYAN_Z, "Village -> E    House of Glory -> E"},
+  // Avak (Crimson District)
+  {CITY_AVAK_X + 3.0f, CITY_AVAK_Z - 5.0f, "Village -> N    Card Shop -> N"},
+  // Gan (Ivory Spire)
+  {CITY_GAN_X - 5.0f, CITY_GAN_Z, "Village -> W    House of Glory -> W"},
+};
+static constexpr int NUM_SIGNPOSTS = (int)(sizeof(g_signposts) / sizeof(g_signposts[0]));
+static int g_signpostMsgTimer = 0; // frames to show signpost text
+static const char *g_signpostText = nullptr;
+
+static void DrawSignposts() {
+  float px = g_player.posX, pz = g_player.posZ;
+  for (int i = 0; i < NUM_SIGNPOSTS; i++) {
+    float sx = g_signposts[i].x, sz = g_signposts[i].z;
+    float ddx = sx - px, ddz = sz - pz;
+    if (ddx*ddx + ddz*ddz > 900.0f) continue; // 30u cull
+    float sy = GetDuneHeight(sx, sz);
+    // Post (brown cylinder)
+    DrawCylinder({sx, sy, sz}, 0.08f, 0.08f, 1.6f, 4, {100, 70, 35, 255});
+    // Sign board (light wood cube)
+    DrawCube({sx, sy + 1.4f, sz}, 1.2f, 0.35f, 0.08f, {180, 150, 90, 255});
+    DrawCubeWires({sx, sy + 1.4f, sz}, 1.2f, 0.35f, 0.08f, {120, 90, 45, 200});
+    // Arrow indicator on top
+    DrawCube({sx + 0.5f, sy + 1.65f, sz}, 0.25f, 0.08f, 0.06f, {200, 170, 60, 255});
+  }
+}
+
+// Check signpost proximity and show text overlay
+static void UpdateSignpostInteraction() {
+  float px = g_player.posX, pz = g_player.posZ;
+  if (g_signpostMsgTimer > 0) g_signpostMsgTimer--;
+  for (int i = 0; i < NUM_SIGNPOSTS; i++) {
+    float ddx = g_signposts[i].x - px, ddz = g_signposts[i].z - pz;
+    if (ddx*ddx + ddz*ddz < 4.0f) { // within 2 units
+      if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_ENTER)) {
+        g_signpostText = g_signposts[i].text;
+        g_signpostMsgTimer = 180; // 3 seconds at 60fps
+      }
+      break;
+    }
+  }
+}
+
+static void DrawSignpostOverlay() {
+  if (g_signpostMsgTimer <= 0 || !g_signpostText) return;
+  int tw = MeasureText(g_signpostText, 16);
+  int bx = SCREEN_W / 2 - tw / 2 - 16;
+  int by = SCREEN_H / 2 - 60;
+  DrawRectangleRounded({(float)bx, (float)by, (float)(tw + 32), 36.0f}, 0.3f, 4, {20, 15, 8, 220});
+  DrawRectangleRoundedLinesEx({(float)bx, (float)by, (float)(tw + 32), 36.0f}, 0.3f, 4, 1.5f, {200, 165, 80, 255});
+  DrawUI(g_signpostText, bx + 16, by + 10, 16, {255, 240, 200, 255});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROAD NETWORK — Colored paths from each city toward the map center (100, 75)
+// ═══════════════════════════════════════════════════════════════════════════════
+static void DrawRoads() {
+  const float centerX = 100.0f, centerZ = 75.0f;
+  const float ROAD_W = 2.5f;  // road width
+  struct RoadDef {
+    float cx, cz;       // city center
+    Color base;         // road surface color
+    Color edge;         // road edge/curb color
+    bool hasPalms;      // Verdant Oasis only
+  };
+  static const RoadDef roads[] = {
+    {CITY_SELA_X,   CITY_SELA_Z,   {140,140,145,255}, {105,105,110,255}, false}, // grey cobblestone
+    {CITY_MAAYAN_X, CITY_MAAYAN_Z, {95,145,70,255},   {70,115,50,255},   true},  // green pasture
+    {CITY_AVAK_X,   CITY_AVAK_Z,   {165,65,50,255},   {130,45,35,255},   false}, // red brick
+    {CITY_GAN_X,    CITY_GAN_Z,    {230,225,215,255}, {200,195,170,255}, false}, // white ivory
+  };
+
+  float px = g_player.posX, pz = g_player.posZ;
+  for (int r = 0; r < 4; r++) {
+    const RoadDef &rd = roads[r];
+    float dx = centerX - rd.cx, dz = centerZ - rd.cz;
+    float len = sqrtf(dx*dx + dz*dz);
+    if (len < 1.0f) continue;
+    float dirX = dx / len, dirZ = dz / len;
+    float perpX = -dirZ, perpZ = dirX;
+    float roadAngle = atan2f(dx, dz) * RAD2DEG;
+
+    // Stop road 6 units short of center to prevent overlap at intersection
+    float drawLen = fmaxf(len - 6.0f, 0.0f);
+    int steps = (int)(drawLen);
+    for (int s = 0; s <= steps; s++) {
+      float t = (float)s + 0.5f; // center of segment
+      float sx = rd.cx + dirX * t;
+      float sz = rd.cz + dirZ * t;
+      // Distance cull
+      float ddx = sx - px, ddz = sz - pz;
+      if (ddx*ddx + ddz*ddz > 900.0f) continue; // 30u
+      float sy = GetDuneHeight(sx, sz) + 0.05f;
+      // Solid road segment — rotated to align with road direction
+      rlPushMatrix();
+      rlTranslatef(sx, sy, sz);
+      rlRotatef(roadAngle, 0, 1, 0);
+      // Main road body (1.1 units long × ROAD_W wide, slight overlap for continuity)
+      DrawCube({0, 0, 0}, ROAD_W, 0.06f, 1.1f, rd.base);
+      // Curb edges
+      DrawCube({-ROAD_W * 0.5f - 0.08f, 0.03f, 0}, 0.16f, 0.1f, 1.1f, rd.edge);
+      DrawCube({ ROAD_W * 0.5f + 0.08f, 0.03f, 0}, 0.16f, 0.1f, 1.1f, rd.edge);
+      rlPopMatrix();
+
+      // Palm trees along Verdant Oasis path (every 8 units, both sides)
+      if (rd.hasPalms && s % 8 == 0 && s > 4 && s < (int)drawLen - 4) {
+        for (int side = -1; side <= 1; side += 2) {
+          float palmX = sx + perpX * 3.0f * side;
+          float palmZ = sz + perpZ * 3.0f * side;
+          float palmY = GetDuneHeight(palmX, palmZ);
+          DrawCylinder({palmX, palmY, palmZ}, 0.18f, 0.12f, 3.8f, 6, {140, 100, 50, 255});
+          DrawSphere({palmX, palmY + 4.1f, palmZ}, 1.3f, {50, 150, 50, 200});
+          DrawSphere({palmX + 0.3f, palmY + 3.8f, palmZ + 0.2f}, 0.9f, {60, 170, 55, 200});
+        }
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOMADIC CAMPS — Scattered desert camps between cities
+// ═══════════════════════════════════════════════════════════════════════════════
+static void DrawNomadicCamps() {
+  struct Camp { float x, z; };
+  static const Camp camps[] = {
+    {60,  50}, {140,  50},   // north wilderness
+    {60, 100}, {140, 100},   // south wilderness
+    {100, 30}, {100, 110},   // north/south road
+    {50,  55}, {150,  55},   // west/east wilderness
+    {75, 120}, {130,  35},   // extra scatter
+  };
+  static constexpr int NUM_CAMPS = (int)(sizeof(camps) / sizeof(camps[0]));
+  // Fabric tent colors (vibrant, colorful)
+  static const Color tentCols[] = {
+    {200, 60, 60, 255}, {60, 80, 200, 255}, {200, 170, 40, 255},
+    {80, 180, 80, 255}, {180, 80, 160, 255}, {220, 140, 50, 255},
+    {100, 200, 200, 255}, {200, 100, 60, 255}, {140, 60, 180, 255},
+    {60, 160, 120, 255},
+  };
+
+  float px = g_player.posX, pz = g_player.posZ;
+  for (int c = 0; c < NUM_CAMPS; c++) {
+    float cx = camps[c].x, cz = camps[c].z;
+    float ddx = cx - px, ddz = cz - pz;
+    if (ddx*ddx + ddz*ddz > 625.0f) continue; // 25u cull
+    if (!SphereInFrustum(cx, GetDuneHeight(cx, cz), cz, 4.0f)) continue;
+    float cy = GetDuneHeight(cx, cz);
+    unsigned int h = (unsigned int)(c * 2654435761u);
+
+    // 2-3 small fabric tents per camp
+    int numTents = 2 + (h % 2);
+    for (int t = 0; t < numTents; t++) {
+      float ang = (float)(h >> (t*3)) * 0.001f;
+      float dist = 1.5f + (float)((h >> (t*5+2)) % 20) * 0.1f;
+      float tx = cx + cosf(ang) * dist;
+      float tz = cz + sinf(ang) * dist;
+      float ty = GetDuneHeight(tx, tz);
+      Color col = tentCols[(c * 3 + t) % 10];
+      // Tent body — angled fabric (cube tilted)
+      rlPushMatrix();
+      rlTranslatef(tx, ty + 0.7f, tz);
+      rlRotatef((float)((h >> (t*7)) % 360), 0, 1, 0);
+      rlRotatef(12.0f, 1, 0, 0); // slight lean
+      DrawCube({0, 0, 0}, 1.6f, 1.2f, 1.4f, col);
+      rlPopMatrix();
+      // Tent pole (thin cylinder poking out top)
+      DrawCylinder({tx, ty, tz}, 0.04f, 0.04f, 1.6f, 4, {100, 75, 45, 255});
+      // Rope line
+      float rx = tx + cosf(ang + 1.5f) * 1.0f;
+      float rz = tz + sinf(ang + 1.5f) * 1.0f;
+      DrawCube({(tx+rx)*0.5f, ty + 0.3f, (tz+rz)*0.5f}, 0.03f, 0.03f,
+               sqrtf((rx-tx)*(rx-tx) + (rz-tz)*(rz-tz)), {160, 130, 80, 200});
+    }
+    // Campfire (center of camp)
+    float glow = 0.5f + 0.5f * sinf(g_time * 3.5f + (float)c);
+    unsigned char fr = (unsigned char)(200 + glow * 55);
+    unsigned char fg = (unsigned char)(100 + glow * 80);
+    DrawSphere({cx, cy + 0.25f, cz}, 0.22f, {fr, fg, 20, 255});
+    DrawSphere({cx, cy + 0.35f, cz}, 0.35f, {255, 160, 40, (unsigned char)(40 + glow * 30)});
+    // Fire logs
+    DrawCube({cx - 0.2f, cy + 0.08f, cz}, 0.5f, 0.08f, 0.08f, {80, 55, 30, 255});
+    DrawCube({cx + 0.1f, cy + 0.08f, cz + 0.15f}, 0.08f, 0.08f, 0.45f, {75, 50, 28, 255});
+  }
+}
+
+// ─── 2. Ma'ayan — The Verdant Oasis (W, ~22,75) ─────────────────────────────
 static void DrawCityMaayan() {
   const float cx = CITY_MAAYAN_X, cz = CITY_MAAYAN_Z;
   const float poolY = GetDuneHeight(cx, cz);
-  const Color limestone = {215, 208, 188, 255};
-  const Color cedar     = {165, 108, 48,  255};
   const Color waterRim  = {200, 192, 172, 255};
+  const Color adobe     = {210, 160, 100, 255};
+  const Color adobeDark = {185, 135, 80,  255};
 
-  // Pool rim (4 stone slabs)
-  DrawCube({cx,        poolY + 0.2f, cz - 3.3f}, 7.0f, 0.4f, 0.6f, waterRim);
-  DrawCube({cx,        poolY + 0.2f, cz + 3.3f}, 7.0f, 0.4f, 0.6f, waterRim);
-  DrawCube({cx - 3.3f, poolY + 0.2f, cz},        0.6f, 0.4f, 7.0f, waterRim);
-  DrawCube({cx + 3.3f, poolY + 0.2f, cz},        0.6f, 0.4f, 7.0f, waterRim);
-  // Water surface (shader-driven)
-  DrawWaterPlane({cx, poolY + 0.1f, cz}, 6.0f, 6.0f);
-  // Fallback solid pool for when shader is loading
-  DrawCylinder({cx, poolY + 0.08f, cz}, 2.9f, 2.9f, 0.04f, 16,
-               {60, 140, 200, 180});
-  // 8-pillar colonnade ring
-  for (int i = 0; i < 8; i++) {
-    float a  = i * (2.0f * PI / 8.0f);
-    float px = cx + cosf(a) * 6.8f;
-    float pz = cz + sinf(a) * 6.8f;
-    float py = GetDuneHeight(px, pz);
-    DrawCylinder({px, py, pz}, 0.26f, 0.22f, 4.2f, 10, limestone);
-    DrawCube({px, py + 4.3f, pz}, 0.65f, 0.48f, 0.65f, limestone); // capital
-  }
-  // Aqueduct arches: N-S span
-  {
-    float aqY = GetDuneHeight(cx, cz) + 5.5f;
-    DrawCube({cx, aqY, cz},        0.45f, 0.45f, 18.0f, {185, 172, 145, 255});
-    DrawCylinder({cx, GetDuneHeight(cx, cz - 9.0f), cz - 9.0f},
-                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz - 9.0f),
-                 6, {180, 168, 140, 255});
-    DrawCylinder({cx, GetDuneHeight(cx, cz + 9.0f), cz + 9.0f},
-                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz + 9.0f),
-                 6, {180, 168, 140, 255});
-  }
-  // Aqueduct arches: E-W span
-  {
-    float aqY = GetDuneHeight(cx, cz) + 5.5f;
-    DrawCube({cx, aqY, cz},        18.0f, 0.45f, 0.45f, {185, 172, 145, 255});
-    DrawCylinder({cx - 9.0f, GetDuneHeight(cx - 9.0f, cz), cz},
-                 0.28f, 0.28f, aqY - GetDuneHeight(cx - 9.0f, cz),
-                 6, {180, 168, 140, 255});
-    DrawCylinder({cx + 9.0f, GetDuneHeight(cx + 9.0f, cz), cz},
-                 0.28f, 0.28f, aqY - GetDuneHeight(cx + 9.0f, cz),
-                 6, {180, 168, 140, 255});
-  }
-  // 4 courtyard houses with cedar pergola
-  static const float hdx[] = {-5.5f,  5.5f, 0.0f,  0.0f};
-  static const float hdz[] = {  0.0f,  0.0f,-5.5f,  5.5f};
-  for (int i = 0; i < 4; i++) {
-    float hx = cx + hdx[i], hz = cz + hdz[i];
+  // ── Lake (kept from previous) ──────────────────────────────────────────
+  DrawCube({cx,        poolY + 0.2f, cz - 5.5f}, 11.6f, 0.4f, 0.6f, waterRim);
+  DrawCube({cx,        poolY + 0.2f, cz + 5.5f}, 11.6f, 0.4f, 0.6f, waterRim);
+  DrawCube({cx - 5.5f, poolY + 0.2f, cz},        0.6f, 0.4f, 11.6f, waterRim);
+  DrawCube({cx + 5.5f, poolY + 0.2f, cz},        0.6f, 0.4f, 11.6f, waterRim);
+  DrawWaterPlane({cx, poolY + 0.1f, cz}, 10.0f, 10.0f);
+  DrawCylinder({cx, poolY + 0.08f, cz}, 4.8f, 4.8f, 0.04f, 16, {60, 140, 200, 180});
+
+  // ── 6 Adobe Villas with vibrant awnings & rooftop gardens ─────────────
+  static const float vdx[] = {-7.0f, 7.0f, -5.0f, 5.0f, -8.5f, 8.5f};
+  static const float vdz[] = {-3.0f, -3.0f, 5.0f, 5.0f, 2.0f, 2.0f};
+  static const Color awnings[] = {
+    {220, 60, 60, 255}, {60, 160, 220, 255}, {220, 180, 40, 255},
+    {200, 80, 160, 255}, {80, 200, 120, 255}, {240, 140, 50, 255}
+  };
+  for (int i = 0; i < 6; i++) {
+    float hx = cx + vdx[i], hz = cz + vdz[i];
     float hy = GetDuneHeight(hx, hz);
-    DrawCube({hx, hy + 1.5f, hz}, 2.8f, 3.0f, 2.8f, {222, 216, 196, 255});
-    DrawCube({hx, hy + 3.2f, hz}, 3.1f, 0.32f, 3.1f, cedar); // cedar roof
+    // Adobe body — warm terracotta
+    DrawCube({hx, hy + 1.5f, hz}, 3.0f, 3.0f, 3.0f, adobe);
+    DrawCubeWires({hx, hy + 1.5f, hz}, 3.1f, 3.1f, 3.1f, adobeDark);
+    // Flat roof
+    DrawCube({hx, hy + 3.1f, hz}, 3.4f, 0.2f, 3.4f, {180, 130, 75, 255});
+    // Rooftop garden — small green spheres
+    DrawSphere({hx - 0.5f, hy + 3.5f, hz - 0.5f}, 0.35f, {50, 160, 50, 200});
+    DrawSphere({hx + 0.5f, hy + 3.5f, hz + 0.3f}, 0.30f, {60, 180, 55, 200});
+    DrawSphere({hx,        hy + 3.6f, hz},        0.40f, {40, 150, 45, 200});
+    // Vibrant awning — extending from front wall
+    DrawCube({hx, hy + 2.4f, hz + 1.8f}, 2.2f, 0.08f, 1.0f, awnings[i]);
+    // Door
+    DrawCube({hx, hy + 0.6f, hz + 1.51f}, 0.7f, 1.2f, 0.05f, {90, 60, 35, 255});
+    // Windows (2 per house)
+    DrawCube({hx - 0.8f, hy + 1.8f, hz + 1.51f}, 0.5f, 0.5f, 0.05f, {180, 210, 230, 200});
+    DrawCube({hx + 0.8f, hy + 1.8f, hz + 1.51f}, 0.5f, 0.5f, 0.05f, {180, 210, 230, 200});
+  }
+
+  // ── Palm trees around the oasis (8 trees) ────────────────────────────
+  for (int i = 0; i < 8; i++) {
+    float a = i * (2.0f * PI / 8.0f);
+    float pr = 9.0f + (i % 2) * 2.0f;
+    float palmX = cx + cosf(a) * pr;
+    float palmZ = cz + sinf(a) * pr;
+    float palmY = GetDuneHeight(palmX, palmZ);
+    DrawCylinder({palmX, palmY, palmZ}, 0.18f, 0.12f, 4.0f, 6, {140, 100, 50, 255});
+    DrawSphere({palmX, palmY + 4.3f, palmZ}, 1.4f, {45, 145, 45, 200});
+    DrawSphere({palmX + 0.4f, palmY + 4.0f, palmZ + 0.3f}, 1.0f, {55, 165, 50, 200});
+  }
+
+  // ── Aqueduct (kept — iconic landmark) ──────────────────────────────────
+  {
+    float aqY = poolY + 5.5f;
+    DrawCube({cx, aqY, cz}, 0.45f, 0.45f, 18.0f, {185, 172, 145, 255});
+    DrawCylinder({cx, GetDuneHeight(cx, cz - 9.0f), cz - 9.0f},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz - 9.0f), 6, {180, 168, 140, 255});
+    DrawCylinder({cx, GetDuneHeight(cx, cz + 9.0f), cz + 9.0f},
+                 0.28f, 0.28f, aqY - GetDuneHeight(cx, cz + 9.0f), 6, {180, 168, 140, 255});
   }
 }
 
-// ─── 3. Avak — The Dust Town (S, ~100,133) ───────────────────────────────────
+// ─── 3. Avak — The Crimson District (S, ~100,133) ────────────────────────────
 static void DrawCityAvak() {
   const float cx = CITY_AVAK_X, cz = CITY_AVAK_Z;
-  const Color eroded  = {192, 182, 155, 255};
-  const Color bleach  = {205, 197, 172, 255};
-  const Color rubbleC = {172, 162, 136, 255};
+  const Color brick = {165, 60, 50, 255};
+  const Color brickDark = {130, 45, 38, 255};
 
-  // Crumbling wall segments (partial, jagged heights)
-  struct WallSeg { float dx, dz, w, h, d; };
-  static const WallSeg walls[] = {
-    {-6.0f, -5.5f,  8.5f, 2.6f, 0.75f},
-    { 5.5f, -2.5f,  0.7f, 3.0f, 5.5f },
-    {-5.5f,  4.5f,  5.0f, 1.8f, 0.7f },
-    { 1.0f,  5.8f,  4.5f, 2.2f, 0.65f},
-    {-1.5f, -7.0f,  3.5f, 1.4f, 0.6f },
+  // ── 8 Colorful multi-story houses with steep roofs ─────────────────────
+  struct House { float dx, dz; int stories; Color wall; };
+  static const House houses[] = {
+    {-7.0f, -4.0f, 3, {220, 140, 80, 255}},   // orange
+    {-3.5f, -5.0f, 2, {80, 160, 220, 255}},    // blue
+    { 1.0f, -4.5f, 3, {200, 80, 120, 255}},    // pink
+    { 5.5f, -3.5f, 2, {120, 200, 100, 255}},   // green
+    {-6.0f,  3.0f, 2, {220, 200, 80, 255}},    // yellow
+    {-2.0f,  4.5f, 3, {180, 100, 200, 255}},   // purple
+    { 3.0f,  5.0f, 2, {100, 200, 200, 255}},   // teal
+    { 7.0f,  3.0f, 3, {220, 120, 60, 255}},    // burnt orange
   };
-  for (auto &w : walls) {
-    float wx = cx + w.dx, wz = cz + w.dz;
-    float wy = GetDuneHeight(wx, wz);
-    DrawCube({wx, wy + w.h*0.5f, wz}, w.w, w.h, w.d, eroded);
-    DrawCubeWires({wx, wy + w.h*0.5f, wz}, w.w, w.h, w.d, {140, 130, 108, 200});
+  for (auto &h : houses) {
+    float hx = cx + h.dx, hz = cz + h.dz;
+    float hy = GetDuneHeight(hx, hz);
+    float storyH = 2.0f;
+    float totalH = h.stories * storyH;
+    // Stacked floors with slight overhang per story
+    for (int s = 0; s < h.stories; s++) {
+      float sw = 2.6f + s * 0.15f; // upper floors slightly wider
+      float sy = hy + s * storyH + storyH * 0.5f;
+      DrawCube({hx, sy, hz}, sw, storyH, sw, h.wall);
+      DrawCubeWires({hx, sy, hz}, sw + 0.05f, storyH + 0.05f, sw + 0.05f,
+                    {(unsigned char)(h.wall.r * 0.6f), (unsigned char)(h.wall.g * 0.6f),
+                     (unsigned char)(h.wall.b * 0.6f), 200});
+      // Windows per floor (2 per side)
+      DrawCube({hx - 0.6f, sy + 0.2f, hz + sw*0.51f}, 0.4f, 0.5f, 0.05f, {255, 245, 200, 220});
+      DrawCube({hx + 0.6f, sy + 0.2f, hz + sw*0.51f}, 0.4f, 0.5f, 0.05f, {255, 245, 200, 220});
+    }
+    // Steep peaked roof
+    float roofBase = hy + totalH;
+    float topW = 2.6f + h.stories * 0.15f;
+    DrawCube({hx, roofBase + 0.8f, hz}, topW * 0.8f, 1.6f, topW * 0.4f, brick);
+    DrawCube({hx, roofBase + 1.2f, hz}, topW * 0.4f, 0.8f, topW * 0.3f, brickDark);
+    // Flower boxes under bottom windows (colorful)
+    Color flowerCol = {(unsigned char)(200 + (int)(h.dx * 7) % 55),
+                       (unsigned char)(80 + (int)(h.dz * 11) % 120),
+                       (unsigned char)(100 + (int)(h.dx * 3) % 100), 255};
+    DrawCube({hx - 0.6f, hy + 1.0f, hz + 1.35f}, 0.5f, 0.15f, 0.2f, flowerCol);
+    DrawCube({hx + 0.6f, hy + 1.0f, hz + 1.35f}, 0.5f, 0.15f, 0.2f, flowerCol);
+    // Door
+    DrawCube({hx, hy + 0.7f, hz + 1.31f}, 0.6f, 1.4f, 0.05f, {80, 50, 30, 255});
   }
-  // Rubble piles
-  struct Rubble { float dx, dz, sc; };
-  static const Rubble rubble[] = {
-    {-4.0f, -7.0f, 1.3f}, { 3.8f, -6.2f, 0.9f},
-    {-7.0f,  2.5f, 1.1f}, { 4.5f,  4.0f, 1.4f},
-    { 1.5f,  5.5f, 0.9f}, {-2.0f,  1.5f, 0.7f},
+
+  // ── 4 Market stalls (open-air with colored canopies) ────────────────────
+  static const Color canopyCols[] = {
+    {200, 50, 50, 230}, {50, 50, 200, 230}, {200, 180, 40, 230}, {50, 180, 50, 230}
   };
-  for (auto &r : rubble) {
-    float rx = cx + r.dx, rz = cz + r.dz;
-    float ry = GetDuneHeight(rx, rz);
-    DrawSphere({rx,            ry + r.sc*0.30f, rz},            r.sc*0.55f, rubbleC);
-    DrawSphere({rx + r.sc*0.3f, ry + r.sc*0.15f, rz + r.sc*0.2f}, r.sc*0.42f, bleach);
+  for (int i = 0; i < 4; i++) {
+    float a = i * (PI / 2.0f) + PI / 4.0f;
+    float sx = cx + cosf(a) * 4.0f;
+    float sz = cz + sinf(a) * 4.0f;
+    float sy = GetDuneHeight(sx, sz);
+    // 4 posts
+    for (int p = 0; p < 4; p++) {
+      float px2 = sx + ((p & 1) ? 0.8f : -0.8f);
+      float pz2 = sz + ((p & 2) ? 0.8f : -0.8f);
+      DrawCylinder({px2, sy, pz2}, 0.06f, 0.06f, 2.2f, 4, {100, 70, 40, 255});
+    }
+    // Canopy
+    DrawCube({sx, sy + 2.2f, sz}, 2.0f, 0.08f, 2.0f, canopyCols[i]);
+    // Counter
+    DrawCube({sx, sy + 0.8f, sz}, 1.6f, 0.1f, 1.0f, {160, 120, 70, 255});
   }
-  // ── Broken Clock Tower (navigation landmark) ──────────────────────────────
-  float ty = GetDuneHeight(cx + 1.5f, cz - 2.5f);
-  // Main shaft
-  DrawCylinder({cx+1.5f, ty, cz-2.5f}, 1.25f, 1.25f, 5.8f, 10, eroded);
-  // Sheared top (diagonal suggestion: taper to one side)
-  DrawCylinder({cx+1.5f, ty+5.8f, cz-2.5f}, 1.25f, 0.45f, 1.4f, 8, bleach);
-  // Clock face inlay
-  DrawCylinder({cx+2.75f, ty+4.2f, cz-2.5f}, 0.7f, 0.7f, 0.08f, 14,
-               {148, 138, 115, 255});
-  // Crack line (thin dark cube along tower face)
-  DrawCube({cx+2.6f, ty+3.5f, cz-2.5f}, 0.07f, 4.5f, 0.07f, {85, 75, 60, 255});
-  // Narrow alley walls
-  DrawCube({cx-2.0f, GetDuneHeight(cx-2.0f,cz+1.5f)+1.3f, cz+1.5f},
-           0.6f, 2.6f, 5.5f, {186, 176, 150, 255});
-  DrawCube({cx+3.0f, GetDuneHeight(cx+3.0f,cz+1.5f)+1.1f, cz+1.5f},
-           0.6f, 2.2f, 5.5f, {180, 170, 144, 255});
+
+  // ── Central brick tower (navigation landmark) ──────────────────────────
+  float ty = GetDuneHeight(cx, cz);
+  DrawCylinder({cx, ty, cz}, 1.3f, 1.0f, 8.0f, 10, brick);
+  DrawCylinder({cx, ty + 8.0f, cz}, 1.5f, 0.8f, 1.5f, 8, brickDark);
+  // Tower flag
+  DrawCylinder({cx, ty + 9.5f, cz}, 0.05f, 0.05f, 2.0f, 4, {80, 50, 30, 255});
+  DrawCube({cx + 0.4f, ty + 11.0f, cz}, 0.8f, 0.5f, 0.05f, {220, 40, 40, 255});
 }
 
-// ─── 4. Gan — The Blooming Town (E, ~177,75) ─────────────────────────────────
+// ─── 4. Gan — The Ivory Spire (E, ~177,75) ───────────────────────────────────
 static void DrawCityGan() {
   const float cx = CITY_GAN_X, cz = CITY_GAN_Z;
-  const Color fittedStone = {180, 162, 122, 255};
-  const Color cedar       = {162, 108, 46,  255};
-  const Color channel     = {80,  130, 175, 180};
+  const Color ivory     = {240, 235, 225, 255};
+  const Color ivoryDark = {210, 205, 190, 255};
+  const Color goldTrim  = {210, 190, 120, 255};
+  const Color channel   = {80, 130, 175, 180};
 
-  // 5 terrace retaining walls (concentric)
-  for (int tier = 0; tier < 5; tier++) {
-    float radius  = (float)(tier + 1) * 3.2f;
-    float wallH   = 0.9f + tier * 0.1f;
-    int   sides   = 8 + tier * 2;
-    float segLen  = 2.0f * PI * radius / sides;
-    for (int i = 0; i < sides; i++) {
-      float a  = i * (2.0f * PI / sides);
-      float wx = cx + cosf(a) * radius;
-      float wz = cz + sinf(a) * radius;
-      float wy = GetDuneHeight(wx, wz);
-      DrawCube({wx, wy + wallH*0.5f, wz}, segLen * 0.88f, wallH, 0.55f, fittedStone);
-    }
-  }
-  // Cedar-framed residential houses (5 positions)
-  static const float hdx[] = {-5.0f,  5.0f, 0.0f, -8.0f,  8.0f};
-  static const float hdz[] = {-4.0f, -4.0f,-8.0f,  0.5f,  0.5f};
-  for (int i = 0; i < 5; i++) {
-    float hx = cx + hdx[i], hz = cz + hdz[i];
+  // ── 6 Elegant buildings with curved walls & stained glass ──────────────
+  struct IvoryHouse { float dx, dz; float scale; };
+  static const IvoryHouse houses[] = {
+    {-6.0f, -4.0f, 1.0f}, { 6.0f, -4.0f, 1.1f},
+    {-5.0f,  5.0f, 0.9f}, { 5.0f,  5.0f, 1.0f},
+    {-8.5f,  0.5f, 0.8f}, { 8.5f,  0.5f, 0.85f},
+  };
+  static const Color stainedGlass[] = {
+    {200, 60, 40, 200}, {40, 80, 200, 200}, {50, 180, 60, 200},
+    {200, 180, 40, 200}, {160, 50, 180, 200}, {40, 180, 180, 200},
+  };
+  for (int i = 0; i < 6; i++) {
+    float hx = cx + houses[i].dx, hz = cz + houses[i].dz;
     float hy = GetDuneHeight(hx, hz);
-    DrawCube({hx, hy + 1.25f, hz}, 2.5f, 2.5f, 2.5f, {215, 205, 178, 255});
-    DrawCube({hx, hy + 2.65f, hz}, 2.75f, 0.35f, 2.75f, cedar);
+    float s = houses[i].scale;
+    // Curved wall body — cylinder + cube combo
+    DrawCylinder({hx, hy, hz}, 1.5f * s, 1.5f * s, 3.5f * s, 12, ivory);
+    DrawCube({hx, hy + 1.75f * s, hz}, 2.5f * s, 3.5f * s, 2.5f * s, ivory);
+    DrawCubeWires({hx, hy + 1.75f * s, hz}, 2.55f * s, 3.55f * s, 2.55f * s, ivoryDark);
+    // Curved dome roof
+    DrawSphere({hx, hy + 3.8f * s, hz}, 1.6f * s, {230, 225, 215, 255});
+    // Gold trim lines along edges
+    DrawCube({hx, hy + 0.1f, hz + 1.26f * s}, 2.6f * s, 0.1f, 0.08f, goldTrim);
+    DrawCube({hx, hy + 3.5f * s, hz + 1.26f * s}, 2.6f * s, 0.1f, 0.08f, goldTrim);
+    // Stained glass windows (3 per building, different colors)
+    for (int w = 0; w < 3; w++) {
+      float wx = hx + (w - 1) * 0.7f * s;
+      DrawCube({wx, hy + 2.2f * s, hz + 1.27f * s}, 0.4f * s, 0.6f * s, 0.04f,
+               stainedGlass[(i + w) % 6]);
+    }
+    // Door — arched (dark rectangle + small sphere on top)
+    DrawCube({hx, hy + 0.7f * s, hz + 1.27f * s}, 0.6f * s, 1.4f * s, 0.05f, {120, 100, 70, 255});
   }
-  // Irrigation channels (N-S lines, thin water-blue slabs)
-  for (int i = -2; i <= 2; i++) {
-    float lx = cx + i * 3.1f;
+
+  // ── Central Ivory Spire (navigation landmark) ──────────────────────────
+  float ty = GetDuneHeight(cx, cz);
+  DrawCylinder({cx, ty, cz}, 1.2f, 0.3f, 10.0f, 12, ivory);
+  DrawCylinder({cx, ty + 10.0f, cz}, 0.3f, 0.05f, 2.0f, 8, goldTrim);
+  // Spiral decoration (gold cubes wrapping up)
+  for (int sp = 0; sp < 20; sp++) {
+    float sa = sp * 0.6f;
+    float sh = ty + sp * 0.5f + 0.5f;
+    float sr = 1.15f - sp * 0.04f;
+    if (sr < 0.15f) sr = 0.15f;
+    float spx = cx + cosf(sa) * sr;
+    float spz = cz + sinf(sa) * sr;
+    DrawCube({spx, sh, spz}, 0.2f, 0.15f, 0.2f, goldTrim);
+  }
+
+  // ── Decorative water channels (kept) ───────────────────────────────────
+  for (int i = -1; i <= 1; i += 2) {
+    float lx = cx + i * 4.0f;
     float ly = GetDuneHeight(lx, cz);
-    DrawCube({lx, ly + 0.025f, cz}, 0.28f, 0.05f, 28.0f, channel);
-  }
-  // Water tower (summit landmark)
-  float wy = GetDuneHeight(cx, cz);
-  DrawCylinder({cx, wy,       cz}, 1.05f, 1.25f, 6.2f, 10, {192, 178, 142, 255});
-  DrawCylinder({cx, wy + 6.2f, cz}, 1.9f, 1.7f,  1.3f, 10, {200, 185, 150, 255});
-  for (int i = 0; i < 4; i++) {
-    float sa = i * (PI / 2.0f) + PI / 4.0f;
-    float sx = cx + cosf(sa) * 1.6f, sz = cz + sinf(sa) * 1.6f;
-    float sy = GetDuneHeight(sx, sz);
-    DrawCylinder({sx, sy + 0.5f, sz}, 0.12f, 0.08f, 5.8f, 5, cedar);
-  }
-  // Dense vegetation patches between terraces
-  for (int v = 0; v < 12; v++) {
-    float va = v * (2.0f * PI / 12.0f);
-    float vr = 2.0f + (v % 3) * 1.8f;
-    float vx = cx + cosf(va) * vr, vz = cz + sinf(va) * vr;
-    float vy = GetDuneHeight(vx, vz);
-    // Stylised plant: small green sphere on thin stem
-    DrawCylinder({vx, vy, vz}, 0.06f, 0.06f, 0.55f, 4, {90, 65, 35, 255});
-    Color leaf = {(unsigned char)(60 + v*8%60), (unsigned char)(140 + v*5%60),
-                  (unsigned char)(50 + v*3%40), 255};
-    DrawSphere({vx, vy + 0.75f, vz}, 0.38f + 0.1f*(v%3), leaf);
+    DrawCube({lx, ly + 0.025f, cz}, 0.3f, 0.05f, 20.0f, channel);
   }
 }
 
-// ─── 5. Sela — The Canyon Town (NW, ~35,30) ──────────────────────────────────
+// ─── 5. Sela — The Iron Quarter (NW, ~35,30) ─────────────────────────────────
 static void DrawCitySela() {
   const float cx = CITY_SELA_X, cz = CITY_SELA_Z;
   const float floorY = GetDuneHeight(cx, cz);
-  const Color rawStone  = {118, 104,  84, 255};
-  const Color stoneFace = {135, 120,  98, 255};
-  const Color brass     = {175, 112,  40, 255};
-  const Color brassDark = {122,  76,  24, 255};
+  const Color stone     = {150, 148, 142, 255};
+  const Color stoneDark = {110, 108, 102, 255};
+  const Color iron      = {55, 55, 60, 255};
 
-  // ── Canyon wall faces (N and S cliff faces) ──────────────────────────────
-  for (int side = 0; side < 2; side++) {
-    float wallZ    = cz + (side == 0 ? -7.5f : 7.5f);
-    int   numSegs  = 10;
-    for (int i = -4; i <= 4; i++) {
-      float wx    = cx + i * 2.5f;
-      float wrimY = GetDuneHeight(wx, wallZ + (side==0 ? -2.0f : 2.0f));
-      float wflrY = GetDuneHeight(wx, cz);
-      float wallH = wrimY - wflrY;
-      if (wallH < 0.5f) wallH = 0.5f;
-      DrawCube({wx, wflrY + wallH*0.5f, wallZ}, 2.3f, wallH, 1.1f, rawStone);
-    }
-  }
-  // ── Rock-cut dwellings (N wall) ──────────────────────────────────────────
-  for (int i = 0; i < 6; i++) {
-    float dx    = (i - 2.5f) * 3.5f;
-    float tier  = (float)(i % 2);
-    float dwx   = cx + dx;
-    float dwz   = cz - 6.0f;
-    float dwy   = floorY + 1.8f + tier * 2.8f;
-    DrawCube({dwx, dwy + 0.9f, dwz}, 1.9f, 2.0f, 0.9f, {78, 68, 54, 255});
-    DrawCubeWires({dwx, dwy + 0.9f, dwz}, 2.2f, 2.3f, 1.0f, stoneFace);
-  }
-  // ── Rock-cut dwellings (S wall) ──────────────────────────────────────────
-  for (int i = 0; i < 5; i++) {
-    float dx  = (i - 2.0f) * 3.8f;
-    float dwx = cx + dx;
-    float dwz = cz + 6.5f;
-    float dwy = floorY + 1.4f + (i % 3) * 2.4f;
-    DrawCube({dwx, dwy + 0.8f, dwz}, 2.0f, 1.8f, 0.9f, {73, 63, 50, 255});
-    DrawCubeWires({dwx, dwy + 0.8f, dwz}, 2.3f, 2.1f, 1.0f, stoneFace);
-  }
-  // ── 3-level brass scaffolding (both faces) ───────────────────────────────
-  for (int level = 0; level < 3; level++) {
-    float scaffY = floorY + 1.0f + level * 3.0f;
-    DrawCube({cx, scaffY, cz - 5.5f}, 20.0f, 0.12f, 0.12f, brass);
-    DrawCube({cx, scaffY, cz + 5.5f}, 20.0f, 0.12f, 0.12f, brass);
-    for (int p = -4; p <= 4; p++) {
-      float px = cx + p * 2.3f;
-      float postH = scaffY - floorY + 0.15f;
-      DrawCylinder({px, floorY, cz - 5.5f}, 0.09f, 0.09f, postH, 5, brassDark);
-      DrawCylinder({px, floorY, cz + 5.5f}, 0.09f, 0.09f, postH, 5, brassDark);
-    }
-  }
-  // ── Great Chain Lift (navigation landmark) ────────────────────────────────
-  float rimY    = GetDuneHeight(cx + 2.0f, cz - 10.0f);
-  float chainY0 = floorY;
-  int   nLinks  = (int)((rimY - chainY0) / 1.5f) + 2;
-  for (int lk = 0; lk < nLinks; lk++) {
-    float ly = chainY0 + lk * 1.5f;
-    if (lk % 2 == 0)
-      DrawCube({cx + 2.0f, ly, cz}, 0.5f, 0.18f, 0.12f, brass);
-    else
-      DrawCube({cx + 2.0f, ly, cz}, 0.12f, 0.18f, 0.5f, brass);
-    // Ore cart mid-chain
-    if (lk == nLinks / 2) {
-      float ct = g_time * 0.3f;
-      float cartY = chainY0 + ct - floorf(ct) * (rimY - chainY0);
-      DrawCube({cx+2.0f, cartY - 0.6f, cz}, 1.2f, 0.7f, 0.8f, {88, 78, 62, 255});
-    }
-  }
-  // ── Brass lanterns along scaffold rails ──────────────────────────────────
-  struct Lantern { float dx, dz, dy; };
-  static const Lantern lanterns[] = {
-    {-7.5f, -5.5f, 2.5f}, {-3.8f, -5.5f, 3.8f}, {0.0f, -5.5f, 2.5f},
-    { 3.8f, -5.5f, 3.8f}, { 7.5f, -5.5f, 2.5f},
-    {-5.0f,  5.5f, 2.0f}, { 0.0f,  5.5f, 3.4f}, { 5.0f,  5.5f, 2.0f},
+  // ── Cobblestone ground plaza ──────────────────────────────────────────
+  DrawCube({cx, floorY + 0.03f, cz}, 18.0f, 0.06f, 14.0f, {145, 143, 138, 255});
+
+  // ── 8 Stone houses in a grid pattern ───────────────────────────────────
+  struct StoneHouse { float dx, dz; Color banner; };
+  static const StoneHouse houses[] = {
+    {-6.5f, -4.5f, {220, 40, 40, 255}},   // red banner
+    {-2.5f, -5.0f, {40, 80, 220, 255}},    // blue
+    { 2.5f, -4.5f, {220, 200, 40, 255}},   // yellow
+    { 6.5f, -5.0f, {40, 200, 80, 255}},    // green
+    {-6.0f,  4.0f, {200, 100, 220, 255}},  // purple
+    {-2.0f,  5.0f, {220, 140, 40, 255}},   // orange
+    { 3.0f,  4.5f, {40, 200, 200, 255}},   // teal
+    { 7.0f,  4.0f, {220, 60, 120, 255}},   // magenta
   };
-  for (auto &l : lanterns) {
-    float lx = cx + l.dx, lz = cz + l.dz, ly = floorY + l.dy;
-    float glow = 0.5f + 0.5f * sinf(g_time * 2.1f + l.dx * 0.7f);
-    unsigned char cr = 255;
-    unsigned char cg = (unsigned char)(130 + glow * 85);
-    DrawSphere({lx, ly,       lz}, 0.22f,        {cr, cg, 22, 255});
-    DrawSphere({lx, ly,       lz}, 0.40f,        {255, 185, 50, (unsigned char)(32 + glow*28)});
-    DrawCube  ({lx, ly - 0.1f, lz}, 0.42f, 0.5f, 0.42f, {115, 76, 22, 140});
+  for (int i = 0; i < 8; i++) {
+    float hx = cx + houses[i].dx, hz = cz + houses[i].dz;
+    float hy = GetDuneHeight(hx, hz);
+    // Stone body
+    DrawCube({hx, hy + 2.0f, hz}, 3.0f, 4.0f, 3.0f, stone);
+    DrawCubeWires({hx, hy + 2.0f, hz}, 3.05f, 4.05f, 3.05f, stoneDark); // masonry lines
+    // Peaked roof — two overlapping cubes
+    DrawCube({hx, hy + 4.3f, hz}, 3.3f, 0.8f, 2.0f, {120, 80, 50, 255});
+    DrawCube({hx, hy + 4.8f, hz}, 2.4f, 0.6f, 1.5f, {110, 70, 42, 255});
+    // Windows (2 per floor, 2 floors)
+    for (int fl = 0; fl < 2; fl++) {
+      float wy = hy + 1.2f + fl * 1.8f;
+      DrawCube({hx - 0.7f, wy, hz + 1.51f}, 0.4f, 0.5f, 0.05f, {40, 35, 30, 255});
+      DrawCube({hx + 0.7f, wy, hz + 1.51f}, 0.4f, 0.5f, 0.05f, {40, 35, 30, 255});
+    }
+    // Door
+    DrawCube({hx, hy + 0.7f, hz + 1.51f}, 0.6f, 1.4f, 0.05f, {70, 50, 30, 255});
+    // Colorful banner hanging from side
+    DrawCube({hx + 1.55f, hy + 3.0f, hz}, 0.06f, 2.0f, 0.5f, houses[i].banner);
+    // Wrought-iron bracket (tiny dark cube)
+    DrawCube({hx + 1.55f, hy + 4.1f, hz}, 0.15f, 0.15f, 0.15f, iron);
   }
-  // ── Rope bridges ─────────────────────────────────────────────────────────
-  for (int b = 0; b < 2; b++) {
-    float by  = floorY + 3.2f + b * 4.0f;
-    float bxc = cx + (b == 0 ? -2.5f : 1.5f);
-    DrawCube({bxc, by,        cz}, 1.1f, 0.09f, 14.0f, {175, 150, 88, 255});
-    DrawCylinder({bxc, by+0.9f, cz - 7.0f}, 0.06f, 0.06f, 8.0f, 4, {140, 110, 60, 255});
-    DrawCylinder({bxc, by+0.9f, cz + 7.0f}, 0.06f, 0.06f, 8.0f, 4, {140, 110, 60, 255});
+
+  // ── Wrought-iron lamp posts (6 around plaza) ──────────────────────────
+  for (int i = 0; i < 6; i++) {
+    float a = i * (2.0f * PI / 6.0f);
+    float lx = cx + cosf(a) * 8.0f;
+    float lz = cz + sinf(a) * 8.0f;
+    float ly = GetDuneHeight(lx, lz);
+    DrawCylinder({lx, ly, lz}, 0.08f, 0.08f, 3.2f, 5, iron);
+    DrawCube({lx, ly + 3.2f, lz}, 0.35f, 0.35f, 0.35f, iron);
+    // Lantern glow
+    float glow = 0.5f + 0.5f * sinf(g_time * 2.0f + (float)i);
+    DrawSphere({lx, ly + 3.2f, lz}, 0.18f,
+               {255, (unsigned char)(180 + glow * 50), 60, 255});
   }
+
+  // ── Central well (town square landmark) ────────────────────────────────
+  DrawCylinder({cx, floorY, cz}, 1.0f, 0.95f, 0.7f, 10, stoneDark);
+  DrawCylinder({cx, floorY + 0.65f, cz}, 0.8f, 0.8f, 0.02f, 10, {60, 120, 180, 200});
+  // Well posts + crossbar
+  DrawCylinder({cx - 0.7f, floorY + 0.7f, cz}, 0.06f, 0.06f, 1.4f, 5, iron);
+  DrawCylinder({cx + 0.7f, floorY + 0.7f, cz}, 0.06f, 0.06f, 1.4f, 5, iron);
+  DrawCube({cx, floorY + 2.15f, cz}, 1.6f, 0.1f, 0.1f, iron);
 }
 
 // ── Village Well at (98, 62) ─────────────────────────────────────────────────
@@ -11514,20 +13681,26 @@ static void DrawOverworld() {
     Vector3 camPos = g_cam.position;
     SetShaderValue(g_shTriplanar, g_locTripCameraPos, &camPos, SHADER_UNIFORM_VEC3);
     SetShaderValue(g_shTriplanar, g_locTripSunDir,    &g_sunDir, SHADER_UNIFORM_VEC3);
+    SetShaderValue(g_shRock, g_locRockSunDir, &g_sunDir, SHADER_UNIFORM_VEC3);
     // ── PASS 0: Infinite ground plane (hides terrain mesh edge) ──────────
-    // A large flat quad at y=-0.1 extends far beyond the terrain,
-    // preventing the visible horizon seam where the mesh ends.
+    // Darker sand color to suggest distance haze, slightly below terrain
     {
-      Color gc = {(unsigned char)(185 * amb.r / 255),
-                  (unsigned char)(165 * amb.g / 255),
-                  (unsigned char)(125 * amb.b / 255), 255};
+      Color gc = {(unsigned char)(155 * amb.r / 255),
+                  (unsigned char)(138 * amb.g / 255),
+                  (unsigned char)(100 * amb.b / 255), 255};
       DrawCube({(float)MAP_W * 0.5f, -4.0f, (float)MAP_H * 0.5f},
                (float)MAP_W * 4.0f, 0.01f, (float)MAP_H * 4.0f, gc);
     }
     // ── PASS 1: Opaque terrain (dune heightmap mesh) ─────────────────────
     if (g_terrainReady) {
-      DrawModel(g_terrainModel, {0, 0, 0}, 1.0f, amb);
+      DrawModel(g_terrainModel, {0, 0, 0}, 1.0f, WHITE);
     }
+    // Roads — flat colored paths from each city toward center
+    // DrawRoads(); // removed per user request
+    // Signposts — interactive direction signs at city hubs
+    DrawSignposts();
+    // Nomadic camps — scattered desert camps
+    DrawNomadicCamps();
 
     // ── PASS 2: Opaque environment (tents, rocks) ───────────────────────
     // Tent shadows (PCF soft) — cull beyond 50 units
@@ -11546,10 +13719,10 @@ static void DrawOverworld() {
       DrawSpriteBlobShadow({g_npcs[i].worldX, ny, g_npcs[i].worldZ}, 0.42f);
     }
 
-    // Rock shadows — cull beyond 40 units
+    // Rock shadows — cull beyond 30 units
     for (int i = 0; i < g_numRocks; i++) {
       RockInstance &ri = g_rockInstances[i];
-      if (DistSqToPlayer(ri.x, ri.z) > 1600.0f) continue;
+      if (DistSqToPlayer(ri.x, ri.z) > 625.0f) continue; // 25u cull
       DrawSoftShadow({ri.x, ri.cachedY, ri.z}, ri.scale * 1.5f, ri.scale * 2.0f);
     }
 
@@ -11569,21 +13742,24 @@ static void DrawOverworld() {
     if (SphereInFrustum(177.0f,  4.0f,  75.0f, 16.0f)) DrawCityGan();
     if (SphereInFrustum( 35.0f, -1.0f,  30.0f, 13.0f)) DrawCitySela();
 
-    // Draw procedural rocks — cull beyond 40 units + frustum
+    // Draw procedural rocks using pre-generated models
     for (int i = 0; i < g_numRocks; i++) {
       RockInstance &ri = g_rockInstances[i];
-      if (DistSqToPlayer(ri.x, ri.z) > 1600.0f) continue;
-      if (!SphereInFrustum(ri.x, ri.cachedY, ri.z, ri.scale * 1.5f)) continue;
-      DrawModelEx(ri.model, {ri.x, ri.cachedY, ri.z}, {0, 1, 0}, ri.rotY,
-                  {ri.scale, ri.scale, ri.scale}, WHITE);
+      if (DistSqToPlayer(ri.x, ri.z) > 1600.0f) continue; // 40u cull
+      if (!SphereInFrustum(ri.x, ri.cachedY, ri.z, ri.scale * 3.0f)) continue;
+      float ry = ri.cachedY + 0.15f; // lift above terrain
+      float s = ri.scale * 2.2f;     // scale up for visibility
+      DrawModelEx(ri.model, {ri.x, ry, ri.z}, {0,1,0}, ri.rotY, {s, s, s}, WHITE);
     }
 
+    // Border rocks — giant formations at map edges
+    DrawBorderRocks();
 
     // ── PASS 2b: Northern Wastes vegetation & obelisk ─────────────────────
     // Vegetation shadows — cull beyond 40 units
     for (int i = 0; i < g_numVeg; i++) {
       const VegetationInstance &vi = g_vegInstances[i];
-      if (DistSqToPlayer(vi.x, vi.z) > 1600.0f) continue;
+      if (DistSqToPlayer(vi.x, vi.z) > 900.0f) continue; // 30u cull
       float shadowH = (vi.type == VEG_SAGUARO || vi.type == VEG_DRY_TREE)
                       ? 3.0f * vi.scale : 1.2f * vi.scale;
       DrawSoftShadow({vi.x, vi.cachedY, vi.z}, vi.scale * 0.8f, shadowH);
@@ -11594,7 +13770,7 @@ static void DrawOverworld() {
     // Vegetation models — cull beyond 40 units + frustum
     for (int i = 0; i < g_numVeg; i++) {
       const VegetationInstance &vi = g_vegInstances[i];
-      if (DistSqToPlayer(vi.x, vi.z) > 1600.0f) continue;
+      if (DistSqToPlayer(vi.x, vi.z) > 900.0f) continue; // 30u cull
       if (!SphereInFrustum(vi.x, vi.cachedY, vi.z, vi.scale * 2.5f)) continue;
       DrawVegetationInstance(vi);
     }
@@ -11727,18 +13903,18 @@ static void DrawOverworld() {
   }
 
   // ── HUD (2D overlay) ─────────────────────────────────────────────────────
-  DrawText("WASD: Move  E/Enter: Talk  Space: Menu  Esc: Back", 10, SCREEN_H - 25,
-           14, {180, 160, 120, 200});
+  DrawUI("WASD: Move  E/Enter: Talk  Space: Menu  Esc: Back",
+           UI_SAFE, SCREEN_H - UI_SAFE, 14, {180, 160, 120, 200});
   char posStr[64];
   snprintf(posStr, 64, "[%d,%d]", g_player.gridX, g_player.gridY);
-  DrawText(posStr, SCREEN_W - 80, 10, 12, {180, 160, 120, 180});
+  DrawUI(posStr, SCREEN_W - 80 - UI_SAFE, UI_SAFE, 12, {180, 160, 120, 180});
 
   // Coins & time of day
   char hudBuf[128];
   snprintf(hudBuf, 128, "Coins: %d", g_playerCoins);
-  DrawText(hudBuf, 10, 10, 14, {255, 220, 120, 240});
+  DrawUI(hudBuf, UI_SAFE, UI_SAFE, 14, {255, 220, 120, 240});
   snprintf(hudBuf, 128, "%s", g_worldClock.GetName());
-  DrawText(hudBuf, 10, 28, 12, {200, 180, 140, 200});
+  DrawUI(hudBuf, UI_SAFE, UI_SAFE + 18, 12, {200, 180, 140, 200});
 
   // ── City proximity banner ─────────────────────────────────────────────────
   {
@@ -11759,7 +13935,7 @@ static void DrawOverworld() {
       int tw = MeasureText(cn, 18);
       DrawRectangle((SCREEN_W - tw - 24) / 2, 68, tw + 24, 28,
                     {15, 10, 5, (unsigned char)(alpha * 3 / 5)});
-      DrawText(cn, (SCREEN_W - tw) / 2, 75, 18, {255, 220, 120, alpha});
+      DrawUI(cn, (SCREEN_W - tw) / 2, 75, 18, {255, 220, 120, alpha});
     }
   }
   // City badges row — small colored circles per city, filled if badge earned
@@ -11767,8 +13943,8 @@ static void DrawOverworld() {
     const char *cityInitials[] = {"Z","M","A","G","S"};
     const Color cityColors[]   = {{220,180,60,255},{60,200,160,255},{200,120,60,255},
                                    {80,200,80,255},{200,80,80,255}};
-    int bx = 10, by = 44;
-    DrawText("Badges:", bx, by, 10, {180,170,140,180});
+    int bx = UI_SAFE, by = UI_SAFE + 34;
+    DrawUI("Badges:", bx, by, 10, {180,170,140,180});
     bx += 52;
     for (int i = 0; i < 5; i++) {
       bool earned = g_tournament.cityChampionDefeated[i];
@@ -11776,14 +13952,14 @@ static void DrawOverworld() {
       Color rim = earned ? Color{255,240,160,220} : Color{120,100,60,120};
       DrawCircle(bx + 8, by + 5, 8.0f, bg);
       DrawCircleLines(bx + 8, by + 5, 8.0f, rim);
-      DrawText(cityInitials[i], bx + 4, by + 0, 10,
+      DrawUI(cityInitials[i], bx + 4, by + 0, 10,
                earned ? Color{30,20,10,255} : Color{120,100,60,160});
       bx += 22;
     }
     // If currently in a tournament, show round progress
     if (g_tournamentMode || g_tournament.roundsWon > 0) {
       snprintf(hudBuf, 128, "  Round %d/3", g_tournament.roundsWon);
-      DrawText(hudBuf, bx + 4, by, 10, {220,200,100,200});
+      DrawUI(hudBuf, bx + 4, by, 10, {220,200,100,200});
     }
   }
 
@@ -11791,17 +13967,19 @@ static void DrawOverworld() {
   if (g_onboardingActive && !g_onboardingDone &&
       g_onboardingTextIdx < NUM_ONBOARDING_TEXTS) {
     // BW-style dialog box at bottom of screen
-    DrawRectangle(20, SCREEN_H - 130, SCREEN_W - 40, 110, {20, 15, 10, 230});
+    DrawRectangle(UI_SAFE + 10, SCREEN_H - UI_SAFE - 110, SCREEN_W - UI_SAFE * 2 - 20, 110, {20, 15, 10, 230});
     DrawRectangleLinesEx(
-        {20, (float)(SCREEN_H - 130), (float)(SCREEN_W - 40), 110}, 2.0f,
+        {(float)(UI_SAFE + 10), (float)(SCREEN_H - UI_SAFE - 110), (float)(SCREEN_W - UI_SAFE * 2 - 20), 110}, 2.0f,
         {200, 170, 100, 255});
-    DrawText("Grandpa Aziz", 40, SCREEN_H - 125, 14, {255, 220, 120, 255});
-    DrawText(g_onboardingTexts[g_onboardingTextIdx], 40, SCREEN_H - 105, 14,
+    DrawUI("Grandpa Aziz", UI_SAFE + 30, SCREEN_H - UI_SAFE - 105, 14, {255, 220, 120, 255});
+    DrawUI(g_onboardingTexts[g_onboardingTextIdx], UI_SAFE + 30, SCREEN_H - UI_SAFE - 85, 14,
              {230, 220, 190, 255});
-    DrawText("[Enter] Continue", SCREEN_W - 160, SCREEN_H - 35, 10,
+    DrawUI("[Enter] Continue", SCREEN_W - UI_SAFE - 150, SCREEN_H - UI_SAFE - 15, 10,
              {180, 160, 120, 180});
   }
 
+  // Signpost direction overlay
+  DrawSignpostOverlay();
   // NPC dialog overlay
   if (g_npcDialogOpen)
     DrawNPCDialog();
@@ -11817,10 +13995,21 @@ void TentInterior::Draw() {}
 // MAIN ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════════
 int main() {
-  SetConfigFlags(FLAG_MSAA_4X_HINT);
-  InitWindow(SCREEN_W, SCREEN_H, "Sovereign Horizons — KOG 2.5D Editor");
+  SetConfigFlags(FLAG_BORDERLESS_WINDOWED_MODE);
+  InitWindow(0, 0, "Cards & Coins");
+  SCREEN_W = GetScreenWidth();
+  SCREEN_H = GetScreenHeight();
   SetTargetFPS(60);
   SetExitKey(0); // Disable default ESC=quit so we can use ESC for menus
+
+  // Load UI font — Inter (clean, modern, highly readable)
+  if (FileExists("C:\\Windows\\Fonts\\Inter-VariableFont.ttf")) {
+    g_fontUI = LoadFontEx("C:\\Windows\\Fonts\\Inter-VariableFont.ttf", 32, nullptr, 0);
+    SetTextureFilter(g_fontUI.texture, TEXTURE_FILTER_BILINEAR);
+  } else if (FileExists("C:\\Windows\\Fonts\\calibri.ttf")) {
+    g_fontUI = LoadFontEx("C:\\Windows\\Fonts\\calibri.ttf", 32, nullptr, 0);
+    SetTextureFilter(g_fontUI.texture, TEXTURE_FILTER_BILINEAR);
+  }
 
   // Init systems
   InitPostProcessing();
@@ -11868,9 +14057,11 @@ int main() {
       break;
     case SCENE_MATCH:
       DrawMatchScene();
+      DrawTutMatchOverlay(); // Scripted tutorial match guidance
       break;
     case SCENE_SHOP:
       DrawShopScene();
+      // DrawTutorialOverlay(); // removed — player discovers on their own
       break;
     default:
       DrawOverworld();
@@ -11878,7 +14069,7 @@ int main() {
     }
 
     // FPS counter (debug)
-    DrawFPS(SCREEN_W - 80, SCREEN_H - 20);
+    DrawFPS(SCREEN_W - 80 - UI_SAFE, SCREEN_H - UI_SAFE);
     g_sceneManager.DrawFadeOverlay();
     EndDrawing();
   }
@@ -11886,6 +14077,8 @@ int main() {
   // Cleanup (3D chibi models are procedural — no textures to unload)
   for (int i = 0; i < g_numRocks; i++)
     UnloadModel(g_rockInstances[i].model);
+  for (int i = 0; i < 4; i++)
+    UnloadModel(g_borderRockModels[i]);
   CleanupPostProcessing();
   UnloadCardShaders();
   CloseSounds();
