@@ -1387,6 +1387,7 @@ struct FieldUnit {
   int weakCounters;  // each adds -1/-1
   bool alive;
   int goldCounters; // for Golden Golem's gold counter ability
+  bool pendingDeath; // true = death anim playing, waiting to be removed
 };
 
 struct MatchPlayer {
@@ -1507,6 +1508,27 @@ static Vector2 g_arrowDst   = {};
 
 // AI "Thinking..." indicator
 static float g_aiThinkTimer  = 0.0f;
+
+// ── AI Step Machine — Animation-First sequenced AI turn ─────────────────────
+// Instead of executing the entire AI turn synchronously, we break it into
+// discrete steps with cooldown delays between each animation. This creates
+// readable, Hearthstone-style pacing where the player can follow each action.
+enum AIStep {
+  AI_IDLE = 0,       // not AI's turn
+  AI_THINK,          // initial "Thinking..." delay
+  AI_DRAW,           // draw card from deck
+  AI_PLAY_NEXT,      // find + play next affordable card
+  AI_PLAY_SUPPORT,   // play next affordable support card
+  AI_ATTACK_NEXT,    // attack with next available unit
+  AI_ASSIGN_DEFENDERS, // assign defenders
+  AI_CLOSURE,        // fire closure effects
+  AI_END_TURN,       // reset + hand back to player
+};
+static AIStep g_aiStep         = AI_IDLE;
+static float  g_aiStepTimer    = 0.0f; // cooldown before executing next step
+static constexpr float AI_ACTION_COOLDOWN = 0.5f; // seconds between AI actions
+static constexpr float AI_THINK_DELAY     = 0.8f; // initial think pause
+static int g_aiSupportIdx = -1; // current support card scan index
 
 // Oblivion portal pulse phase
 static float g_oblivionPulse = 0.0f;
@@ -1751,6 +1773,11 @@ static int  g_pendingDrawCount = 0;
 static bool AnyCA_Active() {
   for (int i = 0; i < CA_POOL; i++)
     if (g_cardAnims[i].active) return true;
+  return false;
+}
+static bool AnyDestroyActive() {
+  for (int i = 0; i < CA_POOL; i++)
+    if (g_cardAnims[i].active && g_cardAnims[i].type == CA_DESTROY) return true;
   return false;
 }
 
@@ -2327,6 +2354,7 @@ static bool g_shopCityVisited[5] = {};     // first-visit free packs tracker per
 
 // ── Menu System ─────────────────────────────────────────────────────────────
 static bool g_menuOpen = false;
+static bool g_menuShowHub = true;  // true = show hub pop-up, false = show tab content
 static bool g_npcDialogOpen = false;
 static int g_targetNPC = -1;
 static int g_dialogSelection = 0;
@@ -3024,6 +3052,9 @@ static void StartMatch(int npcIdx) {
   g_match.needsTarget = false;
   snprintf(g_match.message, 128, "Duel started!");
   g_match.messageTimer = 2.0f;
+  g_aiStep = AI_IDLE;
+  g_aiStepTimer = 0.f;
+  g_aiThinkTimer = 0.f;
 
   for (int p = 0; p < 2; p++) {
     MatchPlayer &mp = g_match.players[p];
@@ -3119,6 +3150,7 @@ static bool MatchDeployUnit(GameMatch &m, int playerIdx, int handIdx) {
   fu.weakCounters = 0;
   fu.alive = true;
   fu.goldCounters = 0;
+  fu.pendingDeath = false;
 
   // Remove from hand
   for (int i = handIdx; i < mp.handSize - 1; i++)
@@ -3550,13 +3582,28 @@ static void FireDeathTrigger(int cardId, MatchPlayer &owner, MatchPlayer &opp) {
 
 // ── Remove dead units from field ────────────────────────────────────────────
 static void CleanupField(MatchPlayer &mp, MatchPlayer *opp = nullptr) {
-  int w = 0;
+  // Determine player index for animation placement
+  int playerIdx = (&mp == &g_match.players[0]) ? 0 : 1;
   for (int i = 0; i < mp.fieldSize; i++) {
+    if (mp.field[i].pendingDeath) continue; // already dying
     int effDef = mp.field[i].curDef + mp.field[i].powerCounters -
                  mp.field[i].weakCounters;
     if (!mp.field[i].alive || effDef <= 0) {
-      // Fire death trigger before moving to graveyard
+      // Fire death trigger before marking for removal
       if (opp) FireDeathTrigger(mp.field[i].cardId, mp, *opp);
+      // Fire destroy animation — card stays on field until anim ends
+      AnimDestroy(mp.field[i].cardId, playerIdx, i, mp.fieldSize);
+      mp.field[i].pendingDeath = true;
+      mp.field[i].alive = false;
+    }
+  }
+}
+
+// Flush units with completed death animations (call when no destroy anims active)
+static void FlushDeadUnits(MatchPlayer &mp) {
+  int w = 0;
+  for (int i = 0; i < mp.fieldSize; i++) {
+    if (mp.field[i].pendingDeath) {
       if (mp.graveSize < MAX_GRAVE)
         mp.grave[mp.graveSize++] = mp.field[i].cardId;
       continue;
@@ -4617,6 +4664,265 @@ static void AITakeTurn(GameMatch &m) {
   }
 }
 
+// ── AI Draw Animation (face-down card from AI deck to AI hand) ───────────────
+static void AnimDrawAI(int cardId, int nextHandIdx, int handSize) {
+  PlaySfx(SFX_CARD_DRAW);
+  CardAnim *a = AllocCA(); if (!a) return;
+  a->type      = CA_DRAW;
+  a->cardId    = cardId;
+  a->duration  = 0.50f;
+  a->startDelay = 0.f;
+  a->showBack  = true;
+  a->isReveal  = false; // AI draw stays face-down
+  a->scale     = 0.75f;
+  // Start from AI deck (top-right)
+  Vector3 dk3 = {10.5f, 0.5f, -6.5f};
+  a->p0 = GetWorldToScreen(dk3, g_matchCam);
+  // Destination: AI hand slot (mirrored at top of screen)
+  const float cardW = 88.f, cardH = 126.f, gap = 6.f;
+  int newSize = handSize + 1;
+  float totalW = newSize * (cardW + gap) - gap;
+  float startX = (SCREEN_W - totalW) * 0.5f;
+  float center = (newSize - 1) * 0.5f;
+  float dist   = fabsf((float)nextHandIdx - center);
+  float fanDip = dist * dist * 3.8f;
+  float y = cardH * 0.5f + 10.f - fanDip;
+  a->p2 = {startX + nextHandIdx * (cardW + gap) + cardW * 0.5f, y};
+  a->p1 = {(a->p0.x + a->p2.x)*0.5f, fminf(a->p0.y, a->p2.y) - 120.f};
+}
+
+// ── AI Step Machine — per-frame stepper ─────────────────────────────────────
+// Called each frame from UpdateMatch. Processes one AI action at a time with
+// AI_ACTION_COOLDOWN delays between each, so the player can follow the match.
+static void UpdateAISteps(float dt) {
+  if (g_aiStep == AI_IDLE) return;
+
+  GameMatch &m = g_match;
+  MatchPlayer &ai = m.players[1];
+  MatchPlayer &human = m.players[0];
+
+  // Wait for all animations to finish before proceeding
+  if (AnyCA_Active() || g_animQHead != g_animQTail) return;
+
+  // Cooldown timer between actions
+  if (g_aiStepTimer > 0.f) {
+    g_aiStepTimer -= dt;
+    return;
+  }
+
+  switch (g_aiStep) {
+  // ── THINK: initial pause ───────────────────────────────────────────────────
+  case AI_THINK:
+    g_aiStep = AI_DRAW;
+    g_aiStepTimer = AI_THINK_DELAY;
+    break;
+
+  // ── DRAW: draw a card with animation ───────────────────────────────────────
+  case AI_DRAW: {
+    if (ai.deckSize <= 0) {
+      m.phase = PHASE_GAME_OVER;
+      m.playerWon = true;
+      m.active = false;
+      g_aiStep = AI_IDLE;
+      return;
+    }
+    if (ai.handSize < MAX_HAND) {
+      int cardId = ai.deck[--ai.deckSize];
+      AnimDrawAI(cardId, ai.handSize, ai.handSize);
+      ai.hand[ai.handSize++] = cardId;
+    }
+    ai.coins += 2;
+    TriggerHarvest(ai, m);
+    TriggerGrudge(ai, human);
+    g_aiStep = AI_PLAY_NEXT;
+    g_aiStepTimer = AI_ACTION_COOLDOWN;
+    break;
+  }
+
+  // ── PLAY_NEXT: find and play the most expensive affordable unit ────────────
+  case AI_PLAY_NEXT: {
+    int bestIdx = -1, bestCost = -1;
+    for (int i = 0; i < ai.handSize; i++) {
+      const CardDef &cd = GetCard(ai.hand[i]);
+      if (cd.isUnit && cd.cost <= ai.coins && ai.fieldSize < MAX_FIELD &&
+          cd.cost > bestCost) {
+        bestCost = cd.cost;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0) {
+      MatchDeployUnit(m, 1, bestIdx);
+      CleanupField(ai, &human);
+      CleanupField(human, &ai);
+      // Stay in AI_PLAY_NEXT to try playing more cards after cooldown
+      g_aiStepTimer = AI_ACTION_COOLDOWN;
+    } else {
+      // No more units to play — move to support cards
+      g_aiSupportIdx = ai.handSize - 1;
+      g_aiStep = AI_PLAY_SUPPORT;
+      g_aiStepTimer = 0.1f; // tiny gap before supports
+    }
+    break;
+  }
+
+  // ── PLAY_SUPPORT: play affordable support cards one at a time ──────────────
+  case AI_PLAY_SUPPORT: {
+    bool played = false;
+    while (g_aiSupportIdx >= 0) {
+      int i = g_aiSupportIdx--;
+      if (i >= ai.handSize) continue;
+      const CardDef &cd = GetCard(ai.hand[i]);
+      if (!cd.isUnit && cd.cost <= ai.coins) {
+        PlaySupportCard(m, 1, i);
+        played = true;
+        g_aiStepTimer = AI_ACTION_COOLDOWN;
+        break;
+      }
+    }
+    if (!played) {
+      g_aiStep = AI_ATTACK_NEXT;
+      g_aiStepTimer = AI_ACTION_COOLDOWN;
+    }
+    break;
+  }
+
+  // ── ATTACK_NEXT: attack with the next available unit ───────────────────────
+  case AI_ATTACK_NEXT: {
+    // Find next unit that can attack
+    int atkIdx = -1;
+    for (int a = 0; a < ai.fieldSize; a++) {
+      if (!ai.field[a].canActivate || ai.field[a].activated) continue;
+      atkIdx = a;
+      break;
+    }
+    if (atkIdx < 0) {
+      // No more attackers — move to defenders
+      g_aiStep = AI_ASSIGN_DEFENDERS;
+      g_aiStepTimer = 0.2f;
+      break;
+    }
+
+    const CardDef &acd = GetCard(ai.field[atkIdx].cardId);
+    bool hasFly = CardHasKeyword(acd, "fly");
+
+    // Check for human defenders
+    bool hasDefenders = false;
+    for (int i = 0; i < human.fieldSize; i++)
+      if (human.field[i].isDefender) { hasDefenders = true; break; }
+
+    if (hasDefenders && !hasFly) {
+      int weakestDef = -1, weakestVal = 99999;
+      for (int d = 0; d < human.fieldSize; d++) {
+        if (!human.field[d].isDefender) continue;
+        int val = human.field[d].curDef + human.field[d].powerCounters -
+                  human.field[d].weakCounters;
+        if (val < weakestVal) { weakestVal = val; weakestDef = d; }
+      }
+      if (weakestDef >= 0)
+        ResolveCombat(m, 1, atkIdx, 0, weakestDef);
+    } else {
+      int weakest = -1, weakestVal2 = 99999;
+      for (int d = 0; d < human.fieldSize; d++) {
+        bool targetFly = CardHasKeyword(GetCard(human.field[d].cardId), "fly");
+        if (targetFly && !hasFly && !human.field[d].isDefender) continue;
+        int val = human.field[d].curDef + human.field[d].powerCounters -
+                  human.field[d].weakCounters + human.field[d].bonusDef;
+        if (val < weakestVal2) { weakestVal2 = val; weakest = d; }
+      }
+      if (weakest >= 0)
+        ResolveCombat(m, 1, atkIdx, 0, weakest);
+      else
+        ResolveCombat(m, 1, atkIdx, 0, -1); // direct attack
+    }
+    CleanupField(ai, &human);
+    CleanupField(human, &ai);
+
+    // Check for game over mid-combat
+    if (human.life <= 0 || ai.life <= 0) {
+      m.phase = PHASE_GAME_OVER;
+      m.playerWon = (ai.life <= 0);
+      m.active = false;
+      snprintf(m.message, 128, m.playerWon ? "You win! Press Enter to continue."
+                                            : "You lose! Press Enter to continue.");
+      m.messageTimer = 99.0f;
+      g_aiStep = AI_IDLE;
+      return;
+    }
+    // Stay in ATTACK_NEXT to try next attacker after cooldown
+    g_aiStepTimer = AI_ACTION_COOLDOWN;
+    break;
+  }
+
+  // ── ASSIGN_DEFENDERS ───────────────────────────────────────────────────────
+  case AI_ASSIGN_DEFENDERS: {
+    for (int i = 0; i < ai.fieldSize; i++)
+      ai.field[i].isDefender = false;
+    if (ai.fieldSize > 0) {
+      int numDef = (ai.fieldSize + 1) / 2;
+      for (int k = 0; k < numDef; k++) {
+        int bestIdx = -1, bestDef = -1;
+        for (int i = 0; i < ai.fieldSize; i++) {
+          if (ai.field[i].isDefender) continue;
+          const CardDef &cd = GetCard(ai.field[i].cardId);
+          if (strstr(cd.effect, "Cannot defend.")) continue;
+          int d = ai.field[i].curDef + ai.field[i].powerCounters -
+                  ai.field[i].weakCounters;
+          if (d > bestDef) { bestDef = d; bestIdx = i; }
+        }
+        if (bestIdx >= 0) ai.field[bestIdx].isDefender = true;
+      }
+    }
+    g_aiStep = AI_CLOSURE;
+    g_aiStepTimer = 0.2f;
+    break;
+  }
+
+  // ── CLOSURE: fire end-of-turn effects ──────────────────────────────────────
+  case AI_CLOSURE:
+    TriggerClosure(ai, m);
+    ResetTempModifiers(m);
+    for (int i = 0; i < ai.fieldSize; i++) {
+      ai.field[i].canActivate = true;
+      ai.field[i].activated = false;
+    }
+    g_aiStep = AI_END_TURN;
+    g_aiStepTimer = 0.3f;
+    break;
+
+  // ── END_TURN: check win/loss, hand back to player ─────────────────────────
+  case AI_END_TURN: {
+    if (human.life <= 0) {
+      m.phase = PHASE_GAME_OVER;
+      m.playerWon = false;
+      m.active = false;
+      snprintf(m.message, 128, "You lose! Press Enter to continue.");
+      m.messageTimer = 99.0f;
+      g_aiStep = AI_IDLE;
+      return;
+    }
+    if (ai.life <= 0) {
+      m.phase = PHASE_GAME_OVER;
+      m.playerWon = true;
+      m.active = false;
+      snprintf(m.message, 128, "You win! Press Enter to continue.");
+      m.messageTimer = 99.0f;
+      g_aiStep = AI_IDLE;
+      return;
+    }
+    // Hand back to player
+    m.turn = 0;
+    m.phase = PHASE_COLLECT;
+    g_turnBannerTimer = 3.2f; g_turnBannerWho = 0;
+    g_aiStep = AI_IDLE;
+    break;
+  }
+
+  default:
+    g_aiStep = AI_IDLE;
+    break;
+  }
+}
+
 // ── Update Match (human turn logic) ─────────────────────────────────────────
 
 static void UpdateMatch(float dt) {
@@ -4624,7 +4930,16 @@ static void UpdateMatch(float dt) {
   UpdateArenaVFX(dt);
   UpdateCardAnims(dt);
   UpdateAnimQueue();
+  UpdateAISteps(dt); // AI step machine: process one action per cooldown
+  // Flush dead units from field once their destroy animations complete
+  if (!AnyDestroyActive()) {
+    FlushDeadUnits(g_match.players[0]);
+    FlushDeadUnits(g_match.players[1]);
+  }
   if (g_turnBannerTimer > 0.f) g_turnBannerTimer -= dt;
+
+  // Block all human input while AI step machine is running
+  if (g_aiStep != AI_IDLE) return;
 
   // ── Graveyard gallery: close on ESC / scroll on wheel ─────────────────────
   if (g_graveModalOpen) {
@@ -4704,6 +5019,7 @@ static void UpdateMatch(float dt) {
       }
       g_tournamentMode = false;
       ClearAnimQueue();
+      g_aiStep = AI_IDLE;
       g_scene = SCENE_OVERWORLD;
     }
     return;
@@ -4958,36 +5274,14 @@ static void UpdateMatch(float dt) {
         return;
       }
 
-      // AI turn
+      // Start AI step machine — it will process one action per frame with cooldowns
       m.turn = 1;
       m.turnNumber++;
-      g_turnBannerTimer = 3.2f; g_turnBannerWho = 1; // opponent's turn banner
-      g_aiThinkTimer = 1.4f;  // show Thinking... indicator
-      AITakeTurn(m);
-      g_aiThinkTimer = 0.0f;
-
-      // Check again
-      if (ai.life <= 0) {
-        m.phase = PHASE_GAME_OVER;
-        m.playerWon = true;
-        m.active = false;
-        snprintf(m.message, 128, "You win! Press Enter to continue.");
-        m.messageTimer = 99.0f;
-        return;
-      }
-      if (human.life <= 0) {
-        m.phase = PHASE_GAME_OVER;
-        m.playerWon = false;
-        m.active = false;
-        snprintf(m.message, 128, "You lose! Press Enter to continue.");
-        m.messageTimer = 99.0f;
-        return;
-      }
-
-      // Back to player
-      m.turn = 0;
-      m.phase = PHASE_COLLECT;
-      g_turnBannerTimer = 3.2f; g_turnBannerWho = 0; // your turn banner
+      g_turnBannerTimer = 3.2f; g_turnBannerWho = 1;
+      g_aiThinkTimer = AI_THINK_DELAY;
+      g_aiStep = AI_THINK;
+      g_aiStepTimer = 0.f;
+      // UpdateAISteps() runs each frame and will eventually hand back to player
     }
   }
 }
@@ -5421,7 +5715,7 @@ static void DrawKeywordBadges(float sx, float sy, const CardDef &cd) {
 
 // "Thinking..." pulsing indicator above AI portrait (shown while AI processes)
 static void DrawAIThinkingIndicator() {
-  if (g_aiThinkTimer <= 0.0f) return;
+  if (g_aiStep == AI_IDLE && g_aiThinkTimer <= 0.0f) return;
   int dotCount = (int)(g_time * 2.8f) % 4;
   const char *dotStr = dotCount == 0 ? "." : dotCount == 1 ? ".." :
                        dotCount == 2 ? "..." : "....";
@@ -5854,26 +6148,33 @@ static void DrawCardView(Rectangle rect, const CardView &view, int artTexId) {
   // ── Stat band divider line ────────────────────────────────────────────────
   DrawRectangle((int)iX, (int)statT, (int)iW, 1, {185, 144, 35, 210});
 
-  // ── Cost gem (top-left corner, overlapping border) ───────────────────────
+  // ── Cost coin (top-left corner, overlapping border) ──────────────────────
   {
     float gR  = W * 0.115f;
     float gCX = X + padX * 0.35f + gR;
     float gCY = Y + nameH * 0.5f;
-    // Outer ring
+    float sh  = sinf(g_time * 4.f) * 0.5f + 0.5f;
+    // Outer dark ring
     DrawCircle((int)gCX, (int)gCY, (int)(gR + 2.f), {50, 24, 4, 255});
-    // Deep blue gem
-    DrawCircle((int)gCX, (int)gCY, (int)(gR),         {28, 55, 130, 255});
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.72f), {45, 90, 190, 255});
-    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.40f), {85, 145, 235, 255});
-    // Glint
-    DrawCircle((int)(gCX - gR * 0.25f), (int)(gCY - gR * 0.28f),
-               (int)(gR * 0.18f), {210, 230, 255, 180});
+    // Gold coin layers (dark gold -> bright gold -> highlight)
+    DrawCircle((int)gCX, (int)gCY, (int)(gR),         {140, 105, 15, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.88f), {195, 155, 30, 255});
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.72f), {220, 185, 45, 255});
+    // Inner bright center
+    DrawCircle((int)gCX, (int)gCY, (int)(gR * 0.40f),
+               {(unsigned char)(235 + (int)(20*sh)), (unsigned char)(210 + (int)(25*sh)),
+                (unsigned char)(80 + (int)(40*sh)), 255});
+    // Coin rim highlight (top-left glint)
+    DrawCircle((int)(gCX - gR * 0.28f), (int)(gCY - gR * 0.30f),
+               (int)(gR * 0.20f), {255, 245, 180, (unsigned char)(140 + (int)(60*sh))});
+    // Coin edge notch (subtle inner ring)
+    DrawCircleLines((int)gCX, (int)gCY, (int)(gR * 0.60f), {120, 85, 10, 120});
     // Cost number
     char costB[4]; snprintf(costB, 4, "%d", view.cost);
     int cfs = Clamp((int)(gR * 1.5f), 8, 15);
     int cw  = MeasureText(costB, cfs);
-    DrawText(costB, (int)(gCX - cw * 0.5f + 1), (int)(gCY - cfs * 0.5f + 1), cfs, {0, 0, 0, 140});
-    DrawText(costB, (int)(gCX - cw * 0.5f),     (int)(gCY - cfs * 0.5f),     cfs, {240, 230, 200, 255});
+    DrawText(costB, (int)(gCX - cw * 0.5f + 1), (int)(gCY - cfs * 0.5f + 1), cfs, {60, 35, 5, 180});
+    DrawText(costB, (int)(gCX - cw * 0.5f),     (int)(gCY - cfs * 0.5f),     cfs, {255, 250, 220, 255});
   }
 
   // ── Rarity gem (top-right corner) ────────────────────────────────────────
@@ -6153,6 +6454,7 @@ static void DrawMatchScene() {
     MatchPlayer &mp = m.players[side];
     for (int i = 0; i < mp.fieldSize; i++) {
       FieldUnit &fu = mp.field[i];
+      if (fu.pendingDeath) continue; // being destroyed — anim handles rendering
       const CardDef &cd = GetCard(fu.cardId);
       Vector3 pos3 = GetFieldSlotPos(side, i, mp.fieldSize);
       if (CardHasKeyword(cd, "fly")) pos3.y += 0.45f;
@@ -6277,8 +6579,8 @@ static void DrawMatchScene() {
       CardView fv = g_handCardViews[i];
       fv.hoverRotX += fanTilt * (hov ? 0.20f : 1.0f);  // flatten on hover
 
-      // Scale: 1.4× on hover
-      float scl   = hov ? 1.4f : fv.scale;
+      // Scale: 2.0× on hover for readable zoom
+      float scl   = hov ? 2.0f : fv.scale;
       Rectangle drawR = r;
       if (hov) {
         drawR = {r.x - r.width  * (scl - 1.0f) * 0.5f,
@@ -6490,35 +6792,7 @@ static void DrawMatchScene() {
   // ── Desert Wind & Dust atmospherics (shared with overworld system) ────────
   DrawVFX();
 
-  // ── Hover tooltip: hand card ──────────────────────────────────────────────
-  if (g_matchHoverHand >= 0 && g_matchHoverHand < human.handSize) {
-    const CardDef &cd = GetCard(human.hand[g_matchHoverHand]);
-    Rectangle hr = GetHandCardRect(g_matchHoverHand, human.handSize);
-    float tipY = hr.y - 88;
-    float tipX = hr.x - 28;
-    if (tipX < 5) tipX = 5;
-    if (tipX > SCREEN_W - 222) tipX = SCREEN_W - 222;
-    DrawRectangleRounded({tipX, tipY, 215, 84}, 0.2f, 4, {24, 19, 14, 248});
-    DrawRectangleRoundedLinesEx({tipX, tipY, 215, 84}, 0.2f, 4, 1.5f,
-                                 {182, 152, 62, 255});
-    DrawText(cd.name, (int)tipX + 6, (int)tipY + 5, 12, {255, 232, 162, 255});
-    if (cd.effect[0])
-      DrawText(cd.effect, (int)tipX + 6, (int)tipY + 22, 8,
-               {202, 182, 142, 222});
-    if (cd.isUnit) {
-      char sb[52];
-      snprintf(sb, 52, "ATK:%d  DEF:%d  Cost:%d", cd.atk, cd.def, cd.cost);
-      DrawText(sb, (int)tipX + 6, (int)tipY + 56, 9, {222, 202, 162, 255});
-      if (cd.keywords[0]) {
-        char kb[52];
-        snprintf(kb, 52, "Keywords: %s", cd.keywords);
-        DrawText(kb, (int)tipX + 6, (int)tipY + 70, 8, {182, 222, 255, 222});
-      }
-    } else {
-      char sb[18]; snprintf(sb, 18, "Cost: %d", cd.cost);
-      DrawText(sb, (int)tipX + 6, (int)tipY + 56, 9, {222, 202, 162, 255});
-    }
-  }
+  // ── Hover tooltip: hand card (removed — 2× zoom on hover replaces it) ────
 
   // ── Hover tooltip: player field unit ─────────────────────────────────────
   if (g_matchHoverField >= 0 && g_matchHoverField < human.fieldSize) {
@@ -7061,8 +7335,8 @@ static void GenerateCardTexture(int cardIdx) {
   ImageDrawRectangle(&img, 3, 3, CARD_TEX_W - 6, 14, PALETTE[1]);
   ImageDrawText(&img, cd.name, 16, 5, 8, PALETTE[5]);
 
-  // Cost circle (top-left)
-  Color costBg = cd.isUnit ? PALETTE[3] : PALETTE[9];
+  // Cost circle (top-left) — gold coin for all cards
+  Color costBg = {195, 155, 30, 255};
   ImageDrawRectangle(&img, 4, 4, 11, 11, costBg);
   ImageDrawRectangleLines(&img, {4, 4, 11, 11}, 1, PALETTE[0]);
   char costStr[4];
@@ -7444,6 +7718,21 @@ static void InteractWithNPC(int npcIdx) {
 // MENU OVERLAY — Desert Theme Collection Browser & Deckbuilder
 // ═══════════════════════════════════════════════════════════════════════════════
 static void UpdateMenu() {
+  // Hub state: Esc/right-click closes menu
+  if (g_menuShowHub) {
+    if (IsKeyPressed(KEY_ESCAPE) || IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+      g_menuOpen = false;
+      return;
+    }
+    return;
+  }
+
+  // Tab view: Esc/right-click goes back to hub
+  if (IsKeyPressed(KEY_ESCAPE) || IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
+    g_menuShowHub = true;
+    return;
+  }
+
   // Tab switching
   if (IsKeyPressed(KEY_TAB) || IsKeyPressed(KEY_RIGHT))
     g_menuTab = (MenuTab)((g_menuTab + 1) % TAB_COUNT);
@@ -7466,12 +7755,6 @@ static void UpdateMenu() {
     if (g_deckScroll < 0)
       g_deckScroll = 0;
   }
-
-  // Close menu
-  if (IsKeyPressed(KEY_ESCAPE) || IsMouseButtonPressed(MOUSE_RIGHT_BUTTON)) {
-    g_menuOpen = false;
-    return;
-  }
 }
 
 static void DrawMenuOverlay() {
@@ -7483,6 +7766,74 @@ static void DrawMenuOverlay() {
   // Semi-transparent dark overlay
   DrawRectangle(0, 0, SCREEN_W, SCREEN_H, {20, 15, 8, 200});
 
+  // ── Hub pop-up: 4 big buttons in a centered window ─────────────────────
+  if (g_menuShowHub) {
+    const float pw = 320.f, ph = 300.f;
+    float px = (SCREEN_W - pw) * 0.5f, py = (SCREEN_H - ph) * 0.5f;
+
+    // Pop-up frame
+    DrawRectangleRounded({px, py, pw, ph}, 0.08f, 6, {32, 24, 14, 252});
+    DrawRectangleRoundedLinesEx({px, py, pw, ph}, 0.08f, 6, 2.5f, {210, 175, 90, 255});
+    DrawRectangleRoundedLinesEx({px+3,py+3,pw-6,ph-6}, 0.08f, 6, 1.0f, {140, 110, 60, 180});
+
+    // Title
+    const char *title = "MENU";
+    int tw = MeasureText(title, 18);
+    DrawRectangleRounded({px+6, py+6, pw-12, 32}, 0.3f, 4, {55, 40, 22, 255});
+    DrawText(title, (int)(px + pw*0.5f - tw*0.5f), (int)(py + 13), 18, {240, 210, 120, 255});
+
+    // 4 menu buttons
+    const char *labels[] = {"Collection", "Decks", "Settings", "Save"};
+    const MenuTab tabs[] = {TAB_COLLECTION, TAB_DECKS, TAB_SETTINGS, TAB_SAVE};
+    // Icon symbols drawn as colored circles
+    const Color iconCols[] = {{80,180,220,255},{120,200,80,255},{200,160,60,255},{100,200,160,255}};
+    const char *icons[] = {"C", "D", "S", "W"};  // card, deck, settings, write
+
+    float btnW = pw - 40, btnH = 44;
+    float btnX = px + 20, btnStartY = py + 50;
+    Vector2 mouse = GetMousePosition();
+
+    for (int i = 0; i < 4; i++) {
+      float btnY = btnStartY + i * (btnH + 8);
+      Rectangle br = {btnX, btnY, btnW, btnH};
+      bool hov = CheckCollisionPointRec(mouse, br);
+
+      // Button background
+      Color bg = hov ? Color{75, 58, 32, 255} : Color{50, 38, 22, 255};
+      DrawRectangleRounded(br, 0.25f, 4, bg);
+      DrawRectangleRoundedLinesEx(br, 0.25f, 4, 1.5f,
+        hov ? Color{240, 210, 80, 255} : Color{160, 130, 70, 200});
+      if (hov) {
+        // Glow on hover
+        DrawRectangleRoundedLinesEx({br.x-1,br.y-1,br.width+2,br.height+2},
+          0.25f, 4, 1.0f, {240, 210, 80, 80});
+      }
+
+      // Icon circle
+      float icx = btnX + 24, icy = btnY + btnH*0.5f;
+      DrawCircle((int)icx, (int)icy, 14, {20, 14, 8, 255});
+      DrawCircle((int)icx, (int)icy, 12, iconCols[i]);
+      int iw2 = MeasureText(icons[i], 12);
+      DrawText(icons[i], (int)(icx - iw2*0.5f), (int)(icy - 6), 12, {255, 255, 255, 240});
+
+      // Label
+      DrawText(labels[i], (int)(btnX + 48), (int)(btnY + btnH*0.5f - 8), 16,
+               hov ? Color{255, 240, 170, 255} : Color{200, 180, 120, 255});
+
+      // Click handler
+      if (hov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        g_menuTab = tabs[i];
+        g_menuShowHub = false;
+      }
+    }
+
+    // Close hint
+    DrawText("Esc: Close", (int)(px + pw*0.5f - 30), (int)(py + ph - 22), 10,
+             {140, 120, 80, 150});
+    return;
+  }
+
+  // ── Full tab view ───────────────────────────────────────────────────────
   // Menu frame
   int mx = 30, my = 20, mw = SCREEN_W - 60, mh = SCREEN_H - 40;
   DrawRectangleRounded({(float)mx, (float)my, (float)mw, (float)mh}, 0.02f, 4,
@@ -7493,34 +7844,29 @@ static void DrawMenuOverlay() {
       {(float)(mx + 2), (float)(my + 2), (float)(mw - 4), (float)(mh - 4)},
       0.02f, 4, {140, 110, 60, 180});
 
-  // Title bar
+  // Title bar — shows current tab name
+  const char *tabTitles[] = {"Collection", "Deck Builder", "Save/Load", "Settings"};
   DrawRectangle(mx + 4, my + 4, mw - 8, 28, {60, 45, 25, 255});
-  DrawText("SOVEREIGN HORIZONS", mx + mw / 2 - 80, my + 10, 16,
-           {220, 190, 100, 255});
-
-  // Tab buttons
-  int tabY = my + 36;
-  const char *tabNames[] = {"Collection", "Deck Builder", "Save/Load",
-                            "Settings"};
-  int tabWidths[] = {100, 110, 90, 80};
-  int tabCumX = mx + 10;
-  for (int t = 0; t < TAB_COUNT; t++) {
-    bool active = (g_menuTab == (MenuTab)t);
-    Color bg = active ? Color{110, 85, 50, 255} : Color{60, 45, 25, 255};
-    Color fg = active ? Color{240, 220, 150, 255} : Color{160, 140, 100, 255};
-    DrawRectangle(tabCumX, tabY, tabWidths[t], 22, bg);
-    DrawRectangleLines(tabCumX, tabY, tabWidths[t], 22, {140, 110, 60, 200});
-    DrawText(tabNames[t], tabCumX + 8, tabY + 5, 12, fg);
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      Vector2 mp = GetMousePosition();
-      if (mp.x >= tabCumX && mp.x < tabCumX + tabWidths[t] && mp.y >= tabY &&
-          mp.y < tabY + 22)
-        g_menuTab = (MenuTab)t;
-    }
-    tabCumX += tabWidths[t] + 6;
+  {
+    const char *tt = tabTitles[g_menuTab];
+    int ttw = MeasureText(tt, 16);
+    DrawText(tt, mx + mw / 2 - ttw / 2, my + 10, 16, {220, 190, 100, 255});
   }
 
-  int panelY = tabY + 30;
+  // Back button (top-left)
+  {
+    Rectangle backR = {(float)(mx + 8), (float)(my + 7), 60, 22};
+    Vector2 mp = GetMousePosition();
+    bool bHov = CheckCollisionPointRec(mp, backR);
+    DrawRectangleRounded(backR, 0.4f, 4,
+      bHov ? Color{80, 60, 35, 255} : Color{55, 42, 24, 255});
+    DrawText("< Back", mx + 15, my + 11, 11,
+      bHov ? Color{255, 230, 130, 255} : Color{180, 155, 95, 220});
+    if (bHov && IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+      g_menuShowHub = true;
+  }
+
+  int panelY = my + 38;
   int panelH = mh - (panelY - my) - 10;
 
   if (g_menuTab == TAB_COLLECTION) {
@@ -10771,8 +11117,10 @@ static void UpdateOverworld(float dt) {
   }
 
   // Menu / dialog
-  if (IsKeyPressed(KEY_SPACE) || g_padStartPressed)
+  if (IsKeyPressed(KEY_SPACE) || g_padStartPressed) {
     g_menuOpen = !g_menuOpen;
+    if (g_menuOpen) g_menuShowHub = true;
+  }
   if (IsKeyPressed(KEY_ESCAPE) || g_padBPressed) {
     g_menuOpen = false;
     g_npcDialogOpen = false;
@@ -11166,6 +11514,16 @@ static void DrawOverworld() {
     Vector3 camPos = g_cam.position;
     SetShaderValue(g_shTriplanar, g_locTripCameraPos, &camPos, SHADER_UNIFORM_VEC3);
     SetShaderValue(g_shTriplanar, g_locTripSunDir,    &g_sunDir, SHADER_UNIFORM_VEC3);
+    // ── PASS 0: Infinite ground plane (hides terrain mesh edge) ──────────
+    // A large flat quad at y=-0.1 extends far beyond the terrain,
+    // preventing the visible horizon seam where the mesh ends.
+    {
+      Color gc = {(unsigned char)(185 * amb.r / 255),
+                  (unsigned char)(165 * amb.g / 255),
+                  (unsigned char)(125 * amb.b / 255), 255};
+      DrawCube({(float)MAP_W * 0.5f, -4.0f, (float)MAP_H * 0.5f},
+               (float)MAP_W * 4.0f, 0.01f, (float)MAP_H * 4.0f, gc);
+    }
     // ── PASS 1: Opaque terrain (dune heightmap mesh) ─────────────────────
     if (g_terrainReady) {
       DrawModel(g_terrainModel, {0, 0, 0}, 1.0f, amb);
